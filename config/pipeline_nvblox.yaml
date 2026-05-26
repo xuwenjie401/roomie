@@ -31,7 +31,7 @@ roomie_pipeline_node:
       mask_robot_threshold: 0
 
     tsdf:
-      map_backend: cpu
+      map_backend: nvblox
       voxel_size_m: 0.03
       truncation_distance_vox: 8.0
       max_weight: 20.0
@@ -39,7 +39,7 @@ roomie_pipeline_node:
       min_visualization_weight: 1.0
       min_color_weight: 0.1
       surface_visualization_distance_vox: 1.0
-      load_map: true
+      load_map: false
       map_load_path: /home/agxi/Datasets/output/jarvis_home/nvblox/color_tsdf_map_0526_1639.nvblox
       freeze_tsdf_map: false
       save_map: false

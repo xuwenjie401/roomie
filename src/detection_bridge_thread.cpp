@@ -2,6 +2,8 @@
 
 #include <thread>
 
+#include "roomie/pipeline/image_utils.hpp"
+
 namespace roomie {
 
 DetectionBridgeThread::DetectionBridgeThread(
@@ -56,14 +58,14 @@ InferenceRequest DetectionBridgeThread::makeRequest(const DetectionFrame& frame,
   InferenceRequest request;
   request.time_ns = frame.time_ns;
   request.camera_id = frame.camera_id;
-  request.rgb_960 = frame.rgb;
-  request.mask_960 = frame.robot_mask;
+  request.rgb_960 =
+      resizeBilinear(frame.rgb, config_.boxer_input_size, config_.boxer_input_size);
+  request.mask_960 =
+      resizeNearest(frame.robot_mask, config_.boxer_input_size, config_.boxer_input_size);
   request.patch_depth = std::move(patch_depth);
   request.intrinsics_960 =
       frame.intrinsics.scaledTo(config_.boxer_input_size, config_.boxer_input_size);
   request.T_world_camera = frame.T_world_camera;
-
-  // TODO: resize RGB and mask buffers to boxer_input_size before enqueueing.
   return request;
 }
 

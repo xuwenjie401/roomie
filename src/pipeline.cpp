@@ -16,7 +16,38 @@ RoomiePipeline::RoomiePipeline(rclcpp::Node& node, PipelineConfig config)
                                map_thread_,
                                python_backend_,
                                config_),
-      publisher_persistence_thread_(node, instance_map_thread_, config_) {}
+      publisher_persistence_thread_(node, instance_map_thread_, map_thread_, config_) {
+  RosCameraSubscriptionConfig mapping_camera;
+  mapping_camera.camera_id = config_.mapping_camera_id;
+  mapping_camera.camera_frame = config_.mapping_camera_frame;
+  mapping_camera.rgb_topic = config_.rgb_topic;
+  mapping_camera.robot_mask_topic = config_.mask_topic;
+  mapping_camera.depth_topic = config_.depth_topic;
+  mapping_camera.camera_info_topic = config_.camera_info_topic;
+  mapping_camera.fallback_intrinsics.width = config_.camera_width;
+  mapping_camera.fallback_intrinsics.height = config_.camera_height;
+  mapping_camera.fallback_intrinsics.fx = config_.camera_fx;
+  mapping_camera.fallback_intrinsics.fy = config_.camera_fy;
+  mapping_camera.fallback_intrinsics.cx = config_.camera_cx;
+  mapping_camera.fallback_intrinsics.cy = config_.camera_cy;
+  mapping_camera.depth_scale = config_.depth_scale;
+  mapping_camera.depth_min_m = config_.depth_min_m;
+  mapping_camera.depth_max_m = config_.depth_max_m;
+  mapping_camera.mask_robot_threshold = config_.mask_robot_threshold;
+  mapping_camera.enable_mapping = true;
+  mapping_camera.enable_detection = true;
+
+  RosIoSubscriptionConfig ros_io_config;
+  ros_io_config.world_frame = config_.world_frame;
+  ros_io_config.tf_topic = config_.tf_topic;
+  ros_io_config.tf_static_topic = config_.tf_static_topic;
+  ros_io_config.max_image_stamp_delta_sec = config_.max_image_stamp_delta_sec;
+  ros_io_config.max_tf_gap_sec = config_.max_tf_gap_sec;
+  ros_io_config.input_queue_size = config_.input_queue_size;
+  ros_io_config.cameras.push_back(std::move(mapping_camera));
+  ros_io_thread_.configure(std::move(ros_io_config));
+  ros_io_thread_.attachNode(node);
+}
 
 RoomiePipeline::~RoomiePipeline() { stop(); }
 

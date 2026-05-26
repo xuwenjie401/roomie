@@ -1,5 +1,6 @@
 #include <memory>
 
+#include <rclcpp/executors/multi_threaded_executor.hpp>
 #include <rclcpp/rclcpp.hpp>
 
 #include "roomie/pipeline/pipeline.hpp"
@@ -30,7 +31,12 @@ class RoomiePipelineNode : public rclcpp::Node {
 
 int main(int argc, char** argv) {
   rclcpp::init(argc, argv);
-  rclcpp::spin(std::make_shared<roomie::RoomiePipelineNode>());
+
+  rclcpp::executors::MultiThreadedExecutor executor;
+  auto node = std::make_shared<roomie::RoomiePipelineNode>();
+  executor.add_node(node);
+  executor.spin();
+
   rclcpp::shutdown();
   return 0;
 }
