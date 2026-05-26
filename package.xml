@@ -1,0 +1,23 @@
+<?xml version="1.0"?>
+<package format="3">
+  <name>roomie</name>
+  <version>0.1.0</version>
+  <description>C++ pipeline skeleton for map-coupled Boxer instance mapping.</description>
+
+  <maintainer email="agxi@example.com">agxi</maintainer>
+  <license>TODO</license>
+
+  <buildtool_depend>ament_cmake</buildtool_depend>
+
+  <depend>eigen</depend>
+  <depend>rclcpp</depend>
+  <depend>sensor_msgs</depend>
+  <depend>std_msgs</depend>
+  <depend>visualization_msgs</depend>
+
+  <exec_depend>rviz2</exec_depend>
+
+  <export>
+    <build_type>ament_cmake</build_type>
+  </export>
+</package>

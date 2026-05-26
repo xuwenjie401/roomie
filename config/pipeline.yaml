@@ -1,0 +1,24 @@
+roomie_pipeline_node:
+  ros__parameters:
+    world_frame: world
+    mapping_camera_id: head_front_left_color
+
+    boxer_input_size: 960
+    patch_rows: 60
+    patch_cols: 60
+    min_patch_coverage_ratio: 0.05
+    max_inference_fps: 10.0
+
+    mapping_queue_size: 30
+    detection_queue_size: 8
+    inference_request_queue_size: 2
+    inference_response_queue_size: 8
+
+    publish_period_sec: 1.0
+
+    load_map: true
+    map_load_path: /home/agxi/Datasets/output/jarvis_home/nvblox/color_tsdf_map_0526_1639.nvblox
+    save_map: false
+    map_save_path: /home/agxi/Datasets/output/jarvis_home/nvblox/
+    save_instance_map: true
+    instance_map_save_path: /home/agxi/Datasets/output/jarvis_home/instances/
