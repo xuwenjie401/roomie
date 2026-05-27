@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
@@ -72,6 +73,11 @@ bool pointInsideYawObb(const Eigen::Vector3f& point_world, const RawDetection& d
   return std::abs(local.x()) <= half_size.x() &&
          std::abs(local.y()) <= half_size.y() &&
          std::abs(local.z()) <= half_size.z();
+}
+
+double elapsedMs(std::chrono::steady_clock::time_point start,
+                 std::chrono::steady_clock::time_point end) {
+  return std::chrono::duration<double, std::milli>(end - start).count();
 }
 
 std::uint8_t maskValueAt(const ImageBuffer& mask, int x, int y, int width, int height) {
@@ -174,7 +180,10 @@ class NvbloxMapBackend : public MapBackend {
     MapBackendSnapshot snapshot;
     snapshot.map_version = map_version_.load();
     snapshot.has_map = mapper_->tsdf_layer().numBlocks() > 0;
+    const auto surface_extract_start = std::chrono::steady_clock::now();
     collectSurfacePoints(&snapshot);
+    snapshot.surface_extract_ms =
+        elapsedMs(surface_extract_start, std::chrono::steady_clock::now());
     return snapshot;
   }
 
@@ -302,6 +311,7 @@ class NvbloxMapBackend : public MapBackend {
     constexpr int kVoxelsPerSide = nvblox::VoxelBlock<nvblox::TsdfVoxel>::kVoxelsPerSide;
 
     const std::vector<nvblox::Index3D> block_indices = layer.getAllBlockIndices();
+    snapshot->tsdf_blocks = static_cast<std::uint64_t>(block_indices.size());
     snapshot->surface_points_world.reserve(block_indices.size() * 32);
     snapshot->debug_surface_points.reserve(block_indices.size() * 32);
     for (const nvblox::Index3D& block_index : block_indices) {
@@ -309,6 +319,10 @@ class NvbloxMapBackend : public MapBackend {
       if (block == nullptr) {
         continue;
       }
+      snapshot->surface_voxels_scanned +=
+          static_cast<std::uint64_t>(kVoxelsPerSide) *
+          static_cast<std::uint64_t>(kVoxelsPerSide) *
+          static_cast<std::uint64_t>(kVoxelsPerSide);
       const nvblox::ColorBlock::ConstPtr color_block =
           color_layer.getBlockAtIndex(block_index);
       for (int x = 0; x < kVoxelsPerSide; ++x) {

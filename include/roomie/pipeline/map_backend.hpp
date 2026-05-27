@@ -27,6 +27,10 @@ struct MapBackendSnapshot {
   WorldPointVector surface_points_world;
   std::vector<MapSurfacePoint, Eigen::aligned_allocator<MapSurfacePoint>> debug_surface_points;
   std::uint64_t map_version = 0;
+  std::uint64_t tsdf_blocks = 0;
+  std::uint64_t surface_voxels_scanned = 0;
+  double snapshot_ms = 0.0;
+  double surface_extract_ms = 0.0;
   bool has_map = false;
 };
 

@@ -4,10 +4,14 @@
 #include <cstdint>
 #include <cstring>
 #include <cmath>
+#include <iomanip>
 #include <sstream>
 #include <thread>
 
 #include <sensor_msgs/point_cloud2_iterator.hpp>
+
+#include "roomie/utils/run_logger.hpp"
+#include "roomie/utils/visualization_utils.hpp"
 
 namespace roomie {
 namespace {
@@ -20,6 +24,15 @@ float packRgbAsFloat(std::uint8_t r, std::uint8_t g, std::uint8_t b) {
   float value = 0.0f;
   std::memcpy(&value, &packed, sizeof(value));
   return value;
+}
+
+std::string instanceText(const InstanceRecord& instance, bool show_score) {
+  std::ostringstream stream;
+  stream << (instance.label.empty() ? std::to_string(instance.track_id) : instance.label);
+  if (show_score) {
+    stream << " " << static_cast<int>(std::round(instance.confidence * 100.0f)) << "%";
+  }
+  return stream.str();
 }
 
 }  // namespace
@@ -49,8 +62,20 @@ void PublisherPersistenceThread::run() {
   while (!stopRequested()) {
     const MapBackendSnapshot map_snapshot = map_thread_.debugSnapshot();
     map_surface_pub_->publish(buildMapSurfaceCloud(map_snapshot));
-    map_stats_pub_->publish(buildMapStats(map_snapshot));
+    const std_msgs::msg::String map_stats = buildMapStats(map_snapshot);
+    map_stats_pub_->publish(map_stats);
     marker_pub_->publish(buildInstanceMarkers());
+    const auto now = std::chrono::steady_clock::now();
+    if (now - last_log_time_ >=
+        std::chrono::duration<double>(config_.file_logging_period_sec)) {
+      last_log_time_ = now;
+      RunLogger::logGlobal("map", map_stats.data);
+      RunLogger::logGlobal("publisher",
+                           "published surface_points=" +
+                               std::to_string(map_snapshot.debug_surface_points.size()) +
+                               " instances=" +
+                               std::to_string(instance_store_.snapshotInstances().size()));
+    }
     std::this_thread::sleep_for(period);
   }
 }
@@ -115,10 +140,15 @@ std_msgs::msg::String PublisherPersistenceThread::buildMapStats(
     const MapBackendSnapshot& snapshot) const {
   std_msgs::msg::String message;
   std::ostringstream stream;
-  stream << "map_backend=" << config_.map_backend
+  stream << std::fixed << std::setprecision(2)
+         << "map_backend=" << config_.map_backend
          << " map_version=" << snapshot.map_version
          << " has_map=" << (snapshot.has_map ? "true" : "false")
          << " surface_points=" << snapshot.surface_points_world.size()
+         << " tsdf_blocks=" << snapshot.tsdf_blocks
+         << " voxels_scanned=" << snapshot.surface_voxels_scanned
+         << " snapshot_ms=" << snapshot.snapshot_ms
+         << " surface_extract_ms=" << snapshot.surface_extract_ms
          << " publish_period_sec=" << config_.publish_period_sec;
   message.data = stream.str();
   return message;
@@ -136,25 +166,23 @@ visualization_msgs::msg::MarkerArray PublisherPersistenceThread::buildInstanceMa
   const auto instances = instance_store_.snapshotInstances();
   int marker_id = 1;
   for (const InstanceRecord& instance : instances) {
+    const RgbColor color = colorForLabel(instance.label, instance.semantic_id);
     visualization_msgs::msg::Marker box;
     box.header.frame_id = config_.world_frame;
     box.header.stamp = node_.now();
     box.ns = "roomie_instances";
     box.id = marker_id++;
-    box.type = visualization_msgs::msg::Marker::CUBE;
+    box.type = visualization_msgs::msg::Marker::LINE_LIST;
     box.action = visualization_msgs::msg::Marker::ADD;
-    box.pose.position.x = instance.center_world.x();
-    box.pose.position.y = instance.center_world.y();
-    box.pose.position.z = instance.center_world.z();
-    box.pose.orientation.z = std::sin(0.5 * instance.yaw_rad);
-    box.pose.orientation.w = std::cos(0.5 * instance.yaw_rad);
-    box.scale.x = std::max(0.01f, instance.size_m.x());
-    box.scale.y = std::max(0.01f, instance.size_m.y());
-    box.scale.z = std::max(0.01f, instance.size_m.z());
-    box.color.r = 0.1f;
-    box.color.g = 0.8f;
-    box.color.b = 0.9f;
-    box.color.a = 0.35f;
+    box.pose.orientation.w = 1.0;
+    box.scale.x = 0.03;
+    box.color.r = color.r;
+    box.color.g = color.g;
+    box.color.b = color.b;
+    box.color.a = 0.95f;
+    fillLineListFromCorners(
+        yawObbCorners(instance.center_world, instance.size_m, instance.yaw_rad),
+        &box);
     markers.markers.push_back(box);
 
     visualization_msgs::msg::Marker text;
@@ -164,14 +192,16 @@ visualization_msgs::msg::MarkerArray PublisherPersistenceThread::buildInstanceMa
     text.id = marker_id++;
     text.type = visualization_msgs::msg::Marker::TEXT_VIEW_FACING;
     text.action = visualization_msgs::msg::Marker::ADD;
-    text.pose.position = box.pose.position;
+    text.pose.position.x = instance.center_world.x();
+    text.pose.position.y = instance.center_world.y();
+    text.pose.position.z = instance.center_world.z();
     text.pose.position.z += std::max(0.05f, instance.size_m.z() * 0.6f);
     text.scale.z = 0.12;
     text.color.r = 1.0f;
     text.color.g = 1.0f;
     text.color.b = 1.0f;
     text.color.a = 1.0f;
-    text.text = instance.label.empty() ? std::to_string(instance.track_id) : instance.label;
+    text.text = instanceText(instance, config_.show_3d_label_score);
     markers.markers.push_back(text);
   }
 

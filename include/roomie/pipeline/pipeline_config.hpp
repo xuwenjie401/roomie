@@ -2,6 +2,7 @@
 
 #include <cstddef>
 #include <string>
+#include <vector>
 
 #include <rclcpp/rclcpp.hpp>
 
@@ -18,6 +19,8 @@ struct PipelineConfig {
   std::string tf_topic = "/tf";
   std::string tf_static_topic = "/tf_static";
   std::string tsdf_output_topic = "/roomie/map_surface";
+  std::string detection_debug_image_topic = "/roomie/detections_2d_image";
+  std::string raw_detections_topic = "/roomie/raw_detections";
 
   int camera_width = 640;
   int camera_height = 480;
@@ -45,6 +48,23 @@ struct PipelineConfig {
   int patch_cols = 60;
   float min_patch_coverage_ratio = 0.05f;
   double max_inference_fps = 10.0;
+  bool python_backend_enabled = true;
+  std::string python_executable = "/home/agxi/miniconda3/envs/jarvis/bin/python";
+  std::string python_worker_script =
+      "/home/agxi/RealityLab/jarvis/src/roomie/scripts/roomie_python_inference_worker.py";
+  std::string boxer_repo_path = "/home/agxi/RealityLab/boxer";
+  std::string boxernet_ckpt_path =
+      "/home/agxi/huggingface/boxer/boxernet_hw960in4x6d768-3e37cfc4.ckpt";
+  std::string inference_device = "cuda";
+  std::string inference_precision = "auto";
+  std::vector<std::string> text_prompts = {"lvisplus"};
+  float owl_min_confidence = 0.25f;
+  float owl_nms_iou_threshold = 0.5f;
+  float boxernet_min_confidence = 0.5f;
+  float robot_bbox_mask_overlap = 0.25f;
+  float robot_bbox_center_overlap = 0.5f;
+  int robot_mask_dilate_px = 3;
+  bool show_3d_label_score = true;
 
   std::size_t input_queue_size = 30;
   std::size_t output_queue_size = 1;
@@ -70,6 +90,11 @@ struct PipelineConfig {
   std::string map_save_path;
   bool save_instance_map = true;
   std::string instance_map_save_path;
+
+  bool file_logging_enabled = true;
+  std::string file_logging_root_dir =
+      "/home/agxi/RealityLab/jarvis/src/roomie/logs/roomie_runs";
+  double file_logging_period_sec = 2.0;
 
   static PipelineConfig declareAndLoad(rclcpp::Node& node);
 };

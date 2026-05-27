@@ -2,6 +2,9 @@
 
 #include <algorithm>
 #include <chrono>
+#include <sstream>
+
+#include "roomie/utils/run_logger.hpp"
 
 namespace roomie {
 
@@ -38,6 +41,7 @@ void InstanceMapThread::run() {
 
 void InstanceMapThread::applyDetections(const InferenceResponse& response) {
   std::lock_guard<std::mutex> lock(mutex_);
+  const std::size_t before = instances_.size();
   for (const RawDetection& detection : response.detections) {
     InstanceRecord instance;
     instance.track_id = next_track_id_++;
@@ -53,6 +57,16 @@ void InstanceMapThread::applyDetections(const InferenceResponse& response) {
     instance.source_cameras.push_back(response.camera_id);
     instance.near_surface_voxels = map_projector_.collectNearSurfaceVoxels(detection);
     instances_.push_back(std::move(instance));
+  }
+
+  if (!response.detections.empty()) {
+    std::ostringstream stream;
+    stream << "applied camera=" << response.camera_id
+           << " t=" << response.time_ns
+           << " added=" << response.detections.size()
+           << " total=" << instances_.size()
+           << " before=" << before;
+    RunLogger::logGlobal("instance_map", stream.str());
   }
 
   // TODO: replace append-only behavior with OBB IoU matching, track aging, and

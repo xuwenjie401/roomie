@@ -1,5 +1,7 @@
 #pragma once
 
+#include <chrono>
+
 #include <rclcpp/rclcpp.hpp>
 #include <sensor_msgs/msg/point_cloud2.hpp>
 #include <std_msgs/msg/string.hpp>
@@ -36,6 +38,8 @@ class PublisherPersistenceThread : public WorkerThread {
   rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr marker_pub_;
   rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr map_surface_pub_;
   rclcpp::Publisher<std_msgs::msg::String>::SharedPtr map_stats_pub_;
+  std::chrono::steady_clock::time_point last_log_time_ =
+      std::chrono::steady_clock::now();
 };
 
 }  // namespace roomie

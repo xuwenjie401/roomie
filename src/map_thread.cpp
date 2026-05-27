@@ -4,7 +4,11 @@
 #include <array>
 #include <chrono>
 #include <cmath>
+#include <iomanip>
+#include <sstream>
 #include <utility>
+
+#include "roomie/utils/run_logger.hpp"
 
 namespace roomie {
 namespace {
@@ -38,6 +42,11 @@ float medianInPlace(std::vector<float>* values) {
   return 0.5f * (*lower_it + upper);
 }
 
+double elapsedMs(std::chrono::steady_clock::time_point start,
+                 std::chrono::steady_clock::time_point end) {
+  return std::chrono::duration<double, std::milli>(end - start).count();
+}
+
 }  // namespace
 
 MapThread::MapThread(ThreadSafeQueue<MappingFrame>& mapping_queue, PipelineConfig config)
@@ -58,12 +67,37 @@ bool MapThread::enqueueMappingFrame(MappingFrame frame) {
 }
 
 std::optional<PatchDepth> MapThread::projectPatchDepth(const DetectionFrame& frame) {
-  const MapBackendSnapshot snapshot = map_backend_->snapshot();
+  ++projection_requests_;
+  const auto project_total_start = std::chrono::steady_clock::now();
+  MapBackendSnapshot snapshot = timedBackendSnapshot();
   if (!snapshot.has_map) {
+    ++projection_no_map_;
+    maybeLogStatus();
     return std::nullopt;
   }
-  return projectWorldPointsToPatchDepth(
+  PatchDepth patch_depth = projectWorldPointsToPatchDepth(
       frame, snapshot.surface_points_world, snapshot.map_version);
+  patch_depth.source_surface_points =
+      static_cast<std::uint64_t>(snapshot.surface_points_world.size());
+  patch_depth.source_tsdf_blocks = snapshot.tsdf_blocks;
+  patch_depth.source_voxels_scanned = snapshot.surface_voxels_scanned;
+  patch_depth.snapshot_ms = snapshot.snapshot_ms;
+  patch_depth.surface_extract_ms = snapshot.surface_extract_ms;
+  patch_depth.project_total_ms =
+      elapsedMs(project_total_start, std::chrono::steady_clock::now());
+  last_valid_patches_ = patch_depth.valid_patches;
+  last_projected_points_ = patch_depth.projected_points;
+  last_projection_map_version_ = patch_depth.map_version;
+  last_source_surface_points_ = patch_depth.source_surface_points;
+  last_source_tsdf_blocks_ = patch_depth.source_tsdf_blocks;
+  last_source_voxels_scanned_ = patch_depth.source_voxels_scanned;
+  last_project_total_ms_.store(patch_depth.project_total_ms);
+  last_snapshot_ms_.store(patch_depth.snapshot_ms);
+  last_surface_extract_ms_.store(patch_depth.surface_extract_ms);
+  last_projection_loop_ms_.store(patch_depth.projection_loop_ms);
+  last_projection_median_ms_.store(patch_depth.projection_median_ms);
+  maybeLogStatus();
+  return patch_depth;
 }
 
 PatchDepth MapThread::projectWorldPointsToPatchDepth(const DetectionFrame& frame,
@@ -85,6 +119,7 @@ PatchDepth MapThread::projectWorldPointsToPatchDepth(const DetectionFrame& frame
   const float patch_height_px =
       static_cast<float>(config_.boxer_input_size) / static_cast<float>(PatchDepth::kRows);
 
+  const auto projection_loop_start = std::chrono::steady_clock::now();
   for (const Eigen::Vector3f& point_world : world_points) {
     if (!point_world.allFinite()) {
       continue;
@@ -109,7 +144,10 @@ PatchDepth MapThread::projectWorldPointsToPatchDepth(const DetectionFrame& frame
     patch_depths[static_cast<std::size_t>(row * PatchDepth::kCols + col)].push_back(z);
     ++result.projected_points;
   }
+  result.projection_loop_ms =
+      elapsedMs(projection_loop_start, std::chrono::steady_clock::now());
 
+  const auto median_start = std::chrono::steady_clock::now();
   for (int index = 0; index < PatchDepth::kSize; ++index) {
     std::vector<float>& depths = patch_depths[static_cast<std::size_t>(index)];
     if (depths.empty()) {
@@ -118,6 +156,7 @@ PatchDepth MapThread::projectWorldPointsToPatchDepth(const DetectionFrame& frame
     result.values[static_cast<std::size_t>(index)] = medianInPlace(&depths);
     ++result.valid_patches;
   }
+  result.projection_median_ms = elapsedMs(median_start, std::chrono::steady_clock::now());
 
   return result;
 }
@@ -132,7 +171,14 @@ std::uint64_t MapThread::mapVersion() const {
 }
 
 MapBackendSnapshot MapThread::debugSnapshot() const {
-  return map_backend_->snapshot();
+  return timedBackendSnapshot();
+}
+
+MapBackendSnapshot MapThread::timedBackendSnapshot() const {
+  const auto snapshot_start = std::chrono::steady_clock::now();
+  MapBackendSnapshot snapshot = map_backend_->snapshot();
+  snapshot.snapshot_ms = elapsedMs(snapshot_start, std::chrono::steady_clock::now());
+  return snapshot;
 }
 
 void MapThread::run() {
@@ -142,7 +188,38 @@ void MapThread::run() {
       continue;
     }
     map_backend_->integrateFrame(frame);
+    ++integrated_frames_;
+    maybeLogStatus();
   }
+}
+
+void MapThread::maybeLogStatus() {
+  std::lock_guard<std::mutex> lock(status_mutex_);
+  const auto now = std::chrono::steady_clock::now();
+  if (now - last_status_log_time_ <
+      std::chrono::duration<double>(config_.file_logging_period_sec)) {
+    return;
+  }
+  last_status_log_time_ = now;
+
+  std::ostringstream stream;
+  stream << std::fixed << std::setprecision(2)
+         << "status backend=" << config_.map_backend
+         << " integrated_frames=" << integrated_frames_.load()
+         << " projection_requests=" << projection_requests_.load()
+         << " projection_no_map=" << projection_no_map_.load()
+         << " last_valid_patches=" << last_valid_patches_.load()
+         << " last_projected_points=" << last_projected_points_.load()
+         << " last_map_version=" << last_projection_map_version_.load()
+         << " last_source_surface_points=" << last_source_surface_points_.load()
+         << " last_tsdf_blocks=" << last_source_tsdf_blocks_.load()
+         << " last_voxels_scanned=" << last_source_voxels_scanned_.load()
+         << " last_project_total_ms=" << last_project_total_ms_.load()
+         << " last_snapshot_ms=" << last_snapshot_ms_.load()
+         << " last_surface_extract_ms=" << last_surface_extract_ms_.load()
+         << " last_projection_loop_ms=" << last_projection_loop_ms_.load()
+         << " last_projection_median_ms=" << last_projection_median_ms_.load();
+  RunLogger::logGlobal("map_thread", stream.str());
 }
 
 }  // namespace roomie

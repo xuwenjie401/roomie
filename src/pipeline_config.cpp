@@ -48,6 +48,10 @@ PipelineConfig PipelineConfig::declareAndLoad(rclcpp::Node& node) {
       node.declare_parameter<std::string>("topics.tf_static_topic", config.tf_static_topic);
   config.tsdf_output_topic = node.declare_parameter<std::string>(
       "topics.tsdf_output_topic", config.tsdf_output_topic);
+  config.detection_debug_image_topic = node.declare_parameter<std::string>(
+      "topics.detection_debug_image_topic", config.detection_debug_image_topic);
+  config.raw_detections_topic = node.declare_parameter<std::string>(
+      "topics.raw_detections_topic", config.raw_detections_topic);
 
   config.camera_width = positiveIntOrDefault(
       node.declare_parameter<int>("camera.width", config.camera_width),
@@ -137,6 +141,53 @@ PipelineConfig PipelineConfig::declareAndLoad(rclcpp::Node& node) {
       0.0,
       node.declare_parameter<double>("detection.max_inference_fps",
                                      config.max_inference_fps));
+  config.python_backend_enabled = node.declare_parameter<bool>(
+      "detection.python_backend_enabled", config.python_backend_enabled);
+  config.python_executable = node.declare_parameter<std::string>(
+      "detection.python_executable", config.python_executable);
+  config.python_worker_script = node.declare_parameter<std::string>(
+      "detection.python_worker_script", config.python_worker_script);
+  config.boxer_repo_path = node.declare_parameter<std::string>(
+      "detection.boxer_repo_path", config.boxer_repo_path);
+  config.boxernet_ckpt_path = node.declare_parameter<std::string>(
+      "detection.boxernet_ckpt_path", config.boxernet_ckpt_path);
+  config.inference_device = node.declare_parameter<std::string>(
+      "detection.inference_device", config.inference_device);
+  config.inference_precision = node.declare_parameter<std::string>(
+      "detection.inference_precision", config.inference_precision);
+  config.text_prompts = node.declare_parameter<std::vector<std::string>>(
+      "detection.text_prompts", config.text_prompts);
+  config.owl_min_confidence = static_cast<float>(std::clamp(
+      node.declare_parameter<double>("detection.owl_min_confidence",
+                                     config.owl_min_confidence),
+      0.0,
+      1.0));
+  config.owl_nms_iou_threshold = static_cast<float>(std::clamp(
+      node.declare_parameter<double>("detection.owl_nms_iou_threshold",
+                                     config.owl_nms_iou_threshold),
+      0.0,
+      1.0));
+  config.boxernet_min_confidence = static_cast<float>(std::clamp(
+      node.declare_parameter<double>("detection.boxernet_min_confidence",
+                                     config.boxernet_min_confidence),
+      0.0,
+      1.0));
+  config.robot_bbox_mask_overlap = static_cast<float>(std::clamp(
+      node.declare_parameter<double>("detection.robot_bbox_mask_overlap",
+                                     config.robot_bbox_mask_overlap),
+      0.0,
+      1.0));
+  config.robot_bbox_center_overlap = static_cast<float>(std::clamp(
+      node.declare_parameter<double>("detection.robot_bbox_center_overlap",
+                                     config.robot_bbox_center_overlap),
+      0.0,
+      1.0));
+  config.robot_mask_dilate_px = std::max(
+      0,
+      static_cast<int>(node.declare_parameter<int>("detection.robot_mask_dilate_px",
+                                                   config.robot_mask_dilate_px)));
+  config.show_3d_label_score = node.declare_parameter<bool>(
+      "detection.show_3d_label_score", config.show_3d_label_score);
 
   config.input_queue_size = positiveSizeOrDefault(
       node.declare_parameter<int>("queues.input_queue_size",
@@ -200,6 +251,15 @@ PipelineConfig PipelineConfig::declareAndLoad(rclcpp::Node& node) {
       "persistence.save_instance_map", config.save_instance_map);
   config.instance_map_save_path = node.declare_parameter<std::string>(
       "persistence.instance_map_save_path", config.instance_map_save_path);
+
+  config.file_logging_enabled = node.declare_parameter<bool>(
+      "logging.enabled", config.file_logging_enabled);
+  config.file_logging_root_dir = node.declare_parameter<std::string>(
+      "logging.root_dir", config.file_logging_root_dir);
+  config.file_logging_period_sec = std::max(
+      0.25,
+      node.declare_parameter<double>("logging.period_sec",
+                                     config.file_logging_period_sec));
 
   return config;
 }

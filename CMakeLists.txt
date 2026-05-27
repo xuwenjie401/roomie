@@ -27,6 +27,7 @@ find_package(sensor_msgs REQUIRED)
 find_package(std_msgs REQUIRED)
 find_package(tf2_msgs REQUIRED)
 find_package(visualization_msgs REQUIRED)
+find_package(OpenCV REQUIRED COMPONENTS core imgproc)
 
 add_library(
   roomie_pipeline
@@ -41,13 +42,15 @@ add_library(
   src/publisher_persistence_thread.cpp
   src/python_inference_backend.cpp
   src/ros_io_thread.cpp
+  src/utils/run_logger.cpp
+  src/utils/visualization_utils.cpp
   src/worker_thread.cpp
 )
 target_include_directories(
   roomie_pipeline PUBLIC "$<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>"
                          "$<INSTALL_INTERFACE:include/${PROJECT_NAME}>"
 )
-target_link_libraries(roomie_pipeline Eigen3::Eigen)
+target_link_libraries(roomie_pipeline Eigen3::Eigen ${OpenCV_LIBS})
 
 if(ROOMIE_ENABLE_NVBLOX)
   find_package(CUDAToolkit REQUIRED)
@@ -116,6 +119,7 @@ install(TARGETS roomie_pipeline
 install(TARGETS roomie_pipeline_node RUNTIME DESTINATION lib/${PROJECT_NAME})
 install(DIRECTORY include/ DESTINATION include/${PROJECT_NAME})
 install(DIRECTORY config launch rviz DESTINATION share/${PROJECT_NAME})
+install(PROGRAMS scripts/roomie_python_inference_worker.py DESTINATION lib/${PROJECT_NAME})
 
 ament_export_targets(roomie-targets HAS_LIBRARY_TARGET)
 ament_export_dependencies(Eigen3 geometry_msgs rclcpp sensor_msgs std_msgs tf2_msgs visualization_msgs)

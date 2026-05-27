@@ -1,6 +1,8 @@
 #pragma once
 
+#include <chrono>
 #include <condition_variable>
+#include <cstdint>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -42,6 +44,7 @@ struct RosIoSubscriptionConfig {
   std::string tf_static_topic = "/tf_static";
   double max_image_stamp_delta_sec = 0.002;
   double max_tf_gap_sec = 0.2;
+  double log_period_sec = 2.0;
   std::size_t input_queue_size = 30;
   std::vector<RosCameraSubscriptionConfig> cameras;
 };
@@ -101,6 +104,7 @@ class RosIoThread : public WorkerThread {
   void handleCameraInfo(const std::string& camera_id,
                         const sensor_msgs::msg::CameraInfo::SharedPtr msg);
   void handleTf(const tf2_msgs::msg::TFMessage::SharedPtr msg, bool is_static);
+  void maybeLogStatusLocked();
   std::pair<std::optional<MappingFrame>, std::optional<DetectionFrame>>
   makeFramesLocked(const std::string& camera_id, TimeNanoseconds time_ns);
   std::optional<Eigen::Isometry3f> lookupTWorldFrameLocked(
@@ -119,6 +123,16 @@ class RosIoThread : public WorkerThread {
   rclcpp::Subscription<tf2_msgs::msg::TFMessage>::SharedPtr tf_subscription_;
   rclcpp::Subscription<tf2_msgs::msg::TFMessage>::SharedPtr tf_static_subscription_;
   rclcpp::Logger logger_;
+  std::chrono::steady_clock::time_point last_status_log_time_ =
+      std::chrono::steady_clock::now();
+  std::uint64_t rgb_messages_ = 0;
+  std::uint64_t mask_messages_ = 0;
+  std::uint64_t depth_messages_ = 0;
+  std::uint64_t camera_info_messages_ = 0;
+  std::uint64_t tf_messages_ = 0;
+  std::uint64_t tf_static_messages_ = 0;
+  std::uint64_t mapping_frames_emitted_ = 0;
+  std::uint64_t detection_frames_emitted_ = 0;
 };
 
 }  // namespace roomie

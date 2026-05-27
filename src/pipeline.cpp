@@ -4,6 +4,7 @@ namespace roomie {
 
 RoomiePipeline::RoomiePipeline(rclcpp::Node& node, PipelineConfig config)
     : config_(std::move(config)),
+      run_logger_(std::make_shared<RunLogger>(config_)),
       mapping_queue_(config_.mapping_queue_size),
       detection_queue_(config_.detection_queue_size),
       inference_response_queue_(config_.inference_response_queue_size),
@@ -11,12 +12,26 @@ RoomiePipeline::RoomiePipeline(rclcpp::Node& node, PipelineConfig config)
       map_thread_(mapping_queue_, config_),
       python_backend_(config_),
       instance_map_thread_(inference_response_queue_, map_thread_, config_),
-      detection_bridge_thread_(detection_queue_,
+      detection_bridge_thread_(node,
+                               detection_queue_,
                                inference_response_queue_,
                                map_thread_,
                                python_backend_,
                                config_),
       publisher_persistence_thread_(node, instance_map_thread_, map_thread_, config_) {
+  RunLogger::setGlobal(run_logger_);
+  if (run_logger_ && run_logger_->enabled()) {
+    RCLCPP_INFO(node.get_logger(),
+                "roomie file logs: %s",
+                run_logger_->runDirectory().c_str());
+    run_logger_->log("pipeline",
+                     "config map_backend=" + config_.map_backend +
+                         " world_frame=" + config_.world_frame +
+                         " camera_id=" + config_.mapping_camera_id +
+                         " debug_image=" + config_.detection_debug_image_topic +
+                         " raw_detections=" + config_.raw_detections_topic);
+  }
+
   RosCameraSubscriptionConfig mapping_camera;
   mapping_camera.camera_id = config_.mapping_camera_id;
   mapping_camera.camera_frame = config_.mapping_camera_frame;
@@ -43,6 +58,7 @@ RoomiePipeline::RoomiePipeline(rclcpp::Node& node, PipelineConfig config)
   ros_io_config.tf_static_topic = config_.tf_static_topic;
   ros_io_config.max_image_stamp_delta_sec = config_.max_image_stamp_delta_sec;
   ros_io_config.max_tf_gap_sec = config_.max_tf_gap_sec;
+  ros_io_config.log_period_sec = config_.file_logging_period_sec;
   ros_io_config.input_queue_size = config_.input_queue_size;
   ros_io_config.cameras.push_back(std::move(mapping_camera));
   ros_io_thread_.configure(std::move(ros_io_config));
@@ -55,6 +71,7 @@ void RoomiePipeline::start() {
   if (started_) {
     return;
   }
+  RunLogger::logGlobal("pipeline", "start");
   python_backend_.start();
   map_thread_.start();
   instance_map_thread_.start();
@@ -69,6 +86,7 @@ void RoomiePipeline::stop() {
     return;
   }
 
+  RunLogger::logGlobal("pipeline", "stop requested");
   ros_io_thread_.stop();
   detection_queue_.stop();
   mapping_queue_.stop();
@@ -78,6 +96,7 @@ void RoomiePipeline::stop() {
   instance_map_thread_.stop();
   map_thread_.stop();
   python_backend_.stop();
+  RunLogger::logGlobal("pipeline", "stopped");
   started_ = false;
 }
 

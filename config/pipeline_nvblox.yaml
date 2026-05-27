@@ -15,6 +15,8 @@ roomie_pipeline_node:
       tf_topic: /tf
       tf_static_topic: /tf_static
       tsdf_output_topic: /roomie/map_surface
+      detection_debug_image_topic: /roomie/detections_2d_image
+      raw_detections_topic: /roomie/raw_detections
 
     camera:
       width: 640
@@ -39,9 +41,9 @@ roomie_pipeline_node:
       min_visualization_weight: 1.0
       min_color_weight: 0.1
       surface_visualization_distance_vox: 1.0
-      load_map: false
+      load_map: true
       map_load_path: /home/agxi/Datasets/output/jarvis_home/nvblox/color_tsdf_map_0526_1639.nvblox
-      freeze_tsdf_map: false
+      freeze_tsdf_map: true
       save_map: false
       map_save_path: /home/agxi/Datasets/output/jarvis_home/nvblox/
 
@@ -51,6 +53,21 @@ roomie_pipeline_node:
       patch_cols: 60
       min_patch_coverage_ratio: 0.05
       max_inference_fps: 10.0
+      python_backend_enabled: true
+      python_executable: /home/agxi/miniconda3/envs/jarvis/bin/python
+      python_worker_script: /home/agxi/RealityLab/jarvis/src/roomie/scripts/roomie_python_inference_worker.py
+      boxer_repo_path: /home/agxi/RealityLab/boxer
+      boxernet_ckpt_path: /home/agxi/huggingface/boxer/boxernet_hw960in4x6d768-3e37cfc4.ckpt
+      inference_device: cuda
+      inference_precision: auto
+      text_prompts: [lvisplus]
+      owl_min_confidence: 0.25
+      owl_nms_iou_threshold: 0.5
+      boxernet_min_confidence: 0.5
+      robot_bbox_mask_overlap: 0.25
+      robot_bbox_center_overlap: 0.5
+      robot_mask_dilate_px: 3
+      show_3d_label_score: true
 
     queues:
       input_queue_size: 30
@@ -75,3 +92,8 @@ roomie_pipeline_node:
     persistence:
       save_instance_map: true
       instance_map_save_path: /home/agxi/Datasets/output/jarvis_home/instances/
+
+    logging:
+      enabled: true
+      root_dir: /home/agxi/RealityLab/jarvis/src/roomie/logs/roomie_runs
+      period_sec: 2.0

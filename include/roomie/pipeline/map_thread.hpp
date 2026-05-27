@@ -1,6 +1,10 @@
 #pragma once
 
+#include <chrono>
+#include <atomic>
+#include <cstdint>
 #include <memory>
+#include <mutex>
 #include <optional>
 
 #include "roomie/pipeline/interfaces.hpp"
@@ -28,6 +32,8 @@ class MapThread : public WorkerThread, public MapProjector {
   void run() override;
 
  private:
+  MapBackendSnapshot timedBackendSnapshot() const;
+  void maybeLogStatus();
   PatchDepth projectWorldPointsToPatchDepth(const DetectionFrame& frame,
                                             const WorldPointVector& world_points,
                                             std::uint64_t map_version) const;
@@ -35,6 +41,23 @@ class MapThread : public WorkerThread, public MapProjector {
   ThreadSafeQueue<MappingFrame>& mapping_queue_;
   PipelineConfig config_;
   std::unique_ptr<MapBackend> map_backend_;
+  std::mutex status_mutex_;
+  std::chrono::steady_clock::time_point last_status_log_time_ =
+      std::chrono::steady_clock::now();
+  std::atomic_uint64_t integrated_frames_{0};
+  std::atomic_uint64_t projection_requests_{0};
+  std::atomic_uint64_t projection_no_map_{0};
+  std::atomic_int last_valid_patches_{0};
+  std::atomic_int last_projected_points_{0};
+  std::atomic_uint64_t last_projection_map_version_{0};
+  std::atomic_uint64_t last_source_surface_points_{0};
+  std::atomic_uint64_t last_source_tsdf_blocks_{0};
+  std::atomic_uint64_t last_source_voxels_scanned_{0};
+  std::atomic<double> last_project_total_ms_{0.0};
+  std::atomic<double> last_snapshot_ms_{0.0};
+  std::atomic<double> last_surface_extract_ms_{0.0};
+  std::atomic<double> last_projection_loop_ms_{0.0};
+  std::atomic<double> last_projection_median_ms_{0.0};
 };
 
 }  // namespace roomie

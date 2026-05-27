@@ -12,6 +12,7 @@
 #include "roomie/pipeline/python_inference_backend.hpp"
 #include "roomie/pipeline/ros_io_thread.hpp"
 #include "roomie/pipeline/thread_safe_queue.hpp"
+#include "roomie/utils/run_logger.hpp"
 
 namespace roomie {
 
@@ -25,6 +26,7 @@ class RoomiePipeline {
 
  private:
   PipelineConfig config_;
+  std::shared_ptr<RunLogger> run_logger_;
   ThreadSafeQueue<MappingFrame> mapping_queue_;
   ThreadSafeQueue<DetectionFrame> detection_queue_;
   ThreadSafeQueue<InferenceResponse> inference_response_queue_;

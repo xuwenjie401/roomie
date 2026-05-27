@@ -5,10 +5,13 @@
 #include <cmath>
 #include <cstring>
 #include <limits>
+#include <sstream>
 #include <unordered_set>
 #include <utility>
 
 #include <geometry_msgs/msg/transform_stamped.hpp>
+
+#include "roomie/utils/run_logger.hpp"
 
 namespace roomie {
 namespace {
@@ -367,11 +370,13 @@ void RosIoThread::handleRgb(const std::string& camera_id,
     std::lock_guard<std::mutex> lock(mutex_);
     auto& state = camera_states_[camera_id];
     state.config.camera_id = camera_id;
+    ++rgb_messages_;
     state.latest_rgb_time_ns = toNanoseconds(msg->header.stamp);
     state.latest_rgb = std::move(rgb);
     auto frames = makeFramesLocked(camera_id, state.latest_rgb_time_ns);
     mapping_frame = std::move(frames.first);
     detection_frame = std::move(frames.second);
+    maybeLogStatusLocked();
   }
 
   if (mapping_frame) {
@@ -398,11 +403,13 @@ void RosIoThread::handleRobotMask(const std::string& camera_id,
     std::lock_guard<std::mutex> lock(mutex_);
     auto& state = camera_states_[camera_id];
     state.config.camera_id = camera_id;
+    ++mask_messages_;
     state.latest_robot_mask_time_ns = toNanoseconds(msg->header.stamp);
     state.latest_robot_mask = std::move(mask);
     auto frames = makeFramesLocked(camera_id, state.latest_rgb_time_ns);
     mapping_frame = std::move(frames.first);
     detection_frame = std::move(frames.second);
+    maybeLogStatusLocked();
   }
 
   if (mapping_frame) {
@@ -421,6 +428,7 @@ void RosIoThread::handleDepth(const std::string& camera_id,
     std::lock_guard<std::mutex> lock(mutex_);
     auto& state = camera_states_[camera_id];
     state.config.camera_id = camera_id;
+    ++depth_messages_;
     auto depth = depthBufferFromRos(*msg,
                                     state.config.depth_scale,
                                     state.config.depth_min_m,
@@ -436,6 +444,7 @@ void RosIoThread::handleDepth(const std::string& camera_id,
     auto frames = makeFramesLocked(camera_id, state.latest_rgb_time_ns);
     mapping_frame = std::move(frames.first);
     detection_frame = std::move(frames.second);
+    maybeLogStatusLocked();
   }
 
   if (mapping_frame) {
@@ -453,10 +462,12 @@ void RosIoThread::handleCameraInfo(const std::string& camera_id,
   state.config.camera_id = camera_id;
   const CameraIntrinsics intrinsics = intrinsicsFromRos(*msg);
   if (hasUsableIntrinsics(intrinsics)) {
+    ++camera_info_messages_;
     state.latest_intrinsics = intrinsics;
   } else if (!state.latest_intrinsics && hasUsableIntrinsics(state.config.fallback_intrinsics)) {
     state.latest_intrinsics = state.config.fallback_intrinsics;
   }
+  maybeLogStatusLocked();
 }
 
 void RosIoThread::handleTf(const tf2_msgs::msg::TFMessage::SharedPtr msg, bool is_static) {
@@ -464,6 +475,11 @@ void RosIoThread::handleTf(const tf2_msgs::msg::TFMessage::SharedPtr msg, bool i
   std::vector<DetectionFrame> detection_frames;
   {
     std::lock_guard<std::mutex> lock(mutex_);
+    if (is_static) {
+      ++tf_static_messages_;
+    } else {
+      ++tf_messages_;
+    }
     for (const auto& transform_msg : msg->transforms) {
       const std::string parent_frame = normalizeFrameId(transform_msg.header.frame_id);
       const std::string child_frame = normalizeFrameId(transform_msg.child_frame_id);
@@ -500,6 +516,7 @@ void RosIoThread::handleTf(const tf2_msgs::msg::TFMessage::SharedPtr msg, bool i
         detection_frames.push_back(std::move(*frames.second));
       }
     }
+    maybeLogStatusLocked();
   }
 
   for (MappingFrame& frame : mapping_frames) {
@@ -589,6 +606,7 @@ RosIoThread::makeFramesLocked(const std::string& camera_id, TimeNanoseconds time
     frame.T_world_camera = *state.latest_T_world_camera;
     detection_frame = std::move(frame);
     state.last_emitted_detection_time_ns = time_ns;
+    ++detection_frames_emitted_;
   }
 
   std::optional<MappingFrame> mapping_frame;
@@ -607,9 +625,32 @@ RosIoThread::makeFramesLocked(const std::string& camera_id, TimeNanoseconds time
     frame.T_world_camera = *state.latest_T_world_camera;
     mapping_frame = std::move(frame);
     state.last_emitted_mapping_time_ns = time_ns;
+    ++mapping_frames_emitted_;
   }
 
   return {std::move(mapping_frame), std::move(detection_frame)};
+}
+
+void RosIoThread::maybeLogStatusLocked() {
+  const auto now = std::chrono::steady_clock::now();
+  if (now - last_status_log_time_ <
+      std::chrono::duration<double>(config_.log_period_sec)) {
+    return;
+  }
+  last_status_log_time_ = now;
+
+  std::ostringstream stream;
+  stream << "status rgb=" << rgb_messages_
+         << " mask=" << mask_messages_
+         << " depth=" << depth_messages_
+         << " camera_info=" << camera_info_messages_
+         << " tf=" << tf_messages_
+         << " tf_static=" << tf_static_messages_
+         << " mapping_frames=" << mapping_frames_emitted_
+         << " detection_frames=" << detection_frames_emitted_
+         << " cameras=" << camera_states_.size()
+         << " tf_edges=" << transforms_by_child_frame_.size();
+  RunLogger::logGlobal("ros_io", stream.str());
 }
 
 void RosIoThread::run() {

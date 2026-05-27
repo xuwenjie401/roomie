@@ -85,6 +85,14 @@ struct PatchDepth {
   int valid_patches = 0;
   int projected_points = 0;
   std::uint64_t map_version = 0;
+  std::uint64_t source_surface_points = 0;
+  std::uint64_t source_tsdf_blocks = 0;
+  std::uint64_t source_voxels_scanned = 0;
+  double project_total_ms = 0.0;
+  double snapshot_ms = 0.0;
+  double surface_extract_ms = 0.0;
+  double projection_loop_ms = 0.0;
+  double projection_median_ms = 0.0;
 
   PatchDepth() { values.fill(-1.0f); }
 
@@ -107,6 +115,13 @@ struct InferenceRequest {
   Eigen::Isometry3f T_world_camera = Eigen::Isometry3f::Identity();
 };
 
+struct Raw2dDetection {
+  float score_2d = 0.0f;
+  std::array<float, 4> box_xyxy = {0.0f, 0.0f, 0.0f, 0.0f};
+  int semantic_id = -1;
+  std::string label;
+};
+
 struct RawDetection {
   EIGEN_MAKE_ALIGNED_OPERATOR_NEW
 
@@ -125,6 +140,14 @@ struct InferenceResponse {
   std::string camera_id;
   bool ok = false;
   std::string error;
+  float backend_ipc_ms = 0.0f;
+  float python_worker_ms = 0.0f;
+  float python_preprocess_ms = 0.0f;
+  float owl_ms = 0.0f;
+  float robot_filter_ms = 0.0f;
+  float boxernet_ms = 0.0f;
+  float python_postprocess_ms = 0.0f;
+  std::vector<Raw2dDetection> filtered_2d_detections;
   std::vector<RawDetection, Eigen::aligned_allocator<RawDetection>> detections;
 };
 
