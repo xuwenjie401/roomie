@@ -284,6 +284,31 @@ PipelineConfig PipelineConfig::declareAndLoad(rclcpp::Node& node) {
                                      config.instance_duplicate_small_object_volume_ratio),
       0.0,
       1.0));
+  config.instance_small_duplicate_max_volume_m3 = static_cast<float>(
+      std::max(0.0,
+               node.declare_parameter<double>(
+                   "instance.small_duplicate_max_volume_m3",
+                   config.instance_small_duplicate_max_volume_m3)));
+  config.instance_small_duplicate_max_extent_m = static_cast<float>(
+      std::max(0.0,
+               node.declare_parameter<double>(
+                   "instance.small_duplicate_max_extent_m",
+                   config.instance_small_duplicate_max_extent_m)));
+  config.instance_small_duplicate_iou_threshold = static_cast<float>(std::clamp(
+      node.declare_parameter<double>("instance.small_duplicate_iou_threshold",
+                                     config.instance_small_duplicate_iou_threshold),
+      0.0,
+      1.0));
+  config.instance_small_duplicate_center_ratio = static_cast<float>(
+      std::max(0.0,
+               node.declare_parameter<double>(
+                   "instance.small_duplicate_center_ratio",
+                   config.instance_small_duplicate_center_ratio)));
+  config.instance_small_duplicate_size_ratio_min = static_cast<float>(std::clamp(
+      node.declare_parameter<double>("instance.small_duplicate_size_ratio_min",
+                                     config.instance_small_duplicate_size_ratio_min),
+      0.0,
+      1.0));
   config.instance_quality_observation_min_quality = static_cast<float>(std::clamp(
       node.declare_parameter<double>("instance.quality_observation_min_quality",
                                      config.instance_quality_observation_min_quality),
@@ -366,6 +391,16 @@ PipelineConfig PipelineConfig::declareAndLoad(rclcpp::Node& node) {
       node.declare_parameter<int>("instance.geometry_inactive_delete_bad_count",
                                   config.instance_geometry_inactive_delete_bad_count),
       config.instance_geometry_inactive_delete_bad_count);
+  config.instance_geometry_empty_small_object_max_volume_m3 = static_cast<float>(
+      std::max(0.0,
+               node.declare_parameter<double>(
+                   "instance.geometry_empty_small_object_max_volume_m3",
+                   config.instance_geometry_empty_small_object_max_volume_m3)));
+  config.instance_geometry_empty_small_object_max_extent_m = static_cast<float>(
+      std::max(0.0,
+               node.declare_parameter<double>(
+                   "instance.geometry_empty_small_object_max_extent_m",
+                   config.instance_geometry_empty_small_object_max_extent_m)));
   config.instance_geometry_reevaluate_center_delta_m = positiveFloatOrDefault(
       node.declare_parameter<double>("instance.geometry_reevaluate_center_delta_m",
                                      config.instance_geometry_reevaluate_center_delta_m),
@@ -379,6 +414,32 @@ PipelineConfig PipelineConfig::declareAndLoad(rclcpp::Node& node) {
       node.declare_parameter<double>("instance.geometry_reevaluate_yaw_delta_deg",
                                      config.instance_geometry_reevaluate_yaw_delta_deg),
       config.instance_geometry_reevaluate_yaw_delta_deg);
+  config.instance_confirmed_geometry_edge_freeze_weight = static_cast<float>(std::clamp(
+      node.declare_parameter<double>(
+          "instance.confirmed_geometry_edge_freeze_weight",
+          config.instance_confirmed_geometry_edge_freeze_weight),
+      0.0,
+      1.0));
+  config.instance_confirmed_geometry_large_min_volume_m3 = static_cast<float>(std::max(
+      0.0,
+      node.declare_parameter<double>(
+          "instance.confirmed_geometry_large_min_volume_m3",
+          config.instance_confirmed_geometry_large_min_volume_m3)));
+  config.instance_confirmed_geometry_far_center_shift_ratio = static_cast<float>(
+      std::max(0.0,
+               node.declare_parameter<double>(
+                   "instance.confirmed_geometry_far_center_shift_ratio",
+                   config.instance_confirmed_geometry_far_center_shift_ratio)));
+  config.instance_confirmed_geometry_far_center_shift_min_m = static_cast<float>(
+      std::max(0.0,
+               node.declare_parameter<double>(
+                   "instance.confirmed_geometry_far_center_shift_min_m",
+                   config.instance_confirmed_geometry_far_center_shift_min_m)));
+  config.instance_confirmed_geometry_center_shift_min_extent_m = static_cast<float>(
+      std::max(0.0,
+               node.declare_parameter<double>(
+                   "instance.confirmed_geometry_center_shift_min_extent_m",
+                   config.instance_confirmed_geometry_center_shift_min_extent_m)));
 
   config.input_queue_size = positiveSizeOrDefault(
       node.declare_parameter<int>("queues.input_queue_size",

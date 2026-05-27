@@ -9,6 +9,7 @@
 #include <cstdint>
 #include <cstring>
 #include <filesystem>
+#include <initializer_list>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -76,6 +77,32 @@ bool pointInsideYawObb(const Eigen::Vector3f& point_world, const RawDetection& d
   return std::abs(local.x()) <= half_size.x() &&
          std::abs(local.y()) <= half_size.y() &&
          std::abs(local.z()) <= half_size.z();
+}
+
+nvblox::AxisAlignedBoundingBox detectionAabbWorld(const RawDetection& detection) {
+  const Eigen::Vector3f half_size =
+      0.5f * detection.size_m.cwiseMax(Eigen::Vector3f::Zero());
+  const float cos_yaw = std::cos(detection.yaw_rad);
+  const float sin_yaw = std::sin(detection.yaw_rad);
+  nvblox::AxisAlignedBoundingBox aabb;
+  bool initialized = false;
+  for (const float x : {-half_size.x(), half_size.x()}) {
+    for (const float y : {-half_size.y(), half_size.y()}) {
+      for (const float z : {-half_size.z(), half_size.z()}) {
+        const Eigen::Vector3f point_world(
+            detection.center_world.x() + cos_yaw * x - sin_yaw * y,
+            detection.center_world.y() + sin_yaw * x + cos_yaw * y,
+            detection.center_world.z() + z);
+        if (!initialized) {
+          aabb = nvblox::AxisAlignedBoundingBox(point_world, point_world);
+          initialized = true;
+        } else {
+          aabb.extend(point_world);
+        }
+      }
+    }
+  }
+  return aabb;
 }
 
 double elapsedMs(std::chrono::steady_clock::time_point start,
@@ -252,8 +279,13 @@ class NvbloxMapBackend : public MapBackend {
       const RawDetection& detection) const override {
     std::lock_guard<std::mutex> lock(mutex_);
     ensureSurfaceCacheLocked();
+    const nvblox::AxisAlignedBoundingBox detection_aabb = detectionAabbWorld(detection);
     std::vector<VoxelRef, Eigen::aligned_allocator<VoxelRef>> refs;
     for (const SurfaceBlockCache& block_cache : surface_cache_blocks_) {
+      if (block_cache.surface_points_world.empty() ||
+          !block_cache.aabb_world.intersects(detection_aabb)) {
+        continue;
+      }
       for (std::size_t i = 0; i < block_cache.surface_points_world.size(); ++i) {
         if (!pointInsideYawObb(block_cache.surface_points_world[i], detection)) {
           continue;

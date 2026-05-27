@@ -83,21 +83,26 @@ roomie_pipeline_node:
       match_center_distance_m: 0.75
       min_support_count: 3
       min_confidence_mass: 1.5
-      tentative_max_missed: 2
-      inactive_after_missed: 3
+      tentative_max_missed: 4
+      inactive_after_missed: 4
       duplicate_iou_threshold: 0.70
       duplicate_size_ratio_min: 0.70
       confirmed_duplicate_iou_threshold: 0.20
       duplicate_containment_threshold: 0.48
       duplicate_center_distance_m: 0.85
       duplicate_small_object_volume_ratio: 0.15
-      quality_observation_min_quality: 0.50
-      close_observation_distance_m: 3.0
+      small_duplicate_max_volume_m3: 0.025
+      small_duplicate_max_extent_m: 0.65
+      small_duplicate_iou_threshold: 0.25
+      small_duplicate_center_ratio: 0.35
+      small_duplicate_size_ratio_min: 0.55
+      quality_observation_min_quality: 0.45
+      close_observation_distance_m: 3.5
       far_observation_distance_m: 4.5
       far_promotion_weight: 0.25
       fusion_prior_mass_cap: 6.0
-      high_quality_min_count: 5
-      high_quality_min_mass: 3.0
+      high_quality_min_count: 3
+      high_quality_min_mass: 1.8
       geometry_check_period_sec: 2.0
       geometry_recent_window_sec: 5.0
       geometry_shell_thickness_m: 0.08
@@ -108,13 +113,20 @@ roomie_pipeline_node:
       geometry_recover_score: 0.55
       geometry_failures_before_suppress: 2
       geometry_inactive_delete_bad_count: 3
+      geometry_empty_small_object_max_volume_m3: 0.025
+      geometry_empty_small_object_max_extent_m: 0.65
       geometry_reevaluate_center_delta_m: 0.12
       geometry_reevaluate_size_ratio: 0.20
       geometry_reevaluate_yaw_delta_deg: 15.0
+      confirmed_geometry_edge_freeze_weight: 0.999
+      confirmed_geometry_large_min_volume_m3: 0.35
+      confirmed_geometry_far_center_shift_ratio: 0.08
+      confirmed_geometry_far_center_shift_min_m: 0.04
+      confirmed_geometry_center_shift_min_extent_m: 0.25
 
     queues:
       input_queue_size: 30
-      output_queue_size: 1
+      output_queue_size: 2
       sync_queue_size: 30
       pending_frame_limit: 120
       mapping_queue_size: 30

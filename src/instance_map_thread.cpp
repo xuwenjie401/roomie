@@ -5,8 +5,10 @@
 #include <cmath>
 #include <cctype>
 #include <cstddef>
+#include <iomanip>
 #include <initializer_list>
 #include <limits>
+#include <map>
 #include <memory>
 #include <set>
 #include <sstream>
@@ -20,6 +22,11 @@ namespace {
 
 constexpr float kEpsilon = 1.0e-6f;
 constexpr float kPi = 3.14159265358979323846f;
+
+double elapsedMs(std::chrono::steady_clock::time_point start,
+                 std::chrono::steady_clock::time_point end) {
+  return std::chrono::duration<double, std::milli>(end - start).count();
+}
 
 struct Aabb {
   Eigen::Vector3f min = Eigen::Vector3f::Zero();
@@ -37,6 +44,7 @@ struct GeometryEvaluation {
   int cavity_points = 0;
   int expanded_points = 0;
   int unique_voxels = 0;
+  std::vector<VoxelRef, Eigen::aligned_allocator<VoxelRef>> voxel_refs;
   std::string reason;
 };
 
@@ -170,6 +178,14 @@ float trackDetectionCenterDistance(const InstanceTrack& track, const RawDetectio
 float trackDetectionIou(const InstanceTrack& track, const RawDetection& detection) {
   return aabbIou(yawAabb(track.center_world, track.size_m, track.yaw_rad),
                  yawAabb(detection.center_world, detection.size_m, detection.yaw_rad));
+}
+
+Eigen::Vector3f yawLocalDelta(const Eigen::Vector3f& delta_world, float yaw_rad) {
+  const float c = std::cos(-yaw_rad);
+  const float s = std::sin(-yaw_rad);
+  return Eigen::Vector3f(c * delta_world.x() - s * delta_world.y(),
+                         s * delta_world.x() + c * delta_world.y(),
+                         delta_world.z());
 }
 
 float trackDetectionContainment(const InstanceTrack& track, const RawDetection& detection) {
@@ -394,17 +410,6 @@ float observationBboxQuality(const InferenceResponse& response,
   return std::max(kEpsilon, confidence * edge_weight * distance_weight);
 }
 
-Eigen::Vector3f pointToLocalObb(const Eigen::Vector3f& point_world,
-                                const Eigen::Vector3f& center_world,
-                                float yaw_rad) {
-  const Eigen::Vector3f delta = point_world - center_world;
-  const float c = std::cos(-yaw_rad);
-  const float s = std::sin(-yaw_rad);
-  return Eigen::Vector3f(c * delta.x() - s * delta.y(),
-                         s * delta.x() + c * delta.y(),
-                         delta.z());
-}
-
 GeometryEvaluation evaluateGeometryAgainstSurface(
     const InstanceTrack& track,
     const GeometrySurfaceCache& surface_cache,
@@ -423,6 +428,10 @@ GeometryEvaluation evaluateGeometryAgainstSurface(
       (half.array() - shell).max(0.0f).matrix();
   const Eigen::Vector3f expanded_half =
       (half.array() + std::max(shell, 0.02f)).matrix();
+  const Aabb expanded_world_aabb =
+      yawAabb(track.center_world, 2.0f * expanded_half, track.yaw_rad);
+  const float c = std::cos(-track.yaw_rad);
+  const float s = std::sin(-track.yaw_rad);
 
   Eigen::Vector3f local_min =
       Eigen::Vector3f::Constant(std::numeric_limits<float>::infinity());
@@ -435,8 +444,14 @@ GeometryEvaluation evaluateGeometryAgainstSurface(
     if (!point_world.allFinite()) {
       continue;
     }
-    const Eigen::Vector3f local =
-        pointToLocalObb(point_world, track.center_world, track.yaw_rad);
+    if ((point_world.array() < expanded_world_aabb.min.array()).any() ||
+        (point_world.array() > expanded_world_aabb.max.array()).any()) {
+      continue;
+    }
+    const Eigen::Vector3f delta = point_world - track.center_world;
+    const Eigen::Vector3f local(c * delta.x() - s * delta.y(),
+                                s * delta.x() + c * delta.y(),
+                                delta.z());
     const Eigen::Vector3f abs_local = local.cwiseAbs();
     const bool inside_expanded = (abs_local.array() <= expanded_half.array()).all();
     if (!inside_expanded) {
@@ -449,12 +464,17 @@ GeometryEvaluation evaluateGeometryAgainstSurface(
     }
     ++evaluation.in_box_points;
     if (surface_point.has_voxel_ref) {
-      unique_voxels.insert(std::make_tuple(surface_point.voxel_ref.block_index.x(),
-                                           surface_point.voxel_ref.block_index.y(),
-                                           surface_point.voxel_ref.block_index.z(),
-                                           surface_point.voxel_ref.voxel_index.x(),
-                                           surface_point.voxel_ref.voxel_index.y(),
-                                           surface_point.voxel_ref.voxel_index.z()));
+      const auto key = std::make_tuple(surface_point.voxel_ref.block_index.x(),
+                                       surface_point.voxel_ref.block_index.y(),
+                                       surface_point.voxel_ref.block_index.z(),
+                                       surface_point.voxel_ref.voxel_index.x(),
+                                       surface_point.voxel_ref.voxel_index.y(),
+                                       surface_point.voxel_ref.voxel_index.z());
+      const auto [unused_it, inserted] = unique_voxels.insert(key);
+      (void)unused_it;
+      if (inserted) {
+        evaluation.voxel_refs.push_back(surface_point.voxel_ref);
+      }
     }
     local_min = local_min.cwiseMin(local);
     local_max = local_max.cwiseMax(local);
@@ -535,6 +555,36 @@ std::string lowercase(std::string value) {
   return value;
 }
 
+std::string diagnosticsLabel(std::string label) {
+  if (label.empty()) {
+    return "object";
+  }
+  for (char& c : label) {
+    if (std::isspace(static_cast<unsigned char>(c)) || c == '=') {
+      c = '_';
+    }
+  }
+  return label;
+}
+
+std::string formatLabelCounts(const std::map<std::string, std::size_t>& counts) {
+  if (counts.empty()) {
+    return "{}";
+  }
+  std::ostringstream stream;
+  stream << "{";
+  bool first = true;
+  for (const auto& [label, count] : counts) {
+    if (!first) {
+      stream << ",";
+    }
+    first = false;
+    stream << label << ":" << count;
+  }
+  stream << "}";
+  return stream.str();
+}
+
 bool isSemanticOverride(const std::string& lhs, const std::string& rhs) {
   const std::string a = lowercase(lhs);
   const std::string b = lowercase(rhs);
@@ -612,6 +662,41 @@ bool isSmallContainedDifferentObject(float volume_a,
   const float smaller = std::min(volume_a, volume_b);
   return larger > kEpsilon &&
          smaller / larger < config.instance_duplicate_small_object_volume_ratio;
+}
+
+bool isSmallDuplicateTrack(const InstanceTrack& track, const PipelineConfig& config) {
+  if (config.instance_small_duplicate_max_volume_m3 <= 0.0f ||
+      config.instance_small_duplicate_max_extent_m <= 0.0f ||
+      (track.size_m.array() <= 0.0f).any()) {
+    return false;
+  }
+  const float track_volume = sizeVolume(track.size_m);
+  const float max_extent = track.size_m.cwiseMax(Eigen::Vector3f::Zero()).maxCoeff();
+  return track_volume > 0.0f &&
+         track_volume <= config.instance_small_duplicate_max_volume_m3 &&
+         max_extent <= config.instance_small_duplicate_max_extent_m;
+}
+
+bool smallStableTracksAreDuplicates(const InstanceTrack& lhs,
+                                    const InstanceTrack& rhs,
+                                    const PipelineConfig& config) {
+  if (!isSmallDuplicateTrack(lhs, config) ||
+      !isSmallDuplicateTrack(rhs, config)) {
+    return false;
+  }
+  const float size_ratio = sizeRatioScore(lhs.size_m, rhs.size_m);
+  if (size_ratio < config.instance_small_duplicate_size_ratio_min) {
+    return false;
+  }
+  const float iou = obbIou(lhs, rhs);
+  if (iou >= config.instance_small_duplicate_iou_threshold) {
+    return true;
+  }
+  const float lhs_diag = lhs.size_m.cwiseMax(Eigen::Vector3f::Zero()).norm();
+  const float rhs_diag = rhs.size_m.cwiseMax(Eigen::Vector3f::Zero()).norm();
+  const float center_gate =
+      config.instance_small_duplicate_center_ratio * std::max(lhs_diag, rhs_diag);
+  return center_gate > 0.0f && centerDistance(lhs, rhs) <= center_gate;
 }
 
 bool confirmedTrackDuplicatesDetection(const InstanceTrack& track,
@@ -722,6 +807,164 @@ float observationPromotionWeight(const PipelineConfig& config,
   return (1.0f - t) + t * config.instance_far_promotion_weight;
 }
 
+bool isLargeFurnitureLabel(const std::string& label) {
+  const std::string normalized = lowercase(label);
+  const auto in_group = [&normalized](std::initializer_list<const char*> group) {
+    return std::find(group.begin(), group.end(), normalized) != group.end();
+  };
+  return in_group({"bed",
+                   "bunk bed",
+                   "sofa bed",
+                   "futon",
+                   "sofa",
+                   "couch",
+                   "table",
+                   "coffee table",
+                   "desk",
+                   "cabinet",
+                   "cupboard",
+                   "wardrobe",
+                   "dresser",
+                   "storage",
+                   "shelf",
+                   "bookcase",
+                   "refrigerator",
+                   "dishwasher",
+                   "stove",
+                   "oven",
+                   "tv",
+                   "television set"});
+}
+
+bool isSmallObjectLabel(const std::string& label) {
+  const std::string normalized = lowercase(label);
+  const auto in_group = [&normalized](std::initializer_list<const char*> group) {
+    return std::find(group.begin(), group.end(), normalized) != group.end();
+  };
+  return in_group({"apple",
+                   "banana",
+                   "orange",
+                   "fruit",
+                   "can",
+                   "tin can",
+                   "soda can",
+                   "cup",
+                   "mug",
+                   "bottle",
+                   "book",
+                   "booklet",
+                   "notebook",
+                   "remote",
+                   "remote control",
+                   "cell phone",
+                   "phone",
+                   "mouse",
+                   "keyboard",
+                   "pencil box",
+                   "bowl",
+                   "plate"});
+}
+
+bool isLargeFurnitureTrack(const InstanceTrack& track,
+                           const InstanceObservation& observation,
+                           const PipelineConfig& config) {
+  const bool label_matches = isLargeFurnitureLabel(track.label) ||
+                             isLargeFurnitureLabel(observation.detection.label);
+  if (!label_matches) {
+    return false;
+  }
+  return sizeVolume(track.size_m) >=
+         config.instance_confirmed_geometry_large_min_volume_m3;
+}
+
+bool shouldIgnoreGeometryEmptyForSmallObject(const InstanceTrack& track,
+                                             const PipelineConfig& config) {
+  const float track_volume = sizeVolume(track.size_m);
+  const float max_extent = track.size_m.cwiseMax(Eigen::Vector3f::Zero()).maxCoeff();
+  const bool small_by_size =
+      config.instance_geometry_empty_small_object_max_volume_m3 > 0.0f &&
+      config.instance_geometry_empty_small_object_max_extent_m > 0.0f &&
+      track_volume > 0.0f &&
+      track_volume <= config.instance_geometry_empty_small_object_max_volume_m3 &&
+      max_extent <= config.instance_geometry_empty_small_object_max_extent_m;
+  return small_by_size || isSmallObjectLabel(track.label);
+}
+
+bool isFarObservationForConfirmedGeometry(const InstanceObservation& observation,
+                                          const PipelineConfig& config) {
+  return config.instance_far_observation_distance_m > 0.0f &&
+         observation.camera_distance_m > 0.0f &&
+         observation.camera_distance_m >= config.instance_far_observation_distance_m;
+}
+
+bool wouldFarObservationShiftLastGoodObb(const InstanceTrack& track,
+                                         const InstanceObservation& observation,
+                                         const PipelineConfig& config,
+                                         float old_mass,
+                                         float new_weight) {
+  if (!isFarObservationForConfirmedGeometry(observation, config) ||
+      config.instance_confirmed_geometry_far_center_shift_ratio <= 0.0f ||
+      track.geometry_evaluation_obb_revision == 0 ||
+      !isFiniteVector(track.geometry_evaluated_center_world) ||
+      !isFiniteVector(track.geometry_evaluated_size_m) ||
+      (track.geometry_evaluated_size_m.array() <= 0.0f).any()) {
+    return false;
+  }
+  const float total_weight = old_mass + new_weight;
+  if (total_weight <= kEpsilon) {
+    return false;
+  }
+  const Eigen::Vector3f candidate_center =
+      (old_mass * track.center_world +
+       new_weight * observation.detection.center_world) /
+      total_weight;
+  const Eigen::Vector3f delta_world =
+      candidate_center - track.geometry_evaluated_center_world;
+  if (delta_world.norm() <
+      config.instance_confirmed_geometry_far_center_shift_min_m) {
+    return false;
+  }
+  const Eigen::Vector3f local_delta =
+      yawLocalDelta(delta_world, track.geometry_evaluated_yaw_rad);
+  float max_axis_ratio = 0.0f;
+  for (int axis = 0; axis < 3; ++axis) {
+    const float denom =
+        std::max(kEpsilon,
+                 std::max(std::abs(track.geometry_evaluated_size_m[axis]),
+                          config.instance_confirmed_geometry_center_shift_min_extent_m));
+    max_axis_ratio = std::max(max_axis_ratio,
+                              std::abs(local_delta[axis]) / denom);
+  }
+  return max_axis_ratio >=
+         config.instance_confirmed_geometry_far_center_shift_ratio;
+}
+
+std::string confirmedGeometryUpdateSuppressionReason(
+    const InstanceTrack& track,
+    const InstanceObservation& observation,
+    const PipelineConfig& config,
+    float old_mass,
+    float new_weight) {
+  if (track.object_id < 0 || !track.publishable ||
+      !geometryConfirmed(track, config)) {
+    return "";
+  }
+  const float edge_weight =
+      edgeCompletenessWeight(observation.detection, config.boxer_input_size);
+  if (isLargeFurnitureTrack(track, observation, config) &&
+      edge_weight < config.instance_confirmed_geometry_edge_freeze_weight) {
+    return "edge";
+  }
+  if (wouldFarObservationShiftLastGoodObb(track,
+                                          observation,
+                                          config,
+                                          old_mass,
+                                          new_weight)) {
+    return "far_center_shift";
+  }
+  return "";
+}
+
 bool isHighQualityObservation(const PipelineConfig& config,
                               const InstanceObservation& observation) {
   const bool close_enough =
@@ -771,6 +1014,51 @@ std::pair<int, float> recentHighQualityStats(const InstanceTrack& track,
 bool hasPromotionQuality(const InstanceTrack& track, const PipelineConfig& config) {
   return track.high_quality_observation_count >= config.instance_high_quality_min_count ||
          track.high_quality_observation_mass >= config.instance_high_quality_min_mass;
+}
+
+bool hasBasePromotionEvidence(const InstanceTrack& track, const PipelineConfig& config) {
+  return track.support_count >= config.instance_min_support_count &&
+         track.confidence >= config.instance_object_min_confidence &&
+         track.confidence_mass >= config.instance_min_confidence_mass &&
+         isFiniteVector(track.center_world) && isFiniteVector(track.size_m) &&
+         (track.size_m.array() >= config.instance_min_bbox_size_m).all() &&
+         (track.size_m.array() <= config.instance_max_bbox_size_m).all();
+}
+
+bool hasMatureDuplicateAuthority(const InstanceTrack& track,
+                                 const PipelineConfig& config) {
+  if (!geometryConfirmed(track, config)) {
+    return false;
+  }
+  const bool mature_quality =
+      track.high_quality_observation_count >= config.instance_high_quality_min_count + 1 ||
+      track.high_quality_observation_mass >=
+          config.instance_high_quality_min_mass +
+              config.instance_quality_observation_min_quality;
+  const bool mature_support =
+      track.support_count >= std::max(config.instance_min_support_count + 3,
+                                      config.instance_min_support_count * 2);
+  return mature_quality || mature_support;
+}
+
+std::size_t countPromotionQualityBlocked(
+    const std::vector<InstanceTrack, Eigen::aligned_allocator<InstanceTrack>>& tracks,
+    const PipelineConfig& config,
+    std::map<std::string, std::size_t>* by_label = nullptr) {
+  if (by_label != nullptr) {
+    by_label->clear();
+  }
+  std::size_t count = 0;
+  for (const InstanceTrack& track : tracks) {
+    if (track.object_id < 0 && hasBasePromotionEvidence(track, config) &&
+        !hasPromotionQuality(track, config)) {
+      ++count;
+      if (by_label != nullptr) {
+        ++(*by_label)[diagnosticsLabel(track.label)];
+      }
+    }
+  }
+  return count;
 }
 
 bool geometryObbChangedEnough(const InstanceTrack& track, const PipelineConfig& config) {
@@ -1049,14 +1337,33 @@ void InstanceMapThread::run() {
 }
 
 void InstanceMapThread::applyDetections(const InferenceResponse& response) {
+  const auto apply_start = std::chrono::steady_clock::now();
   std::vector<InstanceObservation, Eigen::aligned_allocator<InstanceObservation>> observations;
   observations.reserve(response.detections.size());
+  std::map<std::string, std::size_t> raw_by_label;
+  std::map<std::string, std::size_t> observed_by_label;
+  std::map<std::string, std::size_t> make_rejected_by_label;
+  std::map<std::string, std::size_t> accepted_by_label;
+  std::map<std::string, std::size_t> duplicate_rejected_by_label;
+  std::map<std::string, std::size_t> created_by_label;
+  std::map<std::string, std::size_t> updated_by_label;
+  std::map<std::string, std::size_t> promoted_by_label;
+  std::map<std::string, std::size_t> promotion_quality_blocked_by_label;
+  std::map<std::string, std::size_t> geometry_update_suppressed_by_label;
+  std::map<std::string, std::size_t> geometry_update_suppressed_by_reason;
+  std::map<std::string, std::size_t> geometry_deleted_empty_by_label;
+  std::map<std::string, std::size_t> geometry_empty_ignored_by_label;
+  std::map<std::string, std::size_t> merged_small_duplicates_by_label;
   std::size_t rejected = 0;
   for (const RawDetection& detection : response.detections) {
+    const std::string label = diagnosticsLabel(detection.label);
+    ++raw_by_label[label];
     std::optional<InstanceObservation> observation = makeObservation(response, detection);
     if (observation) {
+      ++observed_by_label[label];
       observations.push_back(std::move(*observation));
     } else {
+      ++make_rejected_by_label[label];
       ++rejected;
     }
   }
@@ -1070,10 +1377,13 @@ void InstanceMapThread::applyDetections(const InferenceResponse& response) {
   std::size_t removed_tentative = 0;
   std::size_t merged_duplicates = 0;
   std::size_t duplicate_rejected = 0;
+  std::size_t promotion_quality_blocked = 0;
+  std::size_t geometry_update_suppressed = 0;
   std::size_t geometry_checked = 0;
   std::size_t geometry_suppressed = 0;
   std::size_t geometry_recovered = 0;
   std::size_t geometry_deleted_empty = 0;
+  std::size_t geometry_empty_ignored = 0;
   std::size_t published_objects_after = 0;
   bool run_geometry = false;
   {
@@ -1084,18 +1394,45 @@ void InstanceMapThread::applyDetections(const InferenceResponse& response) {
 
     std::vector<bool> track_matched(tracks_.size(), false);
     for (const InstanceObservation& observation : observations) {
+      const std::string observation_label = diagnosticsLabel(observation.detection.label);
       if (shouldRejectAsDuplicateOfConfirmed(observation)) {
         ++duplicate_rejected;
+        ++duplicate_rejected_by_label[observation_label];
         continue;
       }
+      ++accepted_by_label[observation_label];
       const std::optional<std::size_t> track_index =
           findBestTrack(observation, track_matched);
       if (track_index) {
-        updateTrack(&tracks_[*track_index], observation);
+        bool suppressed_geometry_update = false;
+        std::string geometry_suppression_reason;
+        const bool promoted =
+            updateTrack(&tracks_[*track_index],
+                        observation,
+                        &suppressed_geometry_update,
+                        &geometry_suppression_reason);
+        ++updated_by_label[diagnosticsLabel(tracks_[*track_index].label)];
+        if (suppressed_geometry_update) {
+          const std::string updated_label =
+              diagnosticsLabel(tracks_[*track_index].label);
+          ++geometry_update_suppressed;
+          ++geometry_update_suppressed_by_label[updated_label];
+          if (!geometry_suppression_reason.empty()) {
+            ++geometry_update_suppressed_by_reason[
+                updated_label + ":" + geometry_suppression_reason];
+          }
+        }
+        if (promoted) {
+          ++promoted_by_label[diagnosticsLabel(tracks_[*track_index].label)];
+        }
         track_matched[*track_index] = true;
         ++updated;
       } else {
-        createTrack(observation);
+        const bool promoted = createTrack(observation);
+        ++created_by_label[observation_label];
+        if (promoted) {
+          ++promoted_by_label[observation_label];
+        }
         track_matched.push_back(true);
         ++created;
       }
@@ -1103,7 +1440,7 @@ void InstanceMapThread::applyDetections(const InferenceResponse& response) {
 
     ageUnmatchedTracks(track_matched, response.time_ns);
     removed_tentative = removeExpiredTentativeTracks();
-    merged_duplicates += mergeDuplicateStableTracks();
+    merged_duplicates += mergeDuplicateStableTracks(&merged_small_duplicates_by_label);
     for (InstanceTrack& track : tracks_) {
       if (track.object_id >= 0) {
         object_graph_.updateNodeFromTrack(track);
@@ -1115,6 +1452,8 @@ void InstanceMapThread::applyDetections(const InferenceResponse& response) {
     }
     tracks_after = tracks_.size();
     objects_after = object_graph_.objectCount();
+    promotion_quality_blocked =
+        countPromotionQualityBlocked(tracks_, config_, &promotion_quality_blocked_by_label);
     published_objects_after =
         object_graph_.snapshotInstanceRecords(/*publishable_only=*/false).size();
   }
@@ -1128,9 +1467,12 @@ void InstanceMapThread::applyDetections(const InferenceResponse& response) {
                                                   response.time_ns,
                                                   &geometry_suppressed,
                                                   &geometry_recovered,
-                                                  &geometry_deleted_empty);
+                                                  &geometry_deleted_empty,
+                                                  &geometry_deleted_empty_by_label,
+                                                  &geometry_empty_ignored,
+                                                  &geometry_empty_ignored_by_label);
     }
-    merged_duplicates += mergeDuplicateStableTracks();
+    merged_duplicates += mergeDuplicateStableTracks(&merged_small_duplicates_by_label);
     for (InstanceTrack& track : tracks_) {
       if (track.object_id >= 0) {
         object_graph_.updateNodeFromTrack(track);
@@ -1138,18 +1480,24 @@ void InstanceMapThread::applyDetections(const InferenceResponse& response) {
     }
     tracks_after = tracks_.size();
     objects_after = object_graph_.objectCount();
+    promotion_quality_blocked =
+        countPromotionQualityBlocked(tracks_, config_, &promotion_quality_blocked_by_label);
     published_objects_after =
         object_graph_.snapshotInstanceRecords(/*publishable_only=*/false).size();
   }
 
   if (!response.detections.empty() || !observations.empty() || run_geometry) {
+    const double apply_ms = elapsedMs(apply_start, std::chrono::steady_clock::now());
     std::ostringstream stream;
-    stream << "applied camera=" << response.camera_id
+    stream << std::fixed << std::setprecision(2)
+           << "applied camera=" << response.camera_id
            << " t=" << response.time_ns
            << " raw=" << response.detections.size()
            << " accepted=" << (observations.size() - duplicate_rejected)
            << " rejected=" << (rejected + duplicate_rejected)
            << " duplicate_rejected=" << duplicate_rejected
+           << " geometry_update_suppressed=" << geometry_update_suppressed
+           << " promotion_quality_blocked=" << promotion_quality_blocked
            << " created_tracks=" << created
            << " updated_tracks=" << updated
            << " removed_tentative=" << removed_tentative
@@ -1158,10 +1506,37 @@ void InstanceMapThread::applyDetections(const InferenceResponse& response) {
            << " geometry_suppressed=" << geometry_suppressed
            << " geometry_recovered=" << geometry_recovered
            << " geometry_deleted_empty=" << geometry_deleted_empty
+           << " geometry_empty_ignored=" << geometry_empty_ignored
            << " tracks=" << tracks_before << "->" << tracks_after
            << " objects=" << objects_before << "->" << objects_after
-           << " published_objects=" << published_objects_after;
+           << " published_objects=" << published_objects_after
+           << " apply_ms=" << apply_ms;
     RunLogger::logGlobal("instance_map", stream.str());
+
+    std::ostringstream detail;
+    detail << "labels camera=" << response.camera_id
+           << " t=" << response.time_ns
+           << " raw=" << formatLabelCounts(raw_by_label)
+           << " observed=" << formatLabelCounts(observed_by_label)
+           << " make_rejected=" << formatLabelCounts(make_rejected_by_label)
+           << " accepted=" << formatLabelCounts(accepted_by_label)
+           << " duplicate_rejected=" << formatLabelCounts(duplicate_rejected_by_label)
+           << " created=" << formatLabelCounts(created_by_label)
+           << " updated=" << formatLabelCounts(updated_by_label)
+           << " promoted=" << formatLabelCounts(promoted_by_label)
+           << " promotion_quality_blocked="
+           << formatLabelCounts(promotion_quality_blocked_by_label)
+           << " geometry_update_suppressed="
+           << formatLabelCounts(geometry_update_suppressed_by_label)
+           << " geometry_update_suppressed_reason="
+           << formatLabelCounts(geometry_update_suppressed_by_reason)
+           << " geometry_deleted_empty="
+           << formatLabelCounts(geometry_deleted_empty_by_label)
+           << " geometry_empty_ignored="
+           << formatLabelCounts(geometry_empty_ignored_by_label)
+           << " merged_small_duplicates="
+           << formatLabelCounts(merged_small_duplicates_by_label);
+    RunLogger::logGlobal("instance_map_detail", detail.str());
   }
 }
 
@@ -1191,7 +1566,6 @@ std::optional<InstanceObservation> InstanceMapThread::makeObservation(
                                                     observation.confidence,
                                                     config_.boxer_input_size,
                                                     &observation.camera_distance_m);
-  observation.near_surface_voxels = map_projector_.collectNearSurfaceVoxels(detection);
   return observation;
 }
 
@@ -1245,12 +1619,15 @@ bool InstanceMapThread::shouldRejectAsDuplicateOfConfirmed(
     if (labelsCompatibleForDuplicate(track, observation.detection)) {
       return false;
     }
+    if (!hasMatureDuplicateAuthority(track, config_)) {
+      continue;
+    }
     return true;
   }
   return false;
 }
 
-void InstanceMapThread::createTrack(const InstanceObservation& observation) {
+bool InstanceMapThread::createTrack(const InstanceObservation& observation) {
   const float promotion_weight = observationPromotionWeight(config_, observation);
   InstanceTrack track;
   track.track_id = next_track_id_++;
@@ -1280,34 +1657,57 @@ void InstanceMapThread::createTrack(const InstanceObservation& observation) {
   }
   updateObjectQualityScore(&track);
   tracks_.push_back(std::move(track));
-  maybePromoteOrUpdateObject(&tracks_.back());
+  return maybePromoteOrUpdateObject(&tracks_.back());
 }
 
-void InstanceMapThread::updateTrack(InstanceTrack* track,
-                                    const InstanceObservation& observation) {
+bool InstanceMapThread::updateTrack(InstanceTrack* track,
+                                    const InstanceObservation& observation,
+                                    bool* geometry_update_suppressed,
+                                    std::string* geometry_update_suppression_reason) {
+  if (geometry_update_suppressed != nullptr) {
+    *geometry_update_suppressed = false;
+  }
+  if (geometry_update_suppression_reason != nullptr) {
+    geometry_update_suppression_reason->clear();
+  }
   const float promotion_weight = observationPromotionWeight(config_, observation);
   const float old_mass =
       std::max(kEpsilon,
                std::min(track->bbox_quality_mass, config_.instance_fusion_prior_mass_cap));
   const float new_weight =
       std::max(kEpsilon, observation.bbox_quality * promotion_weight);
-  const float total_weight = old_mass + new_weight;
-  const float w_old = old_mass / total_weight;
-  const float w_new = new_weight / total_weight;
+  const std::string suppression_reason =
+      confirmedGeometryUpdateSuppressionReason(*track,
+                                               observation,
+                                               config_,
+                                               old_mass,
+                                               new_weight);
+  const bool suppress_geometry_update = !suppression_reason.empty();
 
-  Eigen::Vector3f old_size = track->size_m;
-  Eigen::Vector3f new_size = observation.detection.size_m;
-  float old_yaw = track->yaw_rad;
-  float new_yaw = normalizeYaw(observation.detection.yaw_rad);
-  const float reference_yaw = weightedYawMean(old_yaw, w_old, new_yaw, w_new);
-  alignBoxToReference(&old_size, &old_yaw, reference_yaw);
-  alignBoxToReference(&new_size, &new_yaw, reference_yaw);
+  if (!suppress_geometry_update) {
+    const float total_weight = old_mass + new_weight;
+    const float w_old = old_mass / total_weight;
+    const float w_new = new_weight / total_weight;
 
-  track->center_world =
-      w_old * track->center_world + w_new * observation.detection.center_world;
-  track->size_m = w_old * old_size + w_new * new_size;
-  track->yaw_rad = weightedYawMean(old_yaw, w_old, new_yaw, w_new);
-  ++track->obb_revision;
+    Eigen::Vector3f old_size = track->size_m;
+    Eigen::Vector3f new_size = observation.detection.size_m;
+    float old_yaw = track->yaw_rad;
+    float new_yaw = normalizeYaw(observation.detection.yaw_rad);
+    const float reference_yaw = weightedYawMean(old_yaw, w_old, new_yaw, w_new);
+    alignBoxToReference(&old_size, &old_yaw, reference_yaw);
+    alignBoxToReference(&new_size, &new_yaw, reference_yaw);
+
+    track->center_world =
+        w_old * track->center_world + w_new * observation.detection.center_world;
+    track->size_m = w_old * old_size + w_new * new_size;
+    track->yaw_rad = weightedYawMean(old_yaw, w_old, new_yaw, w_new);
+    ++track->obb_revision;
+  } else if (geometry_update_suppressed != nullptr) {
+    *geometry_update_suppressed = true;
+    if (geometry_update_suppression_reason != nullptr) {
+      *geometry_update_suppression_reason = suppression_reason;
+    }
+  }
   track->confidence_mass += observation.confidence;
   track->bbox_quality_mass += new_weight;
   ++track->support_count;
@@ -1318,7 +1718,9 @@ void InstanceMapThread::updateTrack(InstanceTrack* track,
   track->last_seen_ns = observation.time_ns;
   appendUnique(&track->source_cameras, observation.camera_id);
   appendUnique(&track->observation_timestamps_ns, observation.time_ns);
-  track->near_surface_voxels = observation.near_surface_voxels;
+  if (!observation.near_surface_voxels.empty()) {
+    track->near_surface_voxels = observation.near_surface_voxels;
+  }
   recordObservationQuality(track, observation, config_);
 
   if (!observation.detection.label.empty()) {
@@ -1336,7 +1738,7 @@ void InstanceMapThread::updateTrack(InstanceTrack* track,
     track->state = InstanceTrackState::kStable;
   }
   updateObjectQualityScore(track);
-  maybePromoteOrUpdateObject(track);
+  return maybePromoteOrUpdateObject(track);
 }
 
 void InstanceMapThread::ageUnmatchedTracks(const std::vector<bool>& track_matched,
@@ -1369,7 +1771,8 @@ std::size_t InstanceMapThread::removeExpiredTentativeTracks() {
   return before - tracks_.size();
 }
 
-std::size_t InstanceMapThread::mergeDuplicateStableTracks() {
+std::size_t InstanceMapThread::mergeDuplicateStableTracks(
+    std::map<std::string, std::size_t>* small_duplicates_by_label) {
   std::size_t merged = 0;
   bool changed = true;
   while (changed) {
@@ -1384,7 +1787,9 @@ std::size_t InstanceMapThread::mergeDuplicateStableTracks() {
         if (rhs.object_id < 0 || !rhs.publishable) {
           continue;
         }
-        if (!stableTracksAreDuplicates(lhs, rhs, config_)) {
+        const bool small_duplicate =
+            smallStableTracksAreDuplicates(lhs, rhs, config_);
+        if (!small_duplicate && !stableTracksAreDuplicates(lhs, rhs, config_)) {
           continue;
         }
 
@@ -1473,6 +1878,9 @@ std::size_t InstanceMapThread::mergeDuplicateStableTracks() {
         winner.label = bestWeightedKey(winner.label_weights, winner.label);
         winner.semantic_id = bestWeightedKey(winner.semantic_weights, winner.semantic_id);
         updateObjectQualityScore(&winner);
+        if (small_duplicate && small_duplicates_by_label != nullptr) {
+          ++(*small_duplicates_by_label)[diagnosticsLabel(winner.label)];
+        }
 
         object_graph_.removeNode(loser_object_id);
         tracks_.erase(tracks_.begin() + static_cast<std::ptrdiff_t>(loser_index));
@@ -1498,7 +1906,10 @@ std::size_t InstanceMapThread::applyGeometryMaintenance(
     TimeNanoseconds now_ns,
     std::size_t* suppressed,
     std::size_t* recovered,
-    std::size_t* deleted_empty) {
+    std::size_t* deleted_empty,
+    std::map<std::string, std::size_t>* deleted_empty_by_label,
+    std::size_t* ignored_empty,
+    std::map<std::string, std::size_t>* ignored_empty_by_label) {
   GeometrySurfaceCache surface_cache;
   surface_cache.map_version = map_snapshot.map_version;
   surface_cache.cache_rebuilds = map_snapshot.cache_rebuilds;
@@ -1520,7 +1931,10 @@ std::size_t InstanceMapThread::applyGeometryMaintenance(
                                   now_ns,
                                   suppressed,
                                   recovered,
-                                  deleted_empty);
+                                  deleted_empty,
+                                  deleted_empty_by_label,
+                                  ignored_empty,
+                                  ignored_empty_by_label);
 }
 
 std::size_t InstanceMapThread::applyGeometryMaintenance(
@@ -1528,7 +1942,10 @@ std::size_t InstanceMapThread::applyGeometryMaintenance(
     TimeNanoseconds now_ns,
     std::size_t* suppressed,
     std::size_t* recovered,
-    std::size_t* deleted_empty) {
+    std::size_t* deleted_empty,
+    std::map<std::string, std::size_t>* deleted_empty_by_label,
+    std::size_t* ignored_empty,
+    std::map<std::string, std::size_t>* ignored_empty_by_label) {
   if (suppressed != nullptr) {
     *suppressed = 0;
   }
@@ -1537,6 +1954,15 @@ std::size_t InstanceMapThread::applyGeometryMaintenance(
   }
   if (deleted_empty != nullptr) {
     *deleted_empty = 0;
+  }
+  if (deleted_empty_by_label != nullptr) {
+    deleted_empty_by_label->clear();
+  }
+  if (ignored_empty != nullptr) {
+    *ignored_empty = 0;
+  }
+  if (ignored_empty_by_label != nullptr) {
+    ignored_empty_by_label->clear();
   }
   if (!surface_cache.has_map || surface_cache.surface_points.empty()) {
     return 0;
@@ -1574,6 +2000,9 @@ std::size_t InstanceMapThread::applyGeometryMaintenance(
     track.geometry_shell_points = evaluation.shell_points;
     track.geometry_unique_voxels = evaluation.unique_voxels;
     track.geometry_expanded_points = evaluation.expanded_points;
+    if (!evaluation.voxel_refs.empty()) {
+      track.near_surface_voxels = evaluation.voxel_refs;
+    }
     track.last_geometry_check_ns = now_ns;
     track.geometry_evaluation_obb_revision = track.obb_revision;
     track.geometry_evaluation_map_version = surface_cache.map_version;
@@ -1585,10 +2014,25 @@ std::size_t InstanceMapThread::applyGeometryMaintenance(
     if (evaluation.in_box_points < config_.instance_geometry_empty_inside_points ||
         evaluation.unique_voxels < config_.instance_geometry_min_unique_voxels) {
       track.geometry_status = InstanceGeometryStatus::kEmpty;
+      if (shouldIgnoreGeometryEmptyForSmallObject(track, config_)) {
+        track.publishable = was_publishable;
+        if (ignored_empty != nullptr) {
+          ++(*ignored_empty);
+        }
+        if (ignored_empty_by_label != nullptr) {
+          ++(*ignored_empty_by_label)[diagnosticsLabel(track.label)];
+        }
+        updateObjectQualityScore(&track);
+        object_graph_.updateNodeFromTrack(track);
+        continue;
+      }
       track.publishable = false;
       object_ids_to_delete.push_back(track.object_id);
       if (deleted_empty != nullptr) {
         ++(*deleted_empty);
+      }
+      if (deleted_empty_by_label != nullptr) {
+        ++(*deleted_empty_by_label)[diagnosticsLabel(track.label)];
       }
       continue;
     }
@@ -1645,24 +2089,22 @@ bool InstanceMapThread::shouldRunGeometryMaintenance(TimeNanoseconds now_ns) con
          secondsToNanoseconds(config_.instance_geometry_check_period_sec);
 }
 
-void InstanceMapThread::maybePromoteOrUpdateObject(InstanceTrack* track) {
+bool InstanceMapThread::maybePromoteOrUpdateObject(InstanceTrack* track) {
+  bool promoted = false;
   if (track->object_id < 0 && isPromotable(*track)) {
     track->state = InstanceTrackState::kStable;
     track->object_id = object_graph_.createNodeFromTrack(*track);
+    promoted = true;
   }
   if (track->object_id >= 0) {
     object_graph_.updateNodeFromTrack(*track);
   }
+  return promoted;
 }
 
 bool InstanceMapThread::isPromotable(const InstanceTrack& track) const {
-  return track.support_count >= config_.instance_min_support_count &&
-         track.confidence >= config_.instance_object_min_confidence &&
-         track.confidence_mass >= config_.instance_min_confidence_mass &&
-         hasPromotionQuality(track, config_) &&
-         isFiniteVector(track.center_world) && isFiniteVector(track.size_m) &&
-         (track.size_m.array() >= config_.instance_min_bbox_size_m).all() &&
-         (track.size_m.array() <= config_.instance_max_bbox_size_m).all();
+  return hasBasePromotionEvidence(track, config_) &&
+         hasPromotionQuality(track, config_);
 }
 
 }  // namespace roomie
