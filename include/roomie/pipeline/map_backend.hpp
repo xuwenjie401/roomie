@@ -29,9 +29,23 @@ struct MapBackendSnapshot {
   std::uint64_t map_version = 0;
   std::uint64_t tsdf_blocks = 0;
   std::uint64_t surface_voxels_scanned = 0;
+  std::uint64_t selected_blocks = 0;
+  std::uint64_t cached_surface_points = 0;
+  std::uint64_t cache_rebuilds = 0;
   double snapshot_ms = 0.0;
   double surface_extract_ms = 0.0;
+  double cache_build_ms = 0.0;
+  double frustum_filter_ms = 0.0;
   bool has_map = false;
+  bool surface_cache_ready = false;
+  bool view_filtered = false;
+};
+
+struct MapBackendView {
+  CameraIntrinsics intrinsics;
+  Eigen::Isometry3f T_world_camera = Eigen::Isometry3f::Identity();
+  float min_depth_m = 0.1f;
+  float max_depth_m = 10.0f;
 };
 
 class MapBackend {
@@ -40,6 +54,10 @@ class MapBackend {
 
   virtual void integrateFrame(const MappingFrame& frame) = 0;
   virtual MapBackendSnapshot snapshot() const = 0;
+  virtual MapBackendSnapshot snapshotForView(const MapBackendView& view) const {
+    (void)view;
+    return snapshot();
+  }
   virtual std::vector<VoxelRef, Eigen::aligned_allocator<VoxelRef>> collectNearSurfaceVoxels(
       const RawDetection& detection) const = 0;
   virtual void saveIfRequested() {}

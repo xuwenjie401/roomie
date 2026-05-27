@@ -69,7 +69,17 @@ bool MapThread::enqueueMappingFrame(MappingFrame frame) {
 std::optional<PatchDepth> MapThread::projectPatchDepth(const DetectionFrame& frame) {
   ++projection_requests_;
   const auto project_total_start = std::chrono::steady_clock::now();
-  MapBackendSnapshot snapshot = timedBackendSnapshot();
+  const CameraIntrinsics intrinsics_960 =
+      scaledIntrinsicsForBoxerInput(frame.intrinsics, frame.rgb, config_.boxer_input_size);
+  MapBackendView view;
+  view.intrinsics = intrinsics_960;
+  view.T_world_camera = frame.T_world_camera;
+  view.min_depth_m = config_.depth_min_m;
+  view.max_depth_m =
+      config_.max_integration_distance_m > 0.0f
+          ? std::min(config_.depth_max_m, config_.max_integration_distance_m)
+          : config_.depth_max_m;
+  MapBackendSnapshot snapshot = timedBackendSnapshot(&view);
   if (!snapshot.has_map) {
     ++projection_no_map_;
     maybeLogStatus();
@@ -81,8 +91,15 @@ std::optional<PatchDepth> MapThread::projectPatchDepth(const DetectionFrame& fra
       static_cast<std::uint64_t>(snapshot.surface_points_world.size());
   patch_depth.source_tsdf_blocks = snapshot.tsdf_blocks;
   patch_depth.source_voxels_scanned = snapshot.surface_voxels_scanned;
+  patch_depth.source_selected_blocks = snapshot.selected_blocks;
+  patch_depth.source_cached_surface_points = snapshot.cached_surface_points;
+  patch_depth.surface_cache_rebuilds = snapshot.cache_rebuilds;
   patch_depth.snapshot_ms = snapshot.snapshot_ms;
   patch_depth.surface_extract_ms = snapshot.surface_extract_ms;
+  patch_depth.cache_build_ms = snapshot.cache_build_ms;
+  patch_depth.frustum_filter_ms = snapshot.frustum_filter_ms;
+  patch_depth.surface_cache_ready = snapshot.surface_cache_ready;
+  patch_depth.view_filtered = snapshot.view_filtered;
   patch_depth.project_total_ms =
       elapsedMs(project_total_start, std::chrono::steady_clock::now());
   last_valid_patches_ = patch_depth.valid_patches;
@@ -91,9 +108,14 @@ std::optional<PatchDepth> MapThread::projectPatchDepth(const DetectionFrame& fra
   last_source_surface_points_ = patch_depth.source_surface_points;
   last_source_tsdf_blocks_ = patch_depth.source_tsdf_blocks;
   last_source_voxels_scanned_ = patch_depth.source_voxels_scanned;
+  last_source_selected_blocks_ = patch_depth.source_selected_blocks;
+  last_source_cached_surface_points_ = patch_depth.source_cached_surface_points;
+  last_surface_cache_rebuilds_ = patch_depth.surface_cache_rebuilds;
   last_project_total_ms_.store(patch_depth.project_total_ms);
   last_snapshot_ms_.store(patch_depth.snapshot_ms);
   last_surface_extract_ms_.store(patch_depth.surface_extract_ms);
+  last_cache_build_ms_.store(patch_depth.cache_build_ms);
+  last_frustum_filter_ms_.store(patch_depth.frustum_filter_ms);
   last_projection_loop_ms_.store(patch_depth.projection_loop_ms);
   last_projection_median_ms_.store(patch_depth.projection_median_ms);
   maybeLogStatus();
@@ -171,12 +193,13 @@ std::uint64_t MapThread::mapVersion() const {
 }
 
 MapBackendSnapshot MapThread::debugSnapshot() const {
-  return timedBackendSnapshot();
+  return timedBackendSnapshot(nullptr);
 }
 
-MapBackendSnapshot MapThread::timedBackendSnapshot() const {
+MapBackendSnapshot MapThread::timedBackendSnapshot(const MapBackendView* view) const {
   const auto snapshot_start = std::chrono::steady_clock::now();
-  MapBackendSnapshot snapshot = map_backend_->snapshot();
+  MapBackendSnapshot snapshot = view != nullptr ? map_backend_->snapshotForView(*view)
+                                                : map_backend_->snapshot();
   snapshot.snapshot_ms = elapsedMs(snapshot_start, std::chrono::steady_clock::now());
   return snapshot;
 }
@@ -214,9 +237,14 @@ void MapThread::maybeLogStatus() {
          << " last_source_surface_points=" << last_source_surface_points_.load()
          << " last_tsdf_blocks=" << last_source_tsdf_blocks_.load()
          << " last_voxels_scanned=" << last_source_voxels_scanned_.load()
+         << " last_selected_blocks=" << last_source_selected_blocks_.load()
+         << " last_cached_surface_points=" << last_source_cached_surface_points_.load()
+         << " cache_rebuilds=" << last_surface_cache_rebuilds_.load()
          << " last_project_total_ms=" << last_project_total_ms_.load()
          << " last_snapshot_ms=" << last_snapshot_ms_.load()
          << " last_surface_extract_ms=" << last_surface_extract_ms_.load()
+         << " last_cache_build_ms=" << last_cache_build_ms_.load()
+         << " last_frustum_filter_ms=" << last_frustum_filter_ms_.load()
          << " last_projection_loop_ms=" << last_projection_loop_ms_.load()
          << " last_projection_median_ms=" << last_projection_median_ms_.load();
   RunLogger::logGlobal("map_thread", stream.str());

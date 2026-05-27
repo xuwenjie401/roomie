@@ -144,11 +144,17 @@ std_msgs::msg::String PublisherPersistenceThread::buildMapStats(
          << "map_backend=" << config_.map_backend
          << " map_version=" << snapshot.map_version
          << " has_map=" << (snapshot.has_map ? "true" : "false")
+         << " cache_ready=" << (snapshot.surface_cache_ready ? "true" : "false")
          << " surface_points=" << snapshot.surface_points_world.size()
+         << " cached_surface_points=" << snapshot.cached_surface_points
          << " tsdf_blocks=" << snapshot.tsdf_blocks
+         << " selected_blocks=" << snapshot.selected_blocks
+         << " cache_rebuilds=" << snapshot.cache_rebuilds
          << " voxels_scanned=" << snapshot.surface_voxels_scanned
          << " snapshot_ms=" << snapshot.snapshot_ms
          << " surface_extract_ms=" << snapshot.surface_extract_ms
+         << " cache_build_ms=" << snapshot.cache_build_ms
+         << " frustum_filter_ms=" << snapshot.frustum_filter_ms
          << " publish_period_sec=" << config_.publish_period_sec;
   message.data = stream.str();
   return message;

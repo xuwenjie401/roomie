@@ -16,6 +16,7 @@
 
 #include <nvblox/core/cuda_stream.h>
 #include <nvblox/core/indexing.h>
+#include <nvblox/geometry/bounding_boxes.h>
 #include <nvblox/map/blox.h>
 #include <nvblox/map/layer.h>
 #include <nvblox/map/voxels.h>
@@ -23,6 +24,8 @@
 #include <nvblox/sensors/camera.h>
 #include <nvblox/sensors/image.h>
 #include <rclcpp/rclcpp.hpp>
+
+#include "roomie/utils/run_logger.hpp"
 
 namespace roomie {
 namespace {
@@ -178,54 +181,84 @@ class NvbloxMapBackend : public MapBackend {
   MapBackendSnapshot snapshot() const override {
     std::lock_guard<std::mutex> lock(mutex_);
     MapBackendSnapshot snapshot;
-    snapshot.map_version = map_version_.load();
-    snapshot.has_map = mapper_->tsdf_layer().numBlocks() > 0;
-    const auto surface_extract_start = std::chrono::steady_clock::now();
-    collectSurfacePoints(&snapshot);
-    snapshot.surface_extract_ms =
-        elapsedMs(surface_extract_start, std::chrono::steady_clock::now());
+    const std::uint64_t cache_rebuilds_before = cache_rebuilds_;
+    ensureSurfaceCacheLocked();
+    fillSnapshotHeaderLocked(&snapshot);
+    if (snapshot.cache_rebuilds > cache_rebuilds_before) {
+      snapshot.cache_build_ms = last_cache_build_ms_;
+    }
+    populateSnapshotFromCacheLocked(/*include_debug=*/true, &snapshot);
+    return snapshot;
+  }
+
+  MapBackendSnapshot snapshotForView(const MapBackendView& view) const override {
+    std::lock_guard<std::mutex> lock(mutex_);
+    MapBackendSnapshot snapshot;
+    const std::uint64_t cache_rebuilds_before = cache_rebuilds_;
+    ensureSurfaceCacheLocked();
+    fillSnapshotHeaderLocked(&snapshot);
+    if (snapshot.cache_rebuilds > cache_rebuilds_before) {
+      snapshot.cache_build_ms = last_cache_build_ms_;
+    }
+    if (!snapshot.has_map) {
+      return snapshot;
+    }
+    if (!hasUsableIntrinsics(view.intrinsics) || view.max_depth_m <= view.min_depth_m) {
+      populateSnapshotFromCacheLocked(/*include_debug=*/false, &snapshot);
+      return snapshot;
+    }
+
+    const nvblox::Camera camera(view.intrinsics.fx,
+                                view.intrinsics.fy,
+                                view.intrinsics.cx,
+                                view.intrinsics.cy,
+                                view.intrinsics.width,
+                                view.intrinsics.height);
+    const nvblox::Transform T_world_camera = toNvbloxTransform(view.T_world_camera);
+    const nvblox::Frustum frustum(
+        camera, T_world_camera, view.min_depth_m, view.max_depth_m);
+    const auto filter_start = std::chrono::steady_clock::now();
+    snapshot.view_filtered = true;
+    std::vector<const SurfaceBlockCache*> selected_blocks;
+    selected_blocks.reserve(surface_cache_blocks_.size());
+    std::size_t selected_points = 0;
+    for (const SurfaceBlockCache& block_cache : surface_cache_blocks_) {
+      if (block_cache.surface_points_world.empty() ||
+          !frustum.isAABBInView(block_cache.aabb_world)) {
+        continue;
+      }
+      selected_blocks.push_back(&block_cache);
+      selected_points += block_cache.surface_points_world.size();
+    }
+    snapshot.surface_points_world.reserve(selected_points);
+    for (const SurfaceBlockCache* block_cache : selected_blocks) {
+      snapshot.surface_points_world.insert(snapshot.surface_points_world.end(),
+                                           block_cache->surface_points_world.begin(),
+                                           block_cache->surface_points_world.end());
+      ++snapshot.selected_blocks;
+    }
+    snapshot.frustum_filter_ms =
+        elapsedMs(filter_start, std::chrono::steady_clock::now());
     return snapshot;
   }
 
   std::vector<VoxelRef, Eigen::aligned_allocator<VoxelRef>> collectNearSurfaceVoxels(
       const RawDetection& detection) const override {
     std::lock_guard<std::mutex> lock(mutex_);
+    ensureSurfaceCacheLocked();
     std::vector<VoxelRef, Eigen::aligned_allocator<VoxelRef>> refs;
-
-    const nvblox::TsdfLayer& layer = mapper_->tsdf_layer();
-    const float block_size = layer.block_size();
-    const float voxel_size = layer.voxel_size();
-    const float max_surface_distance =
-        config_.surface_visualization_distance_vox * voxel_size;
-    constexpr int kVoxelsPerSide = nvblox::VoxelBlock<nvblox::TsdfVoxel>::kVoxelsPerSide;
-
-    for (const nvblox::Index3D& block_index : layer.getAllBlockIndices()) {
-      const nvblox::TsdfBlock::ConstPtr block = layer.getBlockAtIndex(block_index);
-      if (block == nullptr) {
-        continue;
-      }
-      for (int x = 0; x < kVoxelsPerSide; ++x) {
-        for (int y = 0; y < kVoxelsPerSide; ++y) {
-          for (int z = 0; z < kVoxelsPerSide; ++z) {
-            const nvblox::Index3D voxel_index(x, y, z);
-            const nvblox::TsdfVoxel& voxel = (*block)(voxel_index);
-            if (voxel.weight < config_.min_visualization_weight ||
-                std::abs(voxel.distance) > max_surface_distance) {
-              continue;
-            }
-            const nvblox::Vector3f point =
-                nvblox::getCenterPositionFromBlockIndexAndVoxelIndex(
-                    block_size, block_index, voxel_index);
-            if (!pointInsideYawObb(Eigen::Vector3f(point.x(), point.y(), point.z()),
-                                   detection)) {
-              continue;
-            }
-            VoxelRef ref;
-            ref.block_index = Eigen::Vector3i(block_index.x(), block_index.y(), block_index.z());
-            ref.voxel_index = Eigen::Vector3i(x, y, z);
-            refs.push_back(ref);
-          }
+    for (const SurfaceBlockCache& block_cache : surface_cache_blocks_) {
+      for (std::size_t i = 0; i < block_cache.surface_points_world.size(); ++i) {
+        if (!pointInsideYawObb(block_cache.surface_points_world[i], detection)) {
+          continue;
         }
+        VoxelRef ref;
+        ref.block_index = Eigen::Vector3i(block_cache.block_index.x(),
+                                          block_cache.block_index.y(),
+                                          block_cache.block_index.z());
+        const nvblox::Index3D& voxel_index = block_cache.voxel_indices[i];
+        ref.voxel_index = Eigen::Vector3i(voxel_index.x(), voxel_index.y(), voxel_index.z());
+        refs.push_back(ref);
       }
     }
     return refs;
@@ -247,6 +280,16 @@ class NvbloxMapBackend : public MapBackend {
   }
 
  private:
+  struct SurfaceBlockCache {
+    EIGEN_MAKE_ALIGNED_OPERATOR_NEW
+
+    nvblox::Index3D block_index = nvblox::Index3D::Zero();
+    nvblox::AxisAlignedBoundingBox aabb_world;
+    WorldPointVector surface_points_world;
+    std::vector<MapSurfacePoint, Eigen::aligned_allocator<MapSurfacePoint>> debug_surface_points;
+    std::vector<nvblox::Index3D, Eigen::aligned_allocator<nvblox::Index3D>> voxel_indices;
+  };
+
   std::unique_ptr<nvblox::Mapper> createMapper() const {
     auto mapper = std::make_unique<nvblox::Mapper>(
         config_.voxel_size_m,
@@ -301,7 +344,57 @@ class NvbloxMapBackend : public MapBackend {
     }
   }
 
-  void collectSurfacePoints(MapBackendSnapshot* snapshot) const {
+  void ensureSurfaceCacheLocked() const {
+    if (surface_cache_ready_ || mapper_->tsdf_layer().numBlocks() == 0) {
+      return;
+    }
+    rebuildSurfaceCacheLocked();
+  }
+
+  void fillSnapshotHeaderLocked(MapBackendSnapshot* snapshot) const {
+    snapshot->map_version = cached_map_version_;
+    snapshot->has_map = surface_cache_ready_ && cached_surface_points_ > 0;
+    snapshot->surface_cache_ready = surface_cache_ready_;
+    snapshot->tsdf_blocks = cached_tsdf_blocks_;
+    snapshot->surface_voxels_scanned = cached_voxels_scanned_;
+    snapshot->cached_surface_points = cached_surface_points_;
+    snapshot->cache_rebuilds = cache_rebuilds_;
+  }
+
+  void populateSnapshotFromCacheLocked(bool include_debug,
+                                       MapBackendSnapshot* snapshot) const {
+    const auto copy_start = std::chrono::steady_clock::now();
+    snapshot->surface_points_world.reserve(
+        static_cast<std::size_t>(cached_surface_points_));
+    if (include_debug) {
+      snapshot->debug_surface_points.reserve(
+          static_cast<std::size_t>(cached_surface_points_));
+    }
+    for (const SurfaceBlockCache& block_cache : surface_cache_blocks_) {
+      if (block_cache.surface_points_world.empty()) {
+        continue;
+      }
+      snapshot->surface_points_world.insert(snapshot->surface_points_world.end(),
+                                           block_cache.surface_points_world.begin(),
+                                           block_cache.surface_points_world.end());
+      if (include_debug) {
+        snapshot->debug_surface_points.insert(snapshot->debug_surface_points.end(),
+                                             block_cache.debug_surface_points.begin(),
+                                             block_cache.debug_surface_points.end());
+      }
+      ++snapshot->selected_blocks;
+    }
+    snapshot->surface_extract_ms =
+        elapsedMs(copy_start, std::chrono::steady_clock::now());
+  }
+
+  void rebuildSurfaceCacheLocked() const {
+    const auto build_start = std::chrono::steady_clock::now();
+    surface_cache_blocks_.clear();
+    cached_tsdf_blocks_ = 0;
+    cached_voxels_scanned_ = 0;
+    cached_surface_points_ = 0;
+
     const nvblox::TsdfLayer& layer = mapper_->tsdf_layer();
     const nvblox::ColorLayer& color_layer = mapper_->color_layer();
     const float block_size = layer.block_size();
@@ -311,20 +404,22 @@ class NvbloxMapBackend : public MapBackend {
     constexpr int kVoxelsPerSide = nvblox::VoxelBlock<nvblox::TsdfVoxel>::kVoxelsPerSide;
 
     const std::vector<nvblox::Index3D> block_indices = layer.getAllBlockIndices();
-    snapshot->tsdf_blocks = static_cast<std::uint64_t>(block_indices.size());
-    snapshot->surface_points_world.reserve(block_indices.size() * 32);
-    snapshot->debug_surface_points.reserve(block_indices.size() * 32);
+    cached_tsdf_blocks_ = static_cast<std::uint64_t>(block_indices.size());
+    surface_cache_blocks_.reserve(block_indices.size());
     for (const nvblox::Index3D& block_index : block_indices) {
       const nvblox::TsdfBlock::ConstPtr block = layer.getBlockAtIndex(block_index);
       if (block == nullptr) {
         continue;
       }
-      snapshot->surface_voxels_scanned +=
+      cached_voxels_scanned_ +=
           static_cast<std::uint64_t>(kVoxelsPerSide) *
           static_cast<std::uint64_t>(kVoxelsPerSide) *
           static_cast<std::uint64_t>(kVoxelsPerSide);
       const nvblox::ColorBlock::ConstPtr color_block =
           color_layer.getBlockAtIndex(block_index);
+      SurfaceBlockCache block_cache;
+      block_cache.block_index = block_index;
+      block_cache.aabb_world = nvblox::getAABBOfBlock(block_size, block_index);
       for (int x = 0; x < kVoxelsPerSide; ++x) {
         for (int y = 0; y < kVoxelsPerSide; ++y) {
           for (int z = 0; z < kVoxelsPerSide; ++z) {
@@ -338,7 +433,8 @@ class NvbloxMapBackend : public MapBackend {
                 nvblox::getCenterPositionFromBlockIndexAndVoxelIndex(
                     block_size, block_index, voxel_index);
             const Eigen::Vector3f point_world(point.x(), point.y(), point.z());
-            snapshot->surface_points_world.push_back(point_world);
+            block_cache.surface_points_world.push_back(point_world);
+            block_cache.voxel_indices.push_back(voxel_index);
 
             MapSurfacePoint surface_point;
             surface_point.position_world = point_world;
@@ -352,11 +448,36 @@ class NvbloxMapBackend : public MapBackend {
                 surface_point.b = color_voxel.color.b();
               }
             }
-            snapshot->debug_surface_points.push_back(surface_point);
+            block_cache.debug_surface_points.push_back(surface_point);
           }
         }
       }
+      cached_surface_points_ +=
+          static_cast<std::uint64_t>(block_cache.surface_points_world.size());
+      surface_cache_blocks_.push_back(std::move(block_cache));
     }
+    surface_cache_ready_ = true;
+    cached_map_version_ = map_version_.load();
+    ++cache_rebuilds_;
+    last_cache_build_ms_ = elapsedMs(build_start, std::chrono::steady_clock::now());
+    RCLCPP_INFO(logger_,
+                "built nvblox surface cache blocks=%lu surface_points=%lu "
+                "voxels_scanned=%lu build=%.1fms",
+                static_cast<unsigned long>(cached_tsdf_blocks_),
+                static_cast<unsigned long>(cached_surface_points_),
+                static_cast<unsigned long>(cached_voxels_scanned_),
+                last_cache_build_ms_);
+    RunLogger::logGlobal("map",
+                         "built_nvblox_surface_cache blocks=" +
+                             std::to_string(cached_tsdf_blocks_) +
+                             " surface_points=" +
+                             std::to_string(cached_surface_points_) +
+                             " voxels_scanned=" +
+                             std::to_string(cached_voxels_scanned_) +
+                             " map_version=" +
+                             std::to_string(cached_map_version_) +
+                             " build_ms=" +
+                             std::to_string(last_cache_build_ms_));
   }
 
   PipelineConfig config_;
@@ -370,6 +491,15 @@ class NvbloxMapBackend : public MapBackend {
   nvblox::MonoImage mask_image_;
   std::atomic_uint64_t map_version_{0};
   std::atomic_uint64_t integrated_frames_{0};
+  mutable bool surface_cache_ready_{false};
+  mutable std::vector<SurfaceBlockCache, Eigen::aligned_allocator<SurfaceBlockCache>>
+      surface_cache_blocks_;
+  mutable std::uint64_t cached_tsdf_blocks_{0};
+  mutable std::uint64_t cached_voxels_scanned_{0};
+  mutable std::uint64_t cached_surface_points_{0};
+  mutable std::uint64_t cached_map_version_{0};
+  mutable std::uint64_t cache_rebuilds_{0};
+  mutable double last_cache_build_ms_{0.0};
   rclcpp::Logger logger_;
 };
 

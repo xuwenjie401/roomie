@@ -81,7 +81,7 @@ struct PipelineConfig {
   double max_tf_translation_step_m = 0.5;
   double max_tf_rotation_step_deg = 45.0;
 
-  double publish_period_sec = 1.0;
+  double publish_period_sec = 5.0;
 
   bool load_map = true;
   std::string map_load_path;

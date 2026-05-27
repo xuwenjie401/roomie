@@ -32,7 +32,7 @@ class MapThread : public WorkerThread, public MapProjector {
   void run() override;
 
  private:
-  MapBackendSnapshot timedBackendSnapshot() const;
+  MapBackendSnapshot timedBackendSnapshot(const MapBackendView* view) const;
   void maybeLogStatus();
   PatchDepth projectWorldPointsToPatchDepth(const DetectionFrame& frame,
                                             const WorldPointVector& world_points,
@@ -53,9 +53,14 @@ class MapThread : public WorkerThread, public MapProjector {
   std::atomic_uint64_t last_source_surface_points_{0};
   std::atomic_uint64_t last_source_tsdf_blocks_{0};
   std::atomic_uint64_t last_source_voxels_scanned_{0};
+  std::atomic_uint64_t last_source_selected_blocks_{0};
+  std::atomic_uint64_t last_source_cached_surface_points_{0};
+  std::atomic_uint64_t last_surface_cache_rebuilds_{0};
   std::atomic<double> last_project_total_ms_{0.0};
   std::atomic<double> last_snapshot_ms_{0.0};
   std::atomic<double> last_surface_extract_ms_{0.0};
+  std::atomic<double> last_cache_build_ms_{0.0};
+  std::atomic<double> last_frustum_filter_ms_{0.0};
   std::atomic<double> last_projection_loop_ms_{0.0};
   std::atomic<double> last_projection_median_ms_{0.0};
 };

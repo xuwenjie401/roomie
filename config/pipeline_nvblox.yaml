@@ -87,7 +87,7 @@ roomie_pipeline_node:
       max_tf_rotation_step_deg: 45.0
 
     publishing:
-      publish_period_sec: 1.0
+      publish_period_sec: 5.0
 
     persistence:
       save_instance_map: true

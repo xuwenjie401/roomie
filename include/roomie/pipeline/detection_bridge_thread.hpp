@@ -43,11 +43,18 @@ class DetectionBridgeThread : public WorkerThread {
     std::uint64_t source_surface_points = 0;
     std::uint64_t source_tsdf_blocks = 0;
     std::uint64_t source_voxels_scanned = 0;
+    std::uint64_t source_selected_blocks = 0;
+    std::uint64_t source_cached_surface_points = 0;
+    std::uint64_t surface_cache_rebuilds = 0;
     double project_total_ms = 0.0;
     double snapshot_ms = 0.0;
     double surface_extract_ms = 0.0;
+    double cache_build_ms = 0.0;
+    double frustum_filter_ms = 0.0;
     double projection_loop_ms = 0.0;
     double projection_median_ms = 0.0;
+    bool surface_cache_ready = false;
+    bool view_filtered = false;
   };
 
   bool readyForNextRequest();
@@ -92,6 +99,8 @@ class DetectionBridgeThread : public WorkerThread {
   double total_project_total_ms_ = 0.0;
   double total_snapshot_ms_ = 0.0;
   double total_surface_extract_ms_ = 0.0;
+  double total_cache_build_ms_ = 0.0;
+  double total_frustum_filter_ms_ = 0.0;
   double total_projection_loop_ms_ = 0.0;
   double total_projection_median_ms_ = 0.0;
   double total_resize_ms_ = 0.0;
