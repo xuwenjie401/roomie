@@ -13,6 +13,7 @@ class CpuPointMapBackend : public MapBackend {
 
   void integrateFrame(const MappingFrame& frame) override;
   MapBackendSnapshot snapshot() const override;
+  std::shared_ptr<const GeometrySurfaceCache> geometrySurfaceCache() const override;
   std::vector<VoxelRef, Eigen::aligned_allocator<VoxelRef>> collectNearSurfaceVoxels(
       const RawDetection& detection) const override;
 

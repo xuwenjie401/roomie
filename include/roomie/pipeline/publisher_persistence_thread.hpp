@@ -1,10 +1,14 @@
 #pragma once
 
 #include <chrono>
+#include <memory>
+#include <string>
+#include <vector>
 
 #include <rclcpp/rclcpp.hpp>
 #include <sensor_msgs/msg/point_cloud2.hpp>
 #include <std_msgs/msg/string.hpp>
+#include <std_srvs/srv/trigger.hpp>
 #include <visualization_msgs/msg/marker_array.hpp>
 
 #include "roomie/pipeline/interfaces.hpp"
@@ -26,18 +30,33 @@ class PublisherPersistenceThread : public WorkerThread {
   void run() override;
 
  private:
-  visualization_msgs::msg::MarkerArray buildInstanceMarkers() const;
+  visualization_msgs::msg::MarkerArray buildObjectMarkers() const;
+  visualization_msgs::msg::MarkerArray buildTrackedInstanceMarkers() const;
+  visualization_msgs::msg::MarkerArray buildMarkers(
+      const std::vector<InstanceRecord, Eigen::aligned_allocator<InstanceRecord>>& records,
+      const std::string& box_namespace,
+      const std::string& label_namespace,
+      bool show_object_id,
+      bool show_track_id,
+      float line_width,
+      float active_alpha,
+      float inactive_alpha) const;
   sensor_msgs::msg::PointCloud2 buildMapSurfaceCloud(
       const MapBackendSnapshot& snapshot) const;
   std_msgs::msg::String buildMapStats(const MapBackendSnapshot& snapshot) const;
+  void handleSaveDsg(
+      const std::shared_ptr<std_srvs::srv::Trigger::Request> request,
+      std::shared_ptr<std_srvs::srv::Trigger::Response> response) const;
 
   rclcpp::Node& node_;
   const InstanceStore& instance_store_;
   const MapThread& map_thread_;
   PipelineConfig config_;
-  rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr marker_pub_;
+  rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr object_marker_pub_;
+  rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr instance_marker_pub_;
   rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr map_surface_pub_;
   rclcpp::Publisher<std_msgs::msg::String>::SharedPtr map_stats_pub_;
+  rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr save_dsg_service_;
   std::chrono::steady_clock::time_point last_log_time_ =
       std::chrono::steady_clock::now();
 };

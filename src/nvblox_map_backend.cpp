@@ -242,6 +242,12 @@ class NvbloxMapBackend : public MapBackend {
     return snapshot;
   }
 
+  std::shared_ptr<const GeometrySurfaceCache> geometrySurfaceCache() const override {
+    std::lock_guard<std::mutex> lock(mutex_);
+    ensureSurfaceCacheLocked();
+    return geometry_surface_cache_;
+  }
+
   std::vector<VoxelRef, Eigen::aligned_allocator<VoxelRef>> collectNearSurfaceVoxels(
       const RawDetection& detection) const override {
     std::lock_guard<std::mutex> lock(mutex_);
@@ -391,6 +397,7 @@ class NvbloxMapBackend : public MapBackend {
   void rebuildSurfaceCacheLocked() const {
     const auto build_start = std::chrono::steady_clock::now();
     surface_cache_blocks_.clear();
+    auto geometry_cache = std::make_shared<GeometrySurfaceCache>();
     cached_tsdf_blocks_ = 0;
     cached_voxels_scanned_ = 0;
     cached_surface_points_ = 0;
@@ -440,6 +447,11 @@ class NvbloxMapBackend : public MapBackend {
             surface_point.position_world = point_world;
             surface_point.intensity = voxel.distance;
             surface_point.weight = voxel.weight;
+            surface_point.has_voxel_ref = true;
+            surface_point.voxel_ref.block_index =
+                Eigen::Vector3i(block_index.x(), block_index.y(), block_index.z());
+            surface_point.voxel_ref.voxel_index =
+                Eigen::Vector3i(voxel_index.x(), voxel_index.y(), voxel_index.z());
             if (color_block != nullptr) {
               const nvblox::ColorVoxel& color_voxel = (*color_block)(voxel_index);
               if (color_voxel.weight >= config_.min_color_weight) {
@@ -454,11 +466,20 @@ class NvbloxMapBackend : public MapBackend {
       }
       cached_surface_points_ +=
           static_cast<std::uint64_t>(block_cache.surface_points_world.size());
+      geometry_cache->surface_points.insert(geometry_cache->surface_points.end(),
+                                            block_cache.debug_surface_points.begin(),
+                                            block_cache.debug_surface_points.end());
       surface_cache_blocks_.push_back(std::move(block_cache));
     }
     surface_cache_ready_ = true;
     cached_map_version_ = map_version_.load();
     ++cache_rebuilds_;
+    geometry_cache->map_version = cached_map_version_;
+    geometry_cache->cache_rebuilds = cache_rebuilds_;
+    geometry_cache->tsdf_blocks = cached_tsdf_blocks_;
+    geometry_cache->surface_voxels_scanned = cached_voxels_scanned_;
+    geometry_cache->has_map = cached_surface_points_ > 0;
+    geometry_surface_cache_ = std::move(geometry_cache);
     last_cache_build_ms_ = elapsedMs(build_start, std::chrono::steady_clock::now());
     RCLCPP_INFO(logger_,
                 "built nvblox surface cache blocks=%lu surface_points=%lu "
@@ -494,6 +515,7 @@ class NvbloxMapBackend : public MapBackend {
   mutable bool surface_cache_ready_{false};
   mutable std::vector<SurfaceBlockCache, Eigen::aligned_allocator<SurfaceBlockCache>>
       surface_cache_blocks_;
+  mutable std::shared_ptr<const GeometrySurfaceCache> geometry_surface_cache_;
   mutable std::uint64_t cached_tsdf_blocks_{0};
   mutable std::uint64_t cached_voxels_scanned_{0};
   mutable std::uint64_t cached_surface_points_{0};

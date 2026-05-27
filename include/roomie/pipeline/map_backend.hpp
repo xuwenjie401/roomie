@@ -21,6 +21,17 @@ struct MapSurfacePoint {
   std::uint8_t b = 160;
   float intensity = 0.0f;
   float weight = 0.0f;
+  VoxelRef voxel_ref;
+  bool has_voxel_ref = false;
+};
+
+struct GeometrySurfaceCache {
+  std::vector<MapSurfacePoint, Eigen::aligned_allocator<MapSurfacePoint>> surface_points;
+  std::uint64_t map_version = 0;
+  std::uint64_t cache_rebuilds = 0;
+  std::uint64_t tsdf_blocks = 0;
+  std::uint64_t surface_voxels_scanned = 0;
+  bool has_map = false;
 };
 
 struct MapBackendSnapshot {
@@ -58,6 +69,7 @@ class MapBackend {
     (void)view;
     return snapshot();
   }
+  virtual std::shared_ptr<const GeometrySurfaceCache> geometrySurfaceCache() const = 0;
   virtual std::vector<VoxelRef, Eigen::aligned_allocator<VoxelRef>> collectNearSurfaceVoxels(
       const RawDetection& detection) const = 0;
   virtual void saveIfRequested() {}

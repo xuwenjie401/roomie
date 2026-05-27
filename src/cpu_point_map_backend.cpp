@@ -78,6 +78,21 @@ MapBackendSnapshot CpuPointMapBackend::snapshot() const {
   return snapshot;
 }
 
+std::shared_ptr<const GeometrySurfaceCache> CpuPointMapBackend::geometrySurfaceCache() const {
+  std::lock_guard<std::mutex> lock(mutex_);
+  auto cache = std::make_shared<GeometrySurfaceCache>();
+  cache->map_version = map_version_.load();
+  cache->has_map = !map_points_world_.empty();
+  cache->surface_points.reserve(map_points_world_.size());
+  for (const Eigen::Vector3f& point : map_points_world_) {
+    MapSurfacePoint surface_point;
+    surface_point.position_world = point;
+    surface_point.weight = 1.0f;
+    cache->surface_points.push_back(surface_point);
+  }
+  return cache;
+}
+
 std::vector<VoxelRef, Eigen::aligned_allocator<VoxelRef>>
 CpuPointMapBackend::collectNearSurfaceVoxels(const RawDetection& detection) const {
   (void)detection;

@@ -1,5 +1,6 @@
 #include "roomie/pipeline/publisher_persistence_thread.hpp"
 
+#include <algorithm>
 #include <chrono>
 #include <cstdint>
 #include <cstring>
@@ -10,6 +11,7 @@
 
 #include <sensor_msgs/point_cloud2_iterator.hpp>
 
+#include "roomie/dsg/object_graph_io.hpp"
 #include "roomie/utils/run_logger.hpp"
 #include "roomie/utils/visualization_utils.hpp"
 
@@ -26,9 +28,26 @@ float packRgbAsFloat(std::uint8_t r, std::uint8_t g, std::uint8_t b) {
   return value;
 }
 
-std::string instanceText(const InstanceRecord& instance, bool show_score) {
+std::string instanceText(const InstanceRecord& instance,
+                         bool show_score,
+                         bool show_object_id,
+                         bool show_track_id) {
   std::ostringstream stream;
-  stream << (instance.label.empty() ? std::to_string(instance.track_id) : instance.label);
+  if (!instance.label.empty()) {
+    stream << instance.label;
+  } else if (show_track_id && instance.track_id >= 0) {
+    stream << "instance";
+  } else if (instance.object_id >= 0) {
+    stream << "object " << instance.object_id;
+  } else {
+    stream << "object";
+  }
+  if (show_object_id && instance.object_id >= 0) {
+    stream << " o" << instance.object_id;
+  }
+  if (show_track_id && instance.track_id >= 0) {
+    stream << " t" << instance.track_id;
+  }
   if (show_score) {
     stream << " " << static_cast<int>(std::round(instance.confidence * 100.0f)) << "%";
   }
@@ -46,8 +65,11 @@ PublisherPersistenceThread::PublisherPersistenceThread(rclcpp::Node& node,
       instance_store_(instance_store),
       map_thread_(map_thread),
       config_(std::move(config)) {
-  marker_pub_ = node_.create_publisher<visualization_msgs::msg::MarkerArray>(
-      "/roomie/instances",
+  object_marker_pub_ = node_.create_publisher<visualization_msgs::msg::MarkerArray>(
+      config_.object_markers_topic,
+      rclcpp::QoS(1).reliable());
+  instance_marker_pub_ = node_.create_publisher<visualization_msgs::msg::MarkerArray>(
+      config_.instance_markers_topic,
       rclcpp::QoS(1).reliable());
   map_surface_pub_ = node_.create_publisher<sensor_msgs::msg::PointCloud2>(
       config_.tsdf_output_topic,
@@ -55,6 +77,14 @@ PublisherPersistenceThread::PublisherPersistenceThread(rclcpp::Node& node,
   map_stats_pub_ = node_.create_publisher<std_msgs::msg::String>(
       "/roomie/map_stats",
       rclcpp::QoS(1).reliable());
+  if (config_.save_instance_map && !config_.save_dsg_service.empty()) {
+    save_dsg_service_ = node_.create_service<std_srvs::srv::Trigger>(
+        config_.save_dsg_service,
+        [this](const std::shared_ptr<std_srvs::srv::Trigger::Request> request,
+               std::shared_ptr<std_srvs::srv::Trigger::Response> response) {
+          handleSaveDsg(request, response);
+        });
+  }
 }
 
 void PublisherPersistenceThread::run() {
@@ -64,17 +94,22 @@ void PublisherPersistenceThread::run() {
     map_surface_pub_->publish(buildMapSurfaceCloud(map_snapshot));
     const std_msgs::msg::String map_stats = buildMapStats(map_snapshot);
     map_stats_pub_->publish(map_stats);
-    marker_pub_->publish(buildInstanceMarkers());
+    object_marker_pub_->publish(buildObjectMarkers());
+    instance_marker_pub_->publish(buildTrackedInstanceMarkers());
     const auto now = std::chrono::steady_clock::now();
     if (now - last_log_time_ >=
         std::chrono::duration<double>(config_.file_logging_period_sec)) {
       last_log_time_ = now;
       RunLogger::logGlobal("map", map_stats.data);
+      const std::size_t object_count = instance_store_.snapshotInstances().size();
+      const std::size_t tracked_instance_count =
+          instance_store_.snapshotTrackedInstances().size();
       RunLogger::logGlobal("publisher",
                            "published surface_points=" +
                                std::to_string(map_snapshot.debug_surface_points.size()) +
-                               " instances=" +
-                               std::to_string(instance_store_.snapshotInstances().size()));
+                               " objects=" + std::to_string(object_count) +
+                               " tracked_instances=" +
+                               std::to_string(tracked_instance_count));
     }
     std::this_thread::sleep_for(period);
   }
@@ -160,7 +195,72 @@ std_msgs::msg::String PublisherPersistenceThread::buildMapStats(
   return message;
 }
 
-visualization_msgs::msg::MarkerArray PublisherPersistenceThread::buildInstanceMarkers() const {
+void PublisherPersistenceThread::handleSaveDsg(
+    const std::shared_ptr<std_srvs::srv::Trigger::Request> request,
+    std::shared_ptr<std_srvs::srv::Trigger::Response> response) const {
+  (void)request;
+  const TimeNanoseconds saved_time_ns = node_.now().nanoseconds();
+  ObjectGraphSavePaths paths;
+  std::string error;
+  const ObjectGraphSnapshot snapshot = instance_store_.snapshotObjectGraph();
+  if (!saveObjectGraphSnapshotJson(snapshot,
+                                   config_.world_frame,
+                                   saved_time_ns,
+                                   config_.instance_map_save_path,
+                                   &paths,
+                                   &error)) {
+    response->success = false;
+    response->message = "failed to save DSG: " + error;
+    RCLCPP_WARN(node_.get_logger(), "%s", response->message.c_str());
+    RunLogger::logGlobal("persistence", response->message);
+    return;
+  }
+
+  std::ostringstream stream;
+  stream << "saved DSG objects=" << snapshot.objects.size()
+         << " relations=" << snapshot.relations.size()
+         << " path=" << paths.primary_path.string();
+  if (!paths.latest_path.empty()) {
+    stream << " latest=" << paths.latest_path.string();
+  }
+  response->success = true;
+  response->message = stream.str();
+  RCLCPP_INFO(node_.get_logger(), "%s", response->message.c_str());
+  RunLogger::logGlobal("persistence", response->message);
+}
+
+visualization_msgs::msg::MarkerArray PublisherPersistenceThread::buildObjectMarkers() const {
+  return buildMarkers(instance_store_.snapshotInstances(),
+                      "roomie_objects",
+                      "roomie_object_labels",
+                      false,
+                      false,
+                      0.04f,
+                      0.95f,
+                      0.45f);
+}
+
+visualization_msgs::msg::MarkerArray
+PublisherPersistenceThread::buildTrackedInstanceMarkers() const {
+  return buildMarkers(instance_store_.snapshotTrackedInstances(),
+                      "roomie_instance_tracks",
+                      "roomie_instance_track_labels",
+                      false,
+                      true,
+                      0.015f,
+                      0.35f,
+                      0.12f);
+}
+
+visualization_msgs::msg::MarkerArray PublisherPersistenceThread::buildMarkers(
+    const std::vector<InstanceRecord, Eigen::aligned_allocator<InstanceRecord>>& records,
+    const std::string& box_namespace,
+    const std::string& label_namespace,
+    bool show_object_id,
+    bool show_track_id,
+    float line_width,
+    float active_alpha,
+    float inactive_alpha) const {
   visualization_msgs::msg::MarkerArray markers;
 
   visualization_msgs::msg::Marker clear;
@@ -169,23 +269,22 @@ visualization_msgs::msg::MarkerArray PublisherPersistenceThread::buildInstanceMa
   clear.action = visualization_msgs::msg::Marker::DELETEALL;
   markers.markers.push_back(clear);
 
-  const auto instances = instance_store_.snapshotInstances();
   int marker_id = 1;
-  for (const InstanceRecord& instance : instances) {
+  for (const InstanceRecord& instance : records) {
     const RgbColor color = colorForLabel(instance.label, instance.semantic_id);
     visualization_msgs::msg::Marker box;
     box.header.frame_id = config_.world_frame;
     box.header.stamp = node_.now();
-    box.ns = "roomie_instances";
+    box.ns = box_namespace;
     box.id = marker_id++;
     box.type = visualization_msgs::msg::Marker::LINE_LIST;
     box.action = visualization_msgs::msg::Marker::ADD;
     box.pose.orientation.w = 1.0;
-    box.scale.x = 0.03;
+    box.scale.x = line_width;
     box.color.r = color.r;
     box.color.g = color.g;
     box.color.b = color.b;
-    box.color.a = 0.95f;
+    box.color.a = instance.active ? active_alpha : inactive_alpha;
     fillLineListFromCorners(
         yawObbCorners(instance.center_world, instance.size_m, instance.yaw_rad),
         &box);
@@ -194,7 +293,7 @@ visualization_msgs::msg::MarkerArray PublisherPersistenceThread::buildInstanceMa
     visualization_msgs::msg::Marker text;
     text.header.frame_id = config_.world_frame;
     text.header.stamp = box.header.stamp;
-    text.ns = "roomie_instance_labels";
+    text.ns = label_namespace;
     text.id = marker_id++;
     text.type = visualization_msgs::msg::Marker::TEXT_VIEW_FACING;
     text.action = visualization_msgs::msg::Marker::ADD;
@@ -202,12 +301,14 @@ visualization_msgs::msg::MarkerArray PublisherPersistenceThread::buildInstanceMa
     text.pose.position.y = instance.center_world.y();
     text.pose.position.z = instance.center_world.z();
     text.pose.position.z += std::max(0.05f, instance.size_m.z() * 0.6f);
-    text.scale.z = 0.12;
+    text.scale.z = line_width < 0.02f ? 0.08 : 0.12;
     text.color.r = 1.0f;
     text.color.g = 1.0f;
     text.color.b = 1.0f;
-    text.color.a = 1.0f;
-    text.text = instanceText(instance, config_.show_3d_label_score);
+    text.color.a = instance.active ? std::min(1.0f, active_alpha + 0.25f)
+                                   : std::min(0.75f, inactive_alpha + 0.20f);
+    text.text = instanceText(
+        instance, config_.show_3d_label_score, show_object_id, show_track_id);
     markers.markers.push_back(text);
   }
 

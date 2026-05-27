@@ -21,6 +21,8 @@ struct PipelineConfig {
   std::string tsdf_output_topic = "/roomie/map_surface";
   std::string detection_debug_image_topic = "/roomie/detections_2d_image";
   std::string raw_detections_topic = "/roomie/raw_detections";
+  std::string object_markers_topic = "/roomie/objects";
+  std::string instance_markers_topic = "/roomie/instances";
 
   int camera_width = 640;
   int camera_height = 480;
@@ -44,9 +46,12 @@ struct PipelineConfig {
   std::string map_backend = "cpu";
 
   int boxer_input_size = 960;
-  int patch_rows = 60;
-  int patch_cols = 60;
   float min_patch_coverage_ratio = 0.05f;
+  float patch_depth_max_m = 0.0f;
+  int patch_depth_zbuffer_scale = 4;
+  int patch_depth_zbuffer_splat_radius_cells = 1;
+  float patch_depth_zbuffer_front_quantile = 0.25f;
+  int patch_depth_zbuffer_min_cells_per_patch = 1;
   double max_inference_fps = 10.0;
   bool python_backend_enabled = true;
   std::string python_executable = "/home/agxi/miniconda3/envs/jarvis/bin/python";
@@ -60,11 +65,48 @@ struct PipelineConfig {
   std::vector<std::string> text_prompts = {"lvisplus"};
   float owl_min_confidence = 0.25f;
   float owl_nms_iou_threshold = 0.5f;
-  float boxernet_min_confidence = 0.5f;
+  float boxernet_min_confidence = 0.35f;
   float robot_bbox_mask_overlap = 0.25f;
   float robot_bbox_center_overlap = 0.5f;
   int robot_mask_dilate_px = 3;
   bool show_3d_label_score = true;
+
+  float instance_min_confidence = 0.35f;
+  float instance_object_min_confidence = 0.5f;
+  float instance_min_bbox_size_m = 0.02f;
+  float instance_max_bbox_size_m = 8.0f;
+  float instance_match_iou_threshold = 0.10f;
+  float instance_match_center_distance_m = 0.75f;
+  int instance_min_support_count = 3;
+  float instance_min_confidence_mass = 1.5f;
+  int instance_tentative_max_missed = 2;
+  int instance_inactive_after_missed = 3;
+  float instance_duplicate_iou_threshold = 0.70f;
+  float instance_duplicate_size_ratio_min = 0.70f;
+  float instance_confirmed_duplicate_iou_threshold = 0.20f;
+  float instance_duplicate_containment_threshold = 0.48f;
+  float instance_duplicate_center_distance_m = 0.85f;
+  float instance_duplicate_small_object_volume_ratio = 0.15f;
+  float instance_quality_observation_min_quality = 0.50f;
+  float instance_close_observation_distance_m = 3.0f;
+  float instance_far_observation_distance_m = 4.5f;
+  float instance_far_promotion_weight = 0.25f;
+  float instance_fusion_prior_mass_cap = 6.0f;
+  int instance_high_quality_min_count = 5;
+  float instance_high_quality_min_mass = 3.0f;
+  double instance_geometry_check_period_sec = 2.0;
+  double instance_geometry_recent_window_sec = 5.0;
+  float instance_geometry_shell_thickness_m = 0.08f;
+  int instance_geometry_empty_inside_points = 6;
+  int instance_geometry_min_unique_voxels = 12;
+  float instance_geometry_confirm_score = 0.62f;
+  float instance_geometry_suppress_score = 0.35f;
+  float instance_geometry_recover_score = 0.55f;
+  int instance_geometry_failures_before_suppress = 2;
+  int instance_geometry_inactive_delete_bad_count = 3;
+  float instance_geometry_reevaluate_center_delta_m = 0.12f;
+  float instance_geometry_reevaluate_size_ratio = 0.20f;
+  float instance_geometry_reevaluate_yaw_delta_deg = 15.0f;
 
   std::size_t input_queue_size = 30;
   std::size_t output_queue_size = 1;
@@ -88,8 +130,11 @@ struct PipelineConfig {
   bool freeze_tsdf_map = false;
   bool save_map = false;
   std::string map_save_path;
+  bool load_instance_map = false;
+  std::string instance_map_load_path;
   bool save_instance_map = true;
   std::string instance_map_save_path;
+  std::string save_dsg_service = "/roomie/save_dsg";
 
   bool file_logging_enabled = true;
   std::string file_logging_root_dir =

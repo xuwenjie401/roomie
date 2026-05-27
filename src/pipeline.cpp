@@ -1,5 +1,7 @@
 #include "roomie/pipeline/pipeline.hpp"
 
+#include "roomie/dsg/object_graph_io.hpp"
+
 namespace roomie {
 
 RoomiePipeline::RoomiePipeline(rclcpp::Node& node, PipelineConfig config)
@@ -30,6 +32,53 @@ RoomiePipeline::RoomiePipeline(rclcpp::Node& node, PipelineConfig config)
                          " camera_id=" + config_.mapping_camera_id +
                          " debug_image=" + config_.detection_debug_image_topic +
                          " raw_detections=" + config_.raw_detections_topic);
+  }
+
+  if (config_.load_instance_map) {
+    if (config_.instance_map_load_path.empty()) {
+      const std::string message =
+          "persistence.load_instance_map is true but instance_map_load_path is empty";
+      RCLCPP_WARN(node.get_logger(), "%s", message.c_str());
+      RunLogger::logGlobal("persistence", message);
+    } else {
+      ObjectGraphSnapshot snapshot;
+      std::string loaded_world_frame;
+      std::string error;
+      if (loadObjectGraphSnapshotJson(config_.instance_map_load_path,
+                                      &snapshot,
+                                      &loaded_world_frame,
+                                      &error)) {
+        if (!loaded_world_frame.empty() && loaded_world_frame != config_.world_frame) {
+          RCLCPP_WARN(node.get_logger(),
+                      "loaded DSG world_frame=%s differs from configured world_frame=%s",
+                      loaded_world_frame.c_str(),
+                      config_.world_frame.c_str());
+        }
+        if (instance_map_thread_.loadObjectGraphSnapshot(snapshot, &error)) {
+          RCLCPP_INFO(node.get_logger(),
+                      "loaded roomie DSG objects=%zu relations=%zu from %s",
+                      snapshot.objects.size(),
+                      snapshot.relations.size(),
+                      config_.instance_map_load_path.c_str());
+          RunLogger::logGlobal(
+              "persistence",
+              "loaded DSG objects=" + std::to_string(snapshot.objects.size()) +
+                  " relations=" + std::to_string(snapshot.relations.size()) +
+                  " path=" + config_.instance_map_load_path);
+        } else {
+          RCLCPP_WARN(node.get_logger(), "failed to restore DSG tracks: %s", error.c_str());
+          RunLogger::logGlobal("persistence", "failed to restore DSG tracks: " + error);
+        }
+      } else {
+        RCLCPP_WARN(node.get_logger(),
+                    "failed to load DSG from %s: %s",
+                    config_.instance_map_load_path.c_str(),
+                    error.c_str());
+        RunLogger::logGlobal("persistence",
+                             "failed to load DSG path=" + config_.instance_map_load_path +
+                                 " error=" + error);
+      }
+    }
   }
 
   RosCameraSubscriptionConfig mapping_camera;

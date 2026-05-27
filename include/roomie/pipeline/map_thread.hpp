@@ -22,6 +22,8 @@ class MapThread : public WorkerThread, public MapProjector {
 
   bool enqueueMappingFrame(MappingFrame frame) override;
   std::optional<PatchDepth> projectPatchDepth(const DetectionFrame& frame) override;
+  MapBackendSnapshot snapshotSurfacePoints() const override;
+  std::shared_ptr<const GeometrySurfaceCache> geometrySurfaceCache() const override;
   std::vector<VoxelRef, Eigen::aligned_allocator<VoxelRef>> collectNearSurfaceVoxels(
       const RawDetection& detection) const override;
 
@@ -36,7 +38,9 @@ class MapThread : public WorkerThread, public MapProjector {
   void maybeLogStatus();
   PatchDepth projectWorldPointsToPatchDepth(const DetectionFrame& frame,
                                             const WorldPointVector& world_points,
-                                            std::uint64_t map_version) const;
+                                            std::uint64_t map_version,
+                                            float min_depth_m,
+                                            float max_depth_m) const;
 
   ThreadSafeQueue<MappingFrame>& mapping_queue_;
   PipelineConfig config_;
@@ -62,7 +66,7 @@ class MapThread : public WorkerThread, public MapProjector {
   std::atomic<double> last_cache_build_ms_{0.0};
   std::atomic<double> last_frustum_filter_ms_{0.0};
   std::atomic<double> last_projection_loop_ms_{0.0};
-  std::atomic<double> last_projection_median_ms_{0.0};
+  std::atomic<double> last_projection_zbuffer_ms_{0.0};
 };
 
 }  // namespace roomie

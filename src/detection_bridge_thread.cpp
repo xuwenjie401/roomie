@@ -260,7 +260,7 @@ void DetectionBridgeThread::run() {
     const double cache_build_ms = request.patch_depth.cache_build_ms;
     const double frustum_filter_ms = request.patch_depth.frustum_filter_ms;
     const double projection_loop_ms = request.patch_depth.projection_loop_ms;
-    const double projection_median_ms = request.patch_depth.projection_median_ms;
+    const double projection_zbuffer_ms = request.patch_depth.projection_zbuffer_ms;
     if (inference_backend_.enqueueRequest(std::move(request))) {
       ++requests_sent_;
       total_projection_ms_ += projection_ms;
@@ -270,7 +270,7 @@ void DetectionBridgeThread::run() {
       total_cache_build_ms_ += cache_build_ms;
       total_frustum_filter_ms_ += frustum_filter_ms;
       total_projection_loop_ms_ += projection_loop_ms;
-      total_projection_median_ms_ += projection_median_ms;
+      total_projection_zbuffer_ms_ += projection_zbuffer_ms;
       total_resize_ms_ += resize_ms;
       last_request_time_ = std::chrono::steady_clock::now();
       maybeLogStatus();
@@ -311,6 +311,10 @@ void DetectionBridgeThread::forwardBackendResponses() {
   while (inference_backend_.tryPopResponse(&response)) {
     ++responses_seen_;
     std::optional<PendingDebugFrame> pending = takeDebugFrame(response);
+    if (pending) {
+      response.has_camera_pose = true;
+      response.T_world_camera = pending->T_world_camera;
+    }
     double roundtrip_ms = 0.0;
     if (pending) {
       roundtrip_ms = elapsedMs(pending->sent_time, std::chrono::steady_clock::now());
@@ -327,7 +331,8 @@ void DetectionBridgeThread::forwardBackendResponses() {
       RCLCPP_WARN(logger_,
                   "inference response error camera=%s t=%ld backend=%.1fms "
                   "worker=%.1fms owl=%.1fms boxernet=%.1fms project=%.1fms "
-                  "snapshot=%.1fms surface=%.1fms frustum=%.1fms proj_loop=%.1fms "
+                  "snapshot=%.1fms surface=%.1fms frustum=%.1fms "
+                  "proj_loop=%.1fms zbuffer=%.1fms "
                   "roundtrip=%.1fms "
                   "error=%s",
                   response.camera_id.c_str(),
@@ -341,6 +346,7 @@ void DetectionBridgeThread::forwardBackendResponses() {
                   pending ? pending->surface_extract_ms : 0.0,
                   pending ? pending->frustum_filter_ms : 0.0,
                   pending ? pending->projection_loop_ms : 0.0,
+                  pending ? pending->projection_zbuffer_ms : 0.0,
                   roundtrip_ms,
                   response.error.c_str());
       RunLogger::logGlobal("detection",
@@ -363,15 +369,15 @@ void DetectionBridgeThread::forwardBackendResponses() {
                                std::to_string(pending ? pending->frustum_filter_ms : 0.0) +
                                " projection_loop_ms=" +
                                std::to_string(pending ? pending->projection_loop_ms : 0.0) +
-                               " projection_median_ms=" +
-                               std::to_string(pending ? pending->projection_median_ms : 0.0) +
+                               " projection_zbuffer_ms=" +
+                               std::to_string(pending ? pending->projection_zbuffer_ms : 0.0) +
                                " roundtrip_ms=" + std::to_string(roundtrip_ms) +
                                " error=" + response.error);
     } else {
       RCLCPP_INFO(logger_,
                   "inference response camera=%s t=%ld filtered_2d=%zu raw_3d=%zu "
                   "project=%.1fms snapshot=%.1fms surface=%.1fms frustum=%.1fms "
-                  "proj_loop=%.1fms median=%.1fms resize=%.1fms backend=%.1fms worker=%.1fms "
+                  "proj_loop=%.1fms zbuffer=%.1fms resize=%.1fms backend=%.1fms worker=%.1fms "
                   "owl=%.1fms boxernet=%.1fms roundtrip=%.1fms",
                   response.camera_id.c_str(),
                   static_cast<long>(response.time_ns),
@@ -382,7 +388,7 @@ void DetectionBridgeThread::forwardBackendResponses() {
                   pending ? pending->surface_extract_ms : 0.0,
                   pending ? pending->frustum_filter_ms : 0.0,
                   pending ? pending->projection_loop_ms : 0.0,
-                  pending ? pending->projection_median_ms : 0.0,
+                  pending ? pending->projection_zbuffer_ms : 0.0,
                   pending ? pending->resize_ms : 0.0,
                   response.backend_ipc_ms,
                   response.python_worker_ms,
@@ -415,7 +421,7 @@ void DetectionBridgeThread::forwardBackendResponses() {
              << " cache_build_ms=" << (pending ? pending->cache_build_ms : 0.0)
              << " frustum_filter_ms=" << (pending ? pending->frustum_filter_ms : 0.0)
              << " projection_loop_ms=" << (pending ? pending->projection_loop_ms : 0.0)
-             << " projection_median_ms=" << (pending ? pending->projection_median_ms : 0.0)
+             << " projection_zbuffer_ms=" << (pending ? pending->projection_zbuffer_ms : 0.0)
              << " resize_ms=" << (pending ? pending->resize_ms : 0.0)
              << " backend_ipc_ms=" << response.backend_ipc_ms
              << " worker_ms=" << response.python_worker_ms
@@ -443,6 +449,7 @@ void DetectionBridgeThread::stashDebugFrame(const InferenceRequest& request,
   PendingDebugFrame debug;
   debug.image = request.rgb_960;
   debug.sent_time = std::chrono::steady_clock::now();
+  debug.T_world_camera = request.T_world_camera;
   debug.projection_ms = projection_ms;
   debug.resize_ms = resize_ms;
   debug.patch_coverage = request.patch_depth.coverageRatio();
@@ -461,7 +468,7 @@ void DetectionBridgeThread::stashDebugFrame(const InferenceRequest& request,
   debug.cache_build_ms = request.patch_depth.cache_build_ms;
   debug.frustum_filter_ms = request.patch_depth.frustum_filter_ms;
   debug.projection_loop_ms = request.patch_depth.projection_loop_ms;
-  debug.projection_median_ms = request.patch_depth.projection_median_ms;
+  debug.projection_zbuffer_ms = request.patch_depth.projection_zbuffer_ms;
   debug.surface_cache_ready = request.patch_depth.surface_cache_ready;
   debug.view_filtered = request.patch_depth.view_filtered;
   pending_debug_frames_[key] = std::move(debug);
@@ -604,7 +611,7 @@ void DetectionBridgeThread::maybeLogStatus() {
          << " avg_cache_build_ms=" << total_cache_build_ms_ / request_count
          << " avg_frustum_filter_ms=" << total_frustum_filter_ms_ / request_count
          << " avg_projection_loop_ms=" << total_projection_loop_ms_ / request_count
-         << " avg_projection_median_ms=" << total_projection_median_ms_ / request_count
+         << " avg_projection_zbuffer_ms=" << total_projection_zbuffer_ms_ / request_count
          << " avg_resize_ms=" << total_resize_ms_ / request_count
          << " avg_backend_ipc_ms=" << total_backend_ipc_ms_ / response_count
          << " avg_worker_ms=" << total_worker_ms_ / response_count
@@ -615,7 +622,8 @@ void DetectionBridgeThread::maybeLogStatus() {
               "detection status frames=%lu sent=%lu responses=%lu errors=%lu "
               "skip_rate=%lu(+%lu) no_patch=%lu low_coverage=%lu resize_fail=%lu "
               "avg_project=%.1fms avg_snapshot=%.1fms avg_surface=%.1fms "
-              "avg_frustum=%.1fms avg_proj_loop=%.1fms avg_owl=%.1fms avg_boxernet=%.1fms "
+              "avg_frustum=%.1fms avg_proj_loop=%.1fms avg_zbuffer=%.1fms "
+              "avg_owl=%.1fms avg_boxernet=%.1fms "
               "avg_roundtrip=%.1fms",
               static_cast<unsigned long>(frames_seen_),
               static_cast<unsigned long>(requests_sent_),
@@ -631,6 +639,7 @@ void DetectionBridgeThread::maybeLogStatus() {
               total_surface_extract_ms_ / request_count,
               total_frustum_filter_ms_ / request_count,
               total_projection_loop_ms_ / request_count,
+              total_projection_zbuffer_ms_ / request_count,
               total_owl_ms_ / response_count,
               total_boxernet_ms_ / response_count,
               total_roundtrip_ms_ / response_count);

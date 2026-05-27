@@ -22,9 +22,11 @@ set(ROOMIE_NVBLOX_LIBRARY_DIR
 find_package(ament_cmake REQUIRED)
 find_package(Eigen3 REQUIRED)
 find_package(geometry_msgs REQUIRED)
+find_package(nlohmann_json REQUIRED)
 find_package(rclcpp REQUIRED)
 find_package(sensor_msgs REQUIRED)
 find_package(std_msgs REQUIRED)
+find_package(std_srvs REQUIRED)
 find_package(tf2_msgs REQUIRED)
 find_package(visualization_msgs REQUIRED)
 find_package(OpenCV REQUIRED COMPONENTS core imgproc)
@@ -33,6 +35,8 @@ add_library(
   roomie_pipeline
   src/cpu_point_map_backend.cpp
   src/detection_bridge_thread.cpp
+  src/dsg/object_graph.cpp
+  src/dsg/object_graph_io.cpp
   src/image_utils.cpp
   src/instance_map_thread.cpp
   src/map_backend.cpp
@@ -50,7 +54,7 @@ target_include_directories(
   roomie_pipeline PUBLIC "$<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>"
                          "$<INSTALL_INTERFACE:include/${PROJECT_NAME}>"
 )
-target_link_libraries(roomie_pipeline Eigen3::Eigen ${OpenCV_LIBS})
+target_link_libraries(roomie_pipeline Eigen3::Eigen nlohmann_json::nlohmann_json ${OpenCV_LIBS})
 
 if(ROOMIE_ENABLE_NVBLOX)
   find_package(CUDAToolkit REQUIRED)
@@ -95,6 +99,7 @@ ament_target_dependencies(
   rclcpp
   sensor_msgs
   std_msgs
+  std_srvs
   tf2_msgs
   visualization_msgs
 )
@@ -119,8 +124,20 @@ install(TARGETS roomie_pipeline
 install(TARGETS roomie_pipeline_node RUNTIME DESTINATION lib/${PROJECT_NAME})
 install(DIRECTORY include/ DESTINATION include/${PROJECT_NAME})
 install(DIRECTORY config launch rviz DESTINATION share/${PROJECT_NAME})
-install(PROGRAMS scripts/roomie_python_inference_worker.py DESTINATION lib/${PROJECT_NAME})
+install(PROGRAMS
+  scripts/roomie_python_inference_worker.py
+  scripts/roomie_dsg_viewer.py
+  DESTINATION lib/${PROJECT_NAME})
 
 ament_export_targets(roomie-targets HAS_LIBRARY_TARGET)
-ament_export_dependencies(Eigen3 geometry_msgs rclcpp sensor_msgs std_msgs tf2_msgs visualization_msgs)
+ament_export_dependencies(
+  Eigen3
+  geometry_msgs
+  nlohmann_json
+  rclcpp
+  sensor_msgs
+  std_msgs
+  std_srvs
+  tf2_msgs
+  visualization_msgs)
 ament_package()

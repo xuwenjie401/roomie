@@ -17,6 +17,8 @@ roomie_pipeline_node:
       tsdf_output_topic: /roomie/map_surface
       detection_debug_image_topic: /roomie/detections_2d_image
       raw_detections_topic: /roomie/raw_detections
+      object_markers_topic: /roomie/objects
+      instance_markers_topic: /roomie/instances
 
     camera:
       width: 640
@@ -49,9 +51,12 @@ roomie_pipeline_node:
 
     detection:
       boxer_input_size: 960
-      patch_rows: 60
-      patch_cols: 60
       min_patch_coverage_ratio: 0.05
+      patch_depth_max_m: 0.0
+      patch_depth_zbuffer_scale: 4
+      patch_depth_zbuffer_splat_radius_cells: 1
+      patch_depth_zbuffer_front_quantile: 0.25
+      patch_depth_zbuffer_min_cells_per_patch: 1
       max_inference_fps: 10.0
       python_backend_enabled: true
       python_executable: /home/agxi/miniconda3/envs/jarvis/bin/python
@@ -63,11 +68,49 @@ roomie_pipeline_node:
       text_prompts: [lvisplus]
       owl_min_confidence: 0.25
       owl_nms_iou_threshold: 0.5
-      boxernet_min_confidence: 0.5
+      boxernet_min_confidence: 0.35
       robot_bbox_mask_overlap: 0.25
       robot_bbox_center_overlap: 0.5
       robot_mask_dilate_px: 3
       show_3d_label_score: true
+
+    instance:
+      min_confidence: 0.35
+      object_min_confidence: 0.5
+      min_bbox_size_m: 0.02
+      max_bbox_size_m: 8.0
+      match_iou_threshold: 0.10
+      match_center_distance_m: 0.75
+      min_support_count: 3
+      min_confidence_mass: 1.5
+      tentative_max_missed: 2
+      inactive_after_missed: 3
+      duplicate_iou_threshold: 0.70
+      duplicate_size_ratio_min: 0.70
+      confirmed_duplicate_iou_threshold: 0.20
+      duplicate_containment_threshold: 0.48
+      duplicate_center_distance_m: 0.85
+      duplicate_small_object_volume_ratio: 0.15
+      quality_observation_min_quality: 0.50
+      close_observation_distance_m: 3.0
+      far_observation_distance_m: 4.5
+      far_promotion_weight: 0.25
+      fusion_prior_mass_cap: 6.0
+      high_quality_min_count: 5
+      high_quality_min_mass: 3.0
+      geometry_check_period_sec: 2.0
+      geometry_recent_window_sec: 5.0
+      geometry_shell_thickness_m: 0.08
+      geometry_empty_inside_points: 6
+      geometry_min_unique_voxels: 12
+      geometry_confirm_score: 0.62
+      geometry_suppress_score: 0.35
+      geometry_recover_score: 0.55
+      geometry_failures_before_suppress: 2
+      geometry_inactive_delete_bad_count: 3
+      geometry_reevaluate_center_delta_m: 0.12
+      geometry_reevaluate_size_ratio: 0.20
+      geometry_reevaluate_yaw_delta_deg: 15.0
 
     queues:
       input_queue_size: 30
@@ -90,8 +133,11 @@ roomie_pipeline_node:
       publish_period_sec: 5.0
 
     persistence:
+      load_instance_map: false
+      instance_map_load_path: /home/agxi/Datasets/output/jarvis_home/instances/latest.json
       save_instance_map: true
       instance_map_save_path: /home/agxi/Datasets/output/jarvis_home/instances/
+      save_dsg_service: /roomie/save_dsg
 
     logging:
       enabled: true

@@ -5,13 +5,19 @@
 #include <chrono>
 #include <cmath>
 #include <iomanip>
+#include <limits>
 #include <sstream>
 #include <utility>
+#include <vector>
 
 #include "roomie/utils/run_logger.hpp"
 
 namespace roomie {
 namespace {
+
+constexpr int kMaxZBufferScale = 16;
+constexpr int kMaxZBufferSplatRadiusCells = 2;
+constexpr int kMaxZBufferCellsPerPatch = kMaxZBufferScale * kMaxZBufferScale;
 
 bool hasUsableIntrinsics(const CameraIntrinsics& intrinsics) {
   return intrinsics.fx > 0.0f && intrinsics.fy > 0.0f;
@@ -28,23 +34,24 @@ CameraIntrinsics scaledIntrinsicsForBoxerInput(const CameraIntrinsics& intrinsic
   return source.scaledTo(target_size, target_size);
 }
 
-float medianInPlace(std::vector<float>* values) {
-  const std::size_t middle = values->size() / 2;
-  std::nth_element(values->begin(), values->begin() + static_cast<std::ptrdiff_t>(middle),
-                   values->end());
-  if (values->size() % 2 == 1) {
-    return (*values)[middle];
-  }
-
-  const float upper = (*values)[middle];
-  const auto lower_it = std::max_element(values->begin(),
-                                         values->begin() + static_cast<std::ptrdiff_t>(middle));
-  return 0.5f * (*lower_it + upper);
-}
-
 double elapsedMs(std::chrono::steady_clock::time_point start,
                  std::chrono::steady_clock::time_point end) {
   return std::chrono::duration<double, std::milli>(end - start).count();
+}
+
+float frontQuantileDepth(std::array<float, kMaxZBufferCellsPerPatch>* values,
+                         int count,
+                         float quantile) {
+  if (count <= 0) {
+    return -1.0f;
+  }
+  std::sort(values->begin(), values->begin() + count);
+  const int index = std::clamp(
+      static_cast<int>(std::floor(std::clamp(quantile, 0.0f, 1.0f) *
+                                  static_cast<float>(count - 1))),
+      0,
+      count - 1);
+  return (*values)[static_cast<std::size_t>(index)];
 }
 
 }  // namespace
@@ -76,9 +83,7 @@ std::optional<PatchDepth> MapThread::projectPatchDepth(const DetectionFrame& fra
   view.T_world_camera = frame.T_world_camera;
   view.min_depth_m = config_.depth_min_m;
   view.max_depth_m =
-      config_.max_integration_distance_m > 0.0f
-          ? std::min(config_.depth_max_m, config_.max_integration_distance_m)
-          : config_.depth_max_m;
+      config_.patch_depth_max_m > 0.0f ? config_.patch_depth_max_m : config_.depth_max_m;
   MapBackendSnapshot snapshot = timedBackendSnapshot(&view);
   if (!snapshot.has_map) {
     ++projection_no_map_;
@@ -86,7 +91,11 @@ std::optional<PatchDepth> MapThread::projectPatchDepth(const DetectionFrame& fra
     return std::nullopt;
   }
   PatchDepth patch_depth = projectWorldPointsToPatchDepth(
-      frame, snapshot.surface_points_world, snapshot.map_version);
+      frame,
+      snapshot.surface_points_world,
+      snapshot.map_version,
+      view.min_depth_m,
+      view.max_depth_m);
   patch_depth.source_surface_points =
       static_cast<std::uint64_t>(snapshot.surface_points_world.size());
   patch_depth.source_tsdf_blocks = snapshot.tsdf_blocks;
@@ -117,14 +126,16 @@ std::optional<PatchDepth> MapThread::projectPatchDepth(const DetectionFrame& fra
   last_cache_build_ms_.store(patch_depth.cache_build_ms);
   last_frustum_filter_ms_.store(patch_depth.frustum_filter_ms);
   last_projection_loop_ms_.store(patch_depth.projection_loop_ms);
-  last_projection_median_ms_.store(patch_depth.projection_median_ms);
+  last_projection_zbuffer_ms_.store(patch_depth.projection_zbuffer_ms);
   maybeLogStatus();
   return patch_depth;
 }
 
 PatchDepth MapThread::projectWorldPointsToPatchDepth(const DetectionFrame& frame,
                                                      const WorldPointVector& world_points,
-                                                     std::uint64_t map_version) const {
+                                                     std::uint64_t map_version,
+                                                     float min_depth_m,
+                                                     float max_depth_m) const {
   PatchDepth result;
   result.map_version = map_version;
 
@@ -133,13 +144,31 @@ PatchDepth MapThread::projectWorldPointsToPatchDepth(const DetectionFrame& frame
   if (!hasUsableIntrinsics(intrinsics_960) || world_points.empty()) {
     return result;
   }
+  if (max_depth_m <= min_depth_m) {
+    max_depth_m = config_.depth_max_m;
+  }
 
   const Eigen::Isometry3f T_camera_world = frame.T_world_camera.inverse();
-  std::array<std::vector<float>, PatchDepth::kSize> patch_depths;
-  const float patch_width_px =
-      static_cast<float>(config_.boxer_input_size) / static_cast<float>(PatchDepth::kCols);
-  const float patch_height_px =
-      static_cast<float>(config_.boxer_input_size) / static_cast<float>(PatchDepth::kRows);
+  const int zbuffer_scale =
+      std::clamp(config_.patch_depth_zbuffer_scale, 1, kMaxZBufferScale);
+  const int splat_radius =
+      std::clamp(config_.patch_depth_zbuffer_splat_radius_cells,
+                 0,
+                 kMaxZBufferSplatRadiusCells);
+  const int max_cells_per_patch = zbuffer_scale * zbuffer_scale;
+  const int min_cells_per_patch =
+      std::clamp(config_.patch_depth_zbuffer_min_cells_per_patch,
+                 1,
+                 max_cells_per_patch);
+  const int zbuffer_cols = PatchDepth::kCols * zbuffer_scale;
+  const int zbuffer_rows = PatchDepth::kRows * zbuffer_scale;
+  const float zbuffer_cell_width_px =
+      static_cast<float>(config_.boxer_input_size) / static_cast<float>(zbuffer_cols);
+  const float zbuffer_cell_height_px =
+      static_cast<float>(config_.boxer_input_size) / static_cast<float>(zbuffer_rows);
+  constexpr float kInfinity = std::numeric_limits<float>::infinity();
+  std::vector<float> z_buffer(static_cast<std::size_t>(zbuffer_rows * zbuffer_cols),
+                              kInfinity);
 
   const auto projection_loop_start = std::chrono::steady_clock::now();
   for (const Eigen::Vector3f& point_world : world_points) {
@@ -149,7 +178,7 @@ PatchDepth MapThread::projectWorldPointsToPatchDepth(const DetectionFrame& frame
 
     const Eigen::Vector3f point_camera = T_camera_world * point_world;
     const float z = point_camera.z();
-    if (!std::isfinite(z) || z <= 0.0f) {
+    if (!std::isfinite(z) || z < min_depth_m || z > max_depth_m) {
       continue;
     }
 
@@ -161,24 +190,60 @@ PatchDepth MapThread::projectWorldPointsToPatchDepth(const DetectionFrame& frame
       continue;
     }
 
-    const int col = std::clamp(static_cast<int>(u / patch_width_px), 0, PatchDepth::kCols - 1);
-    const int row = std::clamp(static_cast<int>(v / patch_height_px), 0, PatchDepth::kRows - 1);
-    patch_depths[static_cast<std::size_t>(row * PatchDepth::kCols + col)].push_back(z);
+    const int center_col =
+        std::clamp(static_cast<int>(u / zbuffer_cell_width_px), 0, zbuffer_cols - 1);
+    const int center_row =
+        std::clamp(static_cast<int>(v / zbuffer_cell_height_px), 0, zbuffer_rows - 1);
+    const int row_begin = std::max(0, center_row - splat_radius);
+    const int row_end = std::min(zbuffer_rows - 1, center_row + splat_radius);
+    const int col_begin = std::max(0, center_col - splat_radius);
+    const int col_end = std::min(zbuffer_cols - 1, center_col + splat_radius);
+    for (int row = row_begin; row <= row_end; ++row) {
+      for (int col = col_begin; col <= col_end; ++col) {
+        float& current =
+            z_buffer[static_cast<std::size_t>(row * zbuffer_cols + col)];
+        if (z < current) {
+          current = z;
+        }
+      }
+    }
     ++result.projected_points;
   }
   result.projection_loop_ms =
       elapsedMs(projection_loop_start, std::chrono::steady_clock::now());
 
-  const auto median_start = std::chrono::steady_clock::now();
-  for (int index = 0; index < PatchDepth::kSize; ++index) {
-    std::vector<float>& depths = patch_depths[static_cast<std::size_t>(index)];
-    if (depths.empty()) {
-      continue;
+  const auto zbuffer_start = std::chrono::steady_clock::now();
+  for (int patch_row = 0; patch_row < PatchDepth::kRows; ++patch_row) {
+    for (int patch_col = 0; patch_col < PatchDepth::kCols; ++patch_col) {
+      std::array<float, kMaxZBufferCellsPerPatch> cell_depths{};
+      int cell_count = 0;
+      const int row_begin = patch_row * zbuffer_scale;
+      const int row_end = row_begin + zbuffer_scale;
+      const int col_begin = patch_col * zbuffer_scale;
+      const int col_end = col_begin + zbuffer_scale;
+      for (int row = row_begin; row < row_end; ++row) {
+        for (int col = col_begin; col < col_end; ++col) {
+          const float depth =
+              z_buffer[static_cast<std::size_t>(row * zbuffer_cols + col)];
+          if (!std::isfinite(depth)) {
+            continue;
+          }
+          cell_depths[static_cast<std::size_t>(cell_count++)] = depth;
+        }
+      }
+      if (cell_count < min_cells_per_patch) {
+        continue;
+      }
+      const int patch_index = patch_row * PatchDepth::kCols + patch_col;
+      result.values[static_cast<std::size_t>(patch_index)] =
+          frontQuantileDepth(&cell_depths,
+                             cell_count,
+                             config_.patch_depth_zbuffer_front_quantile);
+      ++result.valid_patches;
     }
-    result.values[static_cast<std::size_t>(index)] = medianInPlace(&depths);
-    ++result.valid_patches;
   }
-  result.projection_median_ms = elapsedMs(median_start, std::chrono::steady_clock::now());
+  result.projection_zbuffer_ms =
+      elapsedMs(zbuffer_start, std::chrono::steady_clock::now());
 
   return result;
 }
@@ -186,6 +251,16 @@ PatchDepth MapThread::projectWorldPointsToPatchDepth(const DetectionFrame& frame
 std::vector<VoxelRef, Eigen::aligned_allocator<VoxelRef>> MapThread::collectNearSurfaceVoxels(
     const RawDetection& detection) const {
   return map_backend_->collectNearSurfaceVoxels(detection);
+}
+
+MapBackendSnapshot MapThread::snapshotSurfacePoints() const {
+  MapBackendView view;
+  view.max_depth_m = 0.0f;
+  return timedBackendSnapshot(&view);
+}
+
+std::shared_ptr<const GeometrySurfaceCache> MapThread::geometrySurfaceCache() const {
+  return map_backend_->geometrySurfaceCache();
 }
 
 std::uint64_t MapThread::mapVersion() const {
@@ -246,7 +321,7 @@ void MapThread::maybeLogStatus() {
          << " last_cache_build_ms=" << last_cache_build_ms_.load()
          << " last_frustum_filter_ms=" << last_frustum_filter_ms_.load()
          << " last_projection_loop_ms=" << last_projection_loop_ms_.load()
-         << " last_projection_median_ms=" << last_projection_median_ms_.load();
+         << " last_projection_zbuffer_ms=" << last_projection_zbuffer_ms_.load();
   RunLogger::logGlobal("map_thread", stream.str());
 }
 

@@ -34,6 +34,7 @@ class DetectionBridgeThread : public WorkerThread {
   struct PendingDebugFrame {
     ImageBuffer image;
     std::chrono::steady_clock::time_point sent_time;
+    Eigen::Isometry3f T_world_camera = Eigen::Isometry3f::Identity();
     double projection_ms = 0.0;
     double resize_ms = 0.0;
     float patch_coverage = 0.0f;
@@ -52,7 +53,7 @@ class DetectionBridgeThread : public WorkerThread {
     double cache_build_ms = 0.0;
     double frustum_filter_ms = 0.0;
     double projection_loop_ms = 0.0;
-    double projection_median_ms = 0.0;
+    double projection_zbuffer_ms = 0.0;
     bool surface_cache_ready = false;
     bool view_filtered = false;
   };
@@ -102,7 +103,7 @@ class DetectionBridgeThread : public WorkerThread {
   double total_cache_build_ms_ = 0.0;
   double total_frustum_filter_ms_ = 0.0;
   double total_projection_loop_ms_ = 0.0;
-  double total_projection_median_ms_ = 0.0;
+  double total_projection_zbuffer_ms_ = 0.0;
   double total_resize_ms_ = 0.0;
   double total_roundtrip_ms_ = 0.0;
   double total_backend_ipc_ms_ = 0.0;

@@ -2,6 +2,7 @@
 
 #include <array>
 #include <cstdint>
+#include <map>
 #include <string>
 #include <vector>
 
@@ -10,6 +11,13 @@
 namespace roomie {
 
 using TimeNanoseconds = std::int64_t;
+
+enum class InstanceGeometryStatus {
+  kUnchecked,
+  kGood,
+  kBad,
+  kEmpty,
+};
 
 struct CameraIntrinsics {
   int width = 0;
@@ -97,7 +105,7 @@ struct PatchDepth {
   double cache_build_ms = 0.0;
   double frustum_filter_ms = 0.0;
   double projection_loop_ms = 0.0;
-  double projection_median_ms = 0.0;
+  double projection_zbuffer_ms = 0.0;
   bool surface_cache_ready = false;
   bool view_filtered = false;
 
@@ -143,8 +151,12 @@ struct RawDetection {
 };
 
 struct InferenceResponse {
+  EIGEN_MAKE_ALIGNED_OPERATOR_NEW
+
   TimeNanoseconds time_ns = 0;
   std::string camera_id;
+  bool has_camera_pose = false;
+  Eigen::Isometry3f T_world_camera = Eigen::Isometry3f::Identity();
   bool ok = false;
   std::string error;
   float backend_ipc_ms = 0.0f;
@@ -166,17 +178,39 @@ struct VoxelRef {
 struct InstanceRecord {
   EIGEN_MAKE_ALIGNED_OPERATOR_NEW
 
+  int object_id = -1;
   int track_id = -1;
   int semantic_id = -1;
   std::string label;
+  std::string description;
   Eigen::Vector3f center_world = Eigen::Vector3f::Zero();
   Eigen::Vector3f size_m = Eigen::Vector3f::Zero();
   float yaw_rad = 0.0f;
   float confidence = 0.0f;
+  float confidence_mass = 0.0f;
+  float object_quality_score = 0.0f;
+  float geometry_score = 0.0f;
+  float geometry_shell_ratio = 0.0f;
+  float geometry_extent_score = 0.0f;
+  float geometry_leak_ratio = 1.0f;
+  float geometry_cavity_ratio = 0.0f;
+  int geometry_in_box_points = 0;
+  int geometry_shell_points = 0;
+  int geometry_unique_voxels = 0;
+  int geometry_expanded_points = 0;
+  int geometry_bad_count = 0;
   int support_count = 0;
+  int high_quality_observation_count = 0;
+  float high_quality_observation_mass = 0.0f;
+  bool active = true;
+  bool publishable = true;
+  InstanceGeometryStatus geometry_status = InstanceGeometryStatus::kUnchecked;
+  TimeNanoseconds last_geometry_check_ns = 0;
   TimeNanoseconds first_seen_ns = 0;
   TimeNanoseconds last_seen_ns = 0;
   std::vector<std::string> source_cameras;
+  std::vector<int> source_track_ids;
+  std::vector<TimeNanoseconds> observation_timestamps_ns;
   std::vector<VoxelRef, Eigen::aligned_allocator<VoxelRef>> near_surface_voxels;
 };
 
