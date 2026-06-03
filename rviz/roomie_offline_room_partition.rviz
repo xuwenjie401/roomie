@@ -27,34 +27,6 @@ Visualization Manager:
       Show Names: false
       Update Interval: 0
       Value: true
-    - Class: rviz_default_plugins/Image
-      Enabled: true
-      Max Value: 1
-      Median window: 5
-      Min Value: 0
-      Name: Head RGB Image
-      Normalize Range: true
-      Topic:
-        Depth: 5
-        Durability Policy: Volatile
-        History Policy: Keep Last
-        Reliability Policy: Reliable
-        Value: /head_front_left_color_rgb
-      Value: true
-    - Class: rviz_default_plugins/Image
-      Enabled: true
-      Max Value: 1
-      Median window: 5
-      Min Value: 0
-      Name: Roomie 2D Detections
-      Normalize Range: true
-      Topic:
-        Depth: 5
-        Durability Policy: Volatile
-        History Policy: Keep Last
-        Reliability Policy: Reliable
-        Value: /roomie/detections_2d_image
-      Value: true
     - Alpha: 1
       Autocompute Intensity Bounds: true
       Autocompute Value Bounds:
@@ -124,18 +96,6 @@ Visualization Manager:
         Reliability Policy: Reliable
         Value: /roomie/instances
       Value: true
-    - Class: rviz_default_plugins/MarkerArray
-      Enabled: true
-      Name: Roomie Raw 3D Detections
-      Namespaces:
-        {}
-      Topic:
-        Depth: 5
-        Durability Policy: Volatile
-        History Policy: Keep Last
-        Reliability Policy: Reliable
-        Value: /roomie/raw_detections
-      Value: true
   Enabled: true
   Global Options:
     Background Color: 36; 36; 40
@@ -157,22 +117,18 @@ Visualization Manager:
   Views:
     Current:
       Class: rviz_default_plugins/Orbit
-      Distance: 5
+      Distance: 8
       Focal Point:
         X: 0
         Y: 0
         Z: 1
       Name: Current View
       Near Clip Distance: 0.01
-      Pitch: 0.6
+      Pitch: 0.75
       Target Frame: <Fixed Frame>
       Yaw: 0.8
     Saved: ~
 Window Geometry:
-  Head RGB Image:
-    collapsed: false
-  Roomie 2D Detections:
-    collapsed: false
   Height: 900
   Width: 1400
   X: 80

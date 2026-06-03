@@ -129,6 +129,7 @@ install(DIRECTORY config launch rviz DESTINATION share/${PROJECT_NAME})
 install(PROGRAMS
   scripts/roomie_python_inference_worker.py
   scripts/roomie_dsg_viewer.py
+  scripts/roomie_offline_room_partition_ui.py
   DESTINATION lib/${PROJECT_NAME})
 
 ament_export_targets(roomie-targets HAS_LIBRARY_TARGET)

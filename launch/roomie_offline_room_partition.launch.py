@@ -24,10 +24,13 @@ def generate_launch_description():
     config_path = LaunchConfiguration("config_path")
     rviz_config = LaunchConfiguration("rviz_config")
     use_rviz = LaunchConfiguration("use_rviz")
-    show_manual_rooms = LaunchConfiguration("show_manual_rooms")
+    ui_port = LaunchConfiguration("ui_port")
+    grid_resolution = LaunchConfiguration("grid_resolution")
+    slice_height = LaunchConfiguration("slice_height")
+    slice_half_thickness = LaunchConfiguration("slice_half_thickness")
 
     default_config = source_package_path("config", "pipeline_nvblox.yaml")
-    default_rviz = source_package_path("rviz", "roomie_pipeline.rviz")
+    default_rviz = source_package_path("rviz", "roomie_offline_room_partition.rviz")
 
     return LaunchDescription(
         [
@@ -39,17 +42,32 @@ def generate_launch_description():
             DeclareLaunchArgument(
                 "use_rviz",
                 default_value="true",
-                description="Start rviz2 with the roomie debug display.",
+                description="Start rviz2 with the manual room partition display.",
             ),
             DeclareLaunchArgument(
                 "rviz_config",
                 default_value=default_rviz,
-                description="RViz config for roomie map and instance debug topics.",
+                description="RViz config for manual room bounding boxes.",
             ),
             DeclareLaunchArgument(
-                "show_manual_rooms",
-                default_value="true",
-                description="Publish saved manual room bounding boxes, when available.",
+                "ui_port",
+                default_value="8765",
+                description="HTTP port for the manual room partition UI.",
+            ),
+            DeclareLaunchArgument(
+                "grid_resolution",
+                default_value="0.10",
+                description="2D ternary map cell size in meters.",
+            ),
+            DeclareLaunchArgument(
+                "slice_height",
+                default_value="0.80",
+                description="Occupied/free/unknown slice height above estimated floor in meters.",
+            ),
+            DeclareLaunchArgument(
+                "slice_half_thickness",
+                default_value="0.08",
+                description="Half-thickness of the occupied slice in meters.",
             ),
             Node(
                 package="roomie",
@@ -59,23 +77,28 @@ def generate_launch_description():
                 parameters=[config_path],
             ),
             Node(
-                condition=IfCondition(show_manual_rooms),
                 package="roomie",
                 executable="roomie_offline_room_partition_ui.py",
-                name="roomie_manual_room_marker_publisher",
+                name="roomie_offline_room_partition_ui",
                 output="screen",
                 arguments=[
                     "--pipeline-config",
                     config_path,
-                    "--marker-only",
-                    "--no-browser",
+                    "--port",
+                    ui_port,
+                    "--grid-resolution",
+                    grid_resolution,
+                    "--slice-height",
+                    slice_height,
+                    "--slice-half-thickness",
+                    slice_half_thickness,
                 ],
             ),
             Node(
                 condition=IfCondition(use_rviz),
                 package="rviz2",
                 executable="rviz2",
-                name="roomie_pipeline_rviz",
+                name="roomie_offline_room_partition_rviz",
                 arguments=["-d", rviz_config],
                 output="screen",
             ),

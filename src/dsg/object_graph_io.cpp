@@ -17,6 +17,7 @@ namespace {
 
 constexpr int kRoomieObjectGraphFormatVersion = 1;
 constexpr const char* kRoomieObjectGraphFormat = "roomie_object_graph";
+constexpr const char* kRoomieManualSceneGraphFormat = "roomie_manual_scene_graph";
 
 using nlohmann::json;
 
@@ -490,18 +491,34 @@ bool loadObjectGraphSnapshotJson(const std::filesystem::path& path,
     }
     const json root = json::parse(stream);
     const std::string format = root.value("format", std::string());
-    if (!format.empty() && format != kRoomieObjectGraphFormat) {
+    const json* object_graph_root = &root;
+    if (format == kRoomieManualSceneGraphFormat) {
+      if (!root.contains("object_graph") || !root.at("object_graph").is_object()) {
+        setError(error, "manual scene graph does not contain object_graph");
+        return false;
+      }
+      object_graph_root = &root.at("object_graph");
+    } else if (!format.empty() && format != kRoomieObjectGraphFormat) {
       setError(error, "unsupported DSG JSON format: " + format);
       return false;
     }
-    const int version = root.value("format_version", 0);
+
+    const std::string object_graph_format =
+        object_graph_root->value("format", std::string());
+    if (!object_graph_format.empty() && object_graph_format != kRoomieObjectGraphFormat) {
+      setError(error, "unsupported embedded object graph format: " + object_graph_format);
+      return false;
+    }
+    const int version = object_graph_root->value("format_version", 0);
     if (version > kRoomieObjectGraphFormatVersion) {
       setError(error, "unsupported DSG JSON version: " + std::to_string(version));
       return false;
     }
-    *snapshot = snapshotFromJson(root);
+    *snapshot = snapshotFromJson(*object_graph_root);
     if (world_frame != nullptr) {
-      *world_frame = root.value("world_frame", std::string());
+      *world_frame = object_graph_root->value(
+          "world_frame",
+          root.value("world_frame", std::string()));
     }
     return true;
   } catch (const std::exception& ex) {
