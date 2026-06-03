@@ -43,6 +43,7 @@ struct PipelineConfig {
   float min_visualization_weight = 1.0f;
   float min_color_weight = 0.1f;
   float surface_visualization_distance_vox = 1.0f;
+  double surface_cache_rebuild_period_sec = 5.0;
   std::string map_backend = "cpu";
 
   int boxer_input_size = 960;
@@ -94,7 +95,7 @@ struct PipelineConfig {
   float instance_small_duplicate_size_ratio_min = 0.55f;
   float instance_quality_observation_min_quality = 0.45f;
   float instance_close_observation_distance_m = 3.5f;
-  float instance_far_observation_distance_m = 4.5f;
+  float instance_far_observation_distance_m = 3.5f;
   float instance_far_promotion_weight = 0.25f;
   float instance_fusion_prior_mass_cap = 6.0f;
   int instance_high_quality_min_count = 3;

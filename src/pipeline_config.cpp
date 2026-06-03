@@ -116,6 +116,10 @@ PipelineConfig PipelineConfig::declareAndLoad(rclcpp::Node& node) {
       node.declare_parameter<double>("tsdf.surface_visualization_distance_vox",
                                      config.surface_visualization_distance_vox),
       config.surface_visualization_distance_vox);
+  config.surface_cache_rebuild_period_sec = std::max(
+      0.0,
+      node.declare_parameter<double>("tsdf.surface_cache_rebuild_period_sec",
+                                     config.surface_cache_rebuild_period_sec));
   config.load_map =
       node.declare_parameter<bool>("tsdf.load_map", config.load_map);
   config.map_load_path =

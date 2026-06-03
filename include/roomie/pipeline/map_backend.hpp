@@ -38,6 +38,7 @@ struct MapBackendSnapshot {
   WorldPointVector surface_points_world;
   std::vector<MapSurfacePoint, Eigen::aligned_allocator<MapSurfacePoint>> debug_surface_points;
   std::uint64_t map_version = 0;
+  std::uint64_t latest_map_version = 0;
   std::uint64_t tsdf_blocks = 0;
   std::uint64_t surface_voxels_scanned = 0;
   std::uint64_t selected_blocks = 0;
@@ -49,6 +50,7 @@ struct MapBackendSnapshot {
   double frustum_filter_ms = 0.0;
   bool has_map = false;
   bool surface_cache_ready = false;
+  bool cache_dirty = false;
   bool view_filtered = false;
 };
 

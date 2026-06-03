@@ -62,6 +62,7 @@ MapBackendSnapshot CpuPointMapBackend::snapshot() const {
   std::lock_guard<std::mutex> lock(mutex_);
   MapBackendSnapshot snapshot;
   snapshot.map_version = map_version_.load();
+  snapshot.latest_map_version = snapshot.map_version;
   snapshot.has_map = !map_points_world_.empty();
   snapshot.surface_points_world = map_points_world_;
   snapshot.debug_surface_points.reserve(map_points_world_.size());

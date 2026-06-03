@@ -567,6 +567,11 @@ std::string diagnosticsLabel(std::string label) {
   return label;
 }
 
+bool shouldIgnoreDetectionLabel(const std::string& label) {
+  const std::string normalized = lowercase(label);
+  return normalized == "bathhub" || normalized == "bath hub";
+}
+
 std::string formatLabelCounts(const std::map<std::string, std::size_t>& counts) {
   if (counts.empty()) {
     return "{}";
@@ -897,6 +902,23 @@ bool isFarObservationForConfirmedGeometry(const InstanceObservation& observation
          observation.camera_distance_m >= config.instance_far_observation_distance_m;
 }
 
+bool hasCloseObservationGeometryLock(const InstanceTrack& track,
+                                     const PipelineConfig& config) {
+  if (track.object_id < 0 || track.state == InstanceTrackState::kTentative) {
+    return false;
+  }
+  return track.high_quality_observation_count >= config.instance_high_quality_min_count ||
+         track.high_quality_observation_mass >= config.instance_high_quality_min_mass;
+}
+
+bool shouldFreezeFarObservationForCloseStableObject(
+    const InstanceTrack& track,
+    const InstanceObservation& observation,
+    const PipelineConfig& config) {
+  return hasCloseObservationGeometryLock(track, config) &&
+         isFarObservationForConfirmedGeometry(observation, config);
+}
+
 bool wouldFarObservationShiftLastGoodObb(const InstanceTrack& track,
                                          const InstanceObservation& observation,
                                          const PipelineConfig& config,
@@ -945,6 +967,9 @@ std::string confirmedGeometryUpdateSuppressionReason(
     const PipelineConfig& config,
     float old_mass,
     float new_weight) {
+  if (shouldFreezeFarObservationForCloseStableObject(track, observation, config)) {
+    return "far_close_stable_lock";
+  }
   if (track.object_id < 0 || !track.publishable ||
       !geometryConfirmed(track, config)) {
     return "";
@@ -1549,6 +1574,9 @@ std::optional<InstanceObservation> InstanceMapThread::makeObservation(
   observation.detection = detection;
   observation.confidence = rawDetectionConfidence(detection);
 
+  if (shouldIgnoreDetectionLabel(detection.label)) {
+    return std::nullopt;
+  }
   if (!isFiniteVector(detection.center_world) || !isFiniteVector(detection.size_m) ||
       !std::isfinite(detection.yaw_rad)) {
     return std::nullopt;

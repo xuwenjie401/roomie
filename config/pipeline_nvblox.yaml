@@ -43,6 +43,7 @@ roomie_pipeline_node:
       min_visualization_weight: 1.0
       min_color_weight: 0.1
       surface_visualization_distance_vox: 1.0
+      surface_cache_rebuild_period_sec: 5.0
       load_map: true
       map_load_path: /home/agxi/Datasets/output/jarvis_home/nvblox/color_tsdf_map_0526_1639.nvblox
       freeze_tsdf_map: true
@@ -98,7 +99,7 @@ roomie_pipeline_node:
       small_duplicate_size_ratio_min: 0.55
       quality_observation_min_quality: 0.45
       close_observation_distance_m: 3.5
-      far_observation_distance_m: 4.5
+      far_observation_distance_m: 3.5
       far_promotion_weight: 0.25
       fusion_prior_mass_cap: 6.0
       high_quality_min_count: 3
@@ -145,8 +146,8 @@ roomie_pipeline_node:
       publish_period_sec: 5.0
 
     persistence:
-      load_instance_map: false
-      instance_map_load_path: /home/agxi/Datasets/output/jarvis_home/instances/latest.json
+      load_instance_map: true
+      instance_map_load_path: /home/agxi/Datasets/output/jarvis_home/instances/roomie_dsg_0601.json
       save_instance_map: true
       instance_map_save_path: /home/agxi/Datasets/output/jarvis_home/instances/
       save_dsg_service: /roomie/save_dsg

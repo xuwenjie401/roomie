@@ -14,6 +14,7 @@
 #include <rclcpp/rclcpp.hpp>
 #include <sensor_msgs/msg/camera_info.hpp>
 #include <sensor_msgs/msg/image.hpp>
+#include <tf2/buffer_core.h>
 #include <tf2_msgs/msg/tf_message.hpp>
 
 #include "roomie/pipeline/thread_safe_queue.hpp"
@@ -43,6 +44,7 @@ struct RosIoSubscriptionConfig {
   std::string tf_topic = "/tf";
   std::string tf_static_topic = "/tf_static";
   double max_image_stamp_delta_sec = 0.002;
+  double tf_buffer_duration_sec = 5.0;
   double max_tf_gap_sec = 0.2;
   double log_period_sec = 2.0;
   std::size_t input_queue_size = 30;
@@ -90,13 +92,6 @@ class RosIoThread : public WorkerThread {
     rclcpp::Subscription<sensor_msgs::msg::CameraInfo>::SharedPtr camera_info;
   };
 
-  struct StoredTransform {
-    std::string parent_frame;
-    Eigen::Isometry3f T_parent_child = Eigen::Isometry3f::Identity();
-    TimeNanoseconds time_ns = 0;
-    bool is_static = false;
-  };
-
   void handleRgb(const std::string& camera_id, const sensor_msgs::msg::Image::SharedPtr msg);
   void handleRobotMask(const std::string& camera_id,
                        const sensor_msgs::msg::Image::SharedPtr msg);
@@ -109,7 +104,7 @@ class RosIoThread : public WorkerThread {
   makeFramesLocked(const std::string& camera_id, TimeNanoseconds time_ns);
   std::optional<Eigen::Isometry3f> lookupTWorldFrameLocked(
       const std::string& target_frame,
-      TimeNanoseconds time_ns) const;
+      TimeNanoseconds time_ns);
 
   ThreadSafeQueue<MappingFrame>& mapping_queue_;
   ThreadSafeQueue<DetectionFrame>& detection_queue_;
@@ -118,7 +113,7 @@ class RosIoThread : public WorkerThread {
   std::condition_variable cv_;
   RosIoSubscriptionConfig config_;
   std::unordered_map<std::string, CameraState> camera_states_;
-  std::unordered_map<std::string, StoredTransform> transforms_by_child_frame_;
+  std::shared_ptr<tf2::BufferCore> tf_buffer_;
   std::vector<CameraSubscriptions> subscriptions_;
   rclcpp::Subscription<tf2_msgs::msg::TFMessage>::SharedPtr tf_subscription_;
   rclcpp::Subscription<tf2_msgs::msg::TFMessage>::SharedPtr tf_static_subscription_;
@@ -131,8 +126,14 @@ class RosIoThread : public WorkerThread {
   std::uint64_t camera_info_messages_ = 0;
   std::uint64_t tf_messages_ = 0;
   std::uint64_t tf_static_messages_ = 0;
+  std::uint64_t tf_set_failures_ = 0;
+  std::uint64_t tf_lookup_successes_ = 0;
+  std::uint64_t tf_lookup_latest_fallbacks_ = 0;
+  std::uint64_t tf_lookup_stale_latest_ = 0;
+  std::uint64_t tf_lookup_failures_ = 0;
   std::uint64_t mapping_frames_emitted_ = 0;
   std::uint64_t detection_frames_emitted_ = 0;
+  std::string last_tf_error_;
 };
 
 }  // namespace roomie

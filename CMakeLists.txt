@@ -27,6 +27,7 @@ find_package(rclcpp REQUIRED)
 find_package(sensor_msgs REQUIRED)
 find_package(std_msgs REQUIRED)
 find_package(std_srvs REQUIRED)
+find_package(tf2 REQUIRED)
 find_package(tf2_msgs REQUIRED)
 find_package(visualization_msgs REQUIRED)
 find_package(OpenCV REQUIRED COMPONENTS core imgproc)
@@ -100,6 +101,7 @@ ament_target_dependencies(
   sensor_msgs
   std_msgs
   std_srvs
+  tf2
   tf2_msgs
   visualization_msgs
 )
@@ -138,6 +140,7 @@ ament_export_dependencies(
   sensor_msgs
   std_msgs
   std_srvs
+  tf2
   tf2_msgs
   visualization_msgs)
 ament_package()

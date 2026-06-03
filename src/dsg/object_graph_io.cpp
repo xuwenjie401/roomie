@@ -2,8 +2,11 @@
 
 #include <algorithm>
 #include <cctype>
+#include <chrono>
 #include <cstdint>
+#include <ctime>
 #include <fstream>
+#include <iomanip>
 #include <sstream>
 #include <utility>
 
@@ -32,6 +35,25 @@ std::string lowercase(std::string value) {
 
 bool hasJsonExtension(const std::filesystem::path& path) {
   return lowercase(path.extension().string()) == ".json";
+}
+
+std::string saveTimeSuffix(TimeNanoseconds saved_time_ns) {
+  std::time_t saved_time_sec = 0;
+  if (saved_time_ns > 0) {
+    saved_time_sec = static_cast<std::time_t>(saved_time_ns / 1000000000LL);
+  } else {
+    saved_time_sec = std::chrono::system_clock::to_time_t(
+        std::chrono::system_clock::now());
+  }
+
+  std::tm local_time{};
+  if (localtime_r(&saved_time_sec, &local_time) == nullptr) {
+    return "0000_0000";
+  }
+
+  std::ostringstream stream;
+  stream << std::put_time(&local_time, "%m%d_%H%M");
+  return stream.str();
 }
 
 json vector3fToJson(const Eigen::Vector3f& value) {
@@ -413,7 +435,7 @@ bool resolveObjectGraphSavePaths(const std::string& configured_path,
   }
 
   std::ostringstream filename;
-  filename << "roomie_dsg_" << saved_time_ns << ".json";
+  filename << "roomie_dsg_" << saveTimeSuffix(saved_time_ns) << ".json";
   paths->primary_path = base_path / filename.str();
   paths->latest_path = base_path / "latest.json";
   return true;

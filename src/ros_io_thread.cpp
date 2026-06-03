@@ -6,10 +6,11 @@
 #include <cstring>
 #include <limits>
 #include <sstream>
-#include <unordered_set>
 #include <utility>
 
 #include <geometry_msgs/msg/transform_stamped.hpp>
+#include <tf2/exceptions.h>
+#include <tf2/time.h>
 
 #include "roomie/utils/run_logger.hpp"
 
@@ -264,6 +265,8 @@ void RosIoThread::attachNode(rclcpp::Node& node) {
   subscriptions_.clear();
   tf_subscription_.reset();
   tf_static_subscription_.reset();
+  tf_buffer_ = std::make_shared<tf2::BufferCore>(
+      tf2::durationFromSec(config_.tf_buffer_duration_sec));
   const auto input_qos =
       rclcpp::QoS(static_cast<std::size_t>(std::max<std::size_t>(1, config_.input_queue_size)))
           .reliable();
@@ -481,27 +484,40 @@ void RosIoThread::handleTf(const tf2_msgs::msg::TFMessage::SharedPtr msg, bool i
       ++tf_messages_;
     }
     for (const auto& transform_msg : msg->transforms) {
-      const std::string parent_frame = normalizeFrameId(transform_msg.header.frame_id);
-      const std::string child_frame = normalizeFrameId(transform_msg.child_frame_id);
-      if (parent_frame.empty() || child_frame.empty()) {
+      geometry_msgs::msg::TransformStamped stored = transform_msg;
+      stored.header.frame_id = normalizeFrameId(stored.header.frame_id);
+      stored.child_frame_id = normalizeFrameId(stored.child_frame_id);
+      if (stored.header.frame_id.empty() || stored.child_frame_id.empty()) {
         continue;
       }
 
-      auto transform = transformFromRos(transform_msg);
+      auto transform = transformFromRos(stored);
       if (!transform) {
         RCLCPP_WARN(logger_,
                     "skipping TF %s -> %s with invalid rotation",
-                    parent_frame.c_str(),
-                    child_frame.c_str());
+                    stored.header.frame_id.c_str(),
+                    stored.child_frame_id.c_str());
         continue;
       }
 
-      StoredTransform stored;
-      stored.parent_frame = parent_frame;
-      stored.T_parent_child = std::move(*transform);
-      stored.time_ns = toNanoseconds(transform_msg.header.stamp);
-      stored.is_static = is_static;
-      transforms_by_child_frame_[child_frame] = std::move(stored);
+      if (!tf_buffer_) {
+        ++tf_set_failures_;
+        last_tf_error_ = "tf_buffer is not initialized";
+        continue;
+      }
+      try {
+        if (!tf_buffer_->setTransform(stored, "roomie_ros_io", is_static)) {
+          ++tf_set_failures_;
+          last_tf_error_ = "tf2 rejected transform " + stored.header.frame_id + " -> " +
+                           stored.child_frame_id;
+        }
+      } catch (const tf2::TransformException& error) {
+        ++tf_set_failures_;
+        last_tf_error_ = error.what();
+      } catch (const std::exception& error) {
+        ++tf_set_failures_;
+        last_tf_error_ = error.what();
+      }
     }
 
     for (auto& [camera_id, state] : camera_states_) {
@@ -529,40 +545,75 @@ void RosIoThread::handleTf(const tf2_msgs::msg::TFMessage::SharedPtr msg, bool i
 
 std::optional<Eigen::Isometry3f> RosIoThread::lookupTWorldFrameLocked(
     const std::string& target_frame,
-    TimeNanoseconds time_ns) const {
+    TimeNanoseconds time_ns) {
   const std::string world_frame = normalizeFrameId(config_.world_frame);
   std::string current_frame = normalizeFrameId(target_frame);
   if (world_frame.empty() || current_frame.empty()) {
+    ++tf_lookup_failures_;
+    last_tf_error_ = "empty world or target frame";
     return std::nullopt;
   }
   if (current_frame == world_frame) {
+    ++tf_lookup_successes_;
     return Eigen::Isometry3f::Identity();
   }
-
-  const TimeNanoseconds max_gap_ns = secondsToNanoseconds(config_.max_tf_gap_sec);
-  Eigen::Isometry3f T_world_current = Eigen::Isometry3f::Identity();
-  std::unordered_set<std::string> visited;
-
-  while (current_frame != world_frame) {
-    if (!visited.insert(current_frame).second) {
-      return std::nullopt;
-    }
-
-    const auto it = transforms_by_child_frame_.find(current_frame);
-    if (it == transforms_by_child_frame_.end()) {
-      return std::nullopt;
-    }
-    const StoredTransform& stored = it->second;
-    if (!stored.is_static && max_gap_ns > 0 && time_ns > 0 && stored.time_ns > 0 &&
-        absoluteDelta(time_ns, stored.time_ns) > max_gap_ns) {
-      return std::nullopt;
-    }
-
-    T_world_current = stored.T_parent_child * T_world_current;
-    current_frame = stored.parent_frame;
+  if (!tf_buffer_) {
+    ++tf_lookup_failures_;
+    last_tf_error_ = "tf_buffer is not initialized";
+    return std::nullopt;
   }
 
-  return T_world_current;
+  try {
+    const geometry_msgs::msg::TransformStamped transform_msg = tf_buffer_->lookupTransform(
+        world_frame,
+        current_frame,
+        tf2::TimePoint(std::chrono::nanoseconds(time_ns)));
+    auto transform = transformFromRos(transform_msg);
+    if (!transform) {
+      ++tf_lookup_failures_;
+      last_tf_error_ = "tf2 returned invalid rotation for " + world_frame + " <- " +
+                       current_frame;
+      return std::nullopt;
+    }
+    ++tf_lookup_successes_;
+    return transform;
+  } catch (const tf2::TransformException& error) {
+    last_tf_error_ = error.what();
+  } catch (const std::exception& error) {
+    last_tf_error_ = error.what();
+  }
+
+  try {
+    const geometry_msgs::msg::TransformStamped latest_msg = tf_buffer_->lookupTransform(
+        world_frame,
+        current_frame,
+        tf2::TimePointZero);
+    const TimeNanoseconds latest_time_ns = toNanoseconds(latest_msg.header.stamp);
+    const TimeNanoseconds max_gap_ns = secondsToNanoseconds(config_.max_tf_gap_sec);
+    if (latest_time_ns > 0 && max_gap_ns > 0 &&
+        !stampCloseEnough(time_ns, latest_time_ns, max_gap_ns)) {
+      ++tf_lookup_stale_latest_;
+      return std::nullopt;
+    }
+    auto transform = transformFromRos(latest_msg);
+    if (!transform) {
+      ++tf_lookup_failures_;
+      last_tf_error_ = "tf2 returned invalid latest rotation for " + world_frame + " <- " +
+                       current_frame;
+      return std::nullopt;
+    }
+    ++tf_lookup_successes_;
+    ++tf_lookup_latest_fallbacks_;
+    return transform;
+  } catch (const tf2::TransformException& error) {
+    ++tf_lookup_failures_;
+    last_tf_error_ = error.what();
+  } catch (const std::exception& error) {
+    ++tf_lookup_failures_;
+    last_tf_error_ = error.what();
+  }
+
+  return std::nullopt;
 }
 
 std::pair<std::optional<MappingFrame>, std::optional<DetectionFrame>>
@@ -646,10 +697,14 @@ void RosIoThread::maybeLogStatusLocked() {
          << " camera_info=" << camera_info_messages_
          << " tf=" << tf_messages_
          << " tf_static=" << tf_static_messages_
+         << " tf_set_failures=" << tf_set_failures_
+         << " tf_lookup_ok=" << tf_lookup_successes_
+         << " tf_latest_fallback=" << tf_lookup_latest_fallbacks_
+         << " tf_stale_latest=" << tf_lookup_stale_latest_
+         << " tf_lookup_fail=" << tf_lookup_failures_
          << " mapping_frames=" << mapping_frames_emitted_
          << " detection_frames=" << detection_frames_emitted_
-         << " cameras=" << camera_states_.size()
-         << " tf_edges=" << transforms_by_child_frame_.size();
+         << " cameras=" << camera_states_.size();
   RunLogger::logGlobal("ros_io", stream.str());
 }
 

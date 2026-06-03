@@ -106,6 +106,7 @@ RoomiePipeline::RoomiePipeline(rclcpp::Node& node, PipelineConfig config)
   ros_io_config.tf_topic = config_.tf_topic;
   ros_io_config.tf_static_topic = config_.tf_static_topic;
   ros_io_config.max_image_stamp_delta_sec = config_.max_image_stamp_delta_sec;
+  ros_io_config.tf_buffer_duration_sec = config_.tf_buffer_duration_sec;
   ros_io_config.max_tf_gap_sec = config_.max_tf_gap_sec;
   ros_io_config.log_period_sec = config_.file_logging_period_sec;
   ros_io_config.input_queue_size = config_.input_queue_size;

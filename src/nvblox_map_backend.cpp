@@ -203,13 +203,14 @@ class NvbloxMapBackend : public MapBackend {
 
     ++integrated_frames_;
     ++map_version_;
+    surface_cache_dirty_ = true;
   }
 
   MapBackendSnapshot snapshot() const override {
     std::lock_guard<std::mutex> lock(mutex_);
     MapBackendSnapshot snapshot;
     const std::uint64_t cache_rebuilds_before = cache_rebuilds_;
-    ensureSurfaceCacheLocked();
+    ensureSurfaceCacheLocked(/*allow_periodic_rebuild=*/true);
     fillSnapshotHeaderLocked(&snapshot);
     if (snapshot.cache_rebuilds > cache_rebuilds_before) {
       snapshot.cache_build_ms = last_cache_build_ms_;
@@ -222,7 +223,7 @@ class NvbloxMapBackend : public MapBackend {
     std::lock_guard<std::mutex> lock(mutex_);
     MapBackendSnapshot snapshot;
     const std::uint64_t cache_rebuilds_before = cache_rebuilds_;
-    ensureSurfaceCacheLocked();
+    ensureSurfaceCacheLocked(/*allow_periodic_rebuild=*/false);
     fillSnapshotHeaderLocked(&snapshot);
     if (snapshot.cache_rebuilds > cache_rebuilds_before) {
       snapshot.cache_build_ms = last_cache_build_ms_;
@@ -271,14 +272,14 @@ class NvbloxMapBackend : public MapBackend {
 
   std::shared_ptr<const GeometrySurfaceCache> geometrySurfaceCache() const override {
     std::lock_guard<std::mutex> lock(mutex_);
-    ensureSurfaceCacheLocked();
+    ensureSurfaceCacheLocked(/*allow_periodic_rebuild=*/false);
     return geometry_surface_cache_;
   }
 
   std::vector<VoxelRef, Eigen::aligned_allocator<VoxelRef>> collectNearSurfaceVoxels(
       const RawDetection& detection) const override {
     std::lock_guard<std::mutex> lock(mutex_);
-    ensureSurfaceCacheLocked();
+    ensureSurfaceCacheLocked(/*allow_periodic_rebuild=*/false);
     const nvblox::AxisAlignedBoundingBox detection_aabb = detectionAabbWorld(detection);
     std::vector<VoxelRef, Eigen::aligned_allocator<VoxelRef>> refs;
     for (const SurfaceBlockCache& block_cache : surface_cache_blocks_) {
@@ -382,17 +383,41 @@ class NvbloxMapBackend : public MapBackend {
     }
   }
 
-  void ensureSurfaceCacheLocked() const {
-    if (surface_cache_ready_ || mapper_->tsdf_layer().numBlocks() == 0) {
+  bool surfaceCacheDirtyLocked() const {
+    return surface_cache_dirty_ || cached_map_version_ != map_version_.load();
+  }
+
+  bool surfaceCacheRebuildDueLocked() const {
+    if (config_.surface_cache_rebuild_period_sec <= 0.0 || cache_rebuilds_ == 0) {
+      return true;
+    }
+    return std::chrono::steady_clock::now() - last_cache_rebuild_time_ >=
+           std::chrono::duration<double>(config_.surface_cache_rebuild_period_sec);
+  }
+
+  void ensureSurfaceCacheLocked(bool allow_periodic_rebuild) const {
+    if (mapper_->tsdf_layer().numBlocks() == 0) {
       return;
     }
-    rebuildSurfaceCacheLocked();
+    if (!surface_cache_ready_) {
+      rebuildSurfaceCacheLocked();
+      return;
+    }
+    surface_cache_dirty_ = surfaceCacheDirtyLocked();
+    if (surface_cache_dirty_ && allow_periodic_rebuild &&
+        surfaceCacheRebuildDueLocked()) {
+      rebuildSurfaceCacheLocked();
+    }
   }
 
   void fillSnapshotHeaderLocked(MapBackendSnapshot* snapshot) const {
+    const std::uint64_t latest_map_version = map_version_.load();
     snapshot->map_version = cached_map_version_;
+    snapshot->latest_map_version = latest_map_version;
     snapshot->has_map = surface_cache_ready_ && cached_surface_points_ > 0;
     snapshot->surface_cache_ready = surface_cache_ready_;
+    snapshot->cache_dirty =
+        surface_cache_ready_ && cached_map_version_ != latest_map_version;
     snapshot->tsdf_blocks = cached_tsdf_blocks_;
     snapshot->surface_voxels_scanned = cached_voxels_scanned_;
     snapshot->cached_surface_points = cached_surface_points_;
@@ -505,6 +530,7 @@ class NvbloxMapBackend : public MapBackend {
     }
     surface_cache_ready_ = true;
     cached_map_version_ = map_version_.load();
+    surface_cache_dirty_ = false;
     ++cache_rebuilds_;
     geometry_cache->map_version = cached_map_version_;
     geometry_cache->cache_rebuilds = cache_rebuilds_;
@@ -512,13 +538,15 @@ class NvbloxMapBackend : public MapBackend {
     geometry_cache->surface_voxels_scanned = cached_voxels_scanned_;
     geometry_cache->has_map = cached_surface_points_ > 0;
     geometry_surface_cache_ = std::move(geometry_cache);
-    last_cache_build_ms_ = elapsedMs(build_start, std::chrono::steady_clock::now());
+    last_cache_rebuild_time_ = std::chrono::steady_clock::now();
+    last_cache_build_ms_ = elapsedMs(build_start, last_cache_rebuild_time_);
     RCLCPP_INFO(logger_,
                 "built nvblox surface cache blocks=%lu surface_points=%lu "
-                "voxels_scanned=%lu build=%.1fms",
+                "voxels_scanned=%lu map_version=%lu build=%.1fms",
                 static_cast<unsigned long>(cached_tsdf_blocks_),
                 static_cast<unsigned long>(cached_surface_points_),
                 static_cast<unsigned long>(cached_voxels_scanned_),
+                static_cast<unsigned long>(cached_map_version_),
                 last_cache_build_ms_);
     RunLogger::logGlobal("map",
                          "built_nvblox_surface_cache blocks=" +
@@ -529,6 +557,8 @@ class NvbloxMapBackend : public MapBackend {
                              std::to_string(cached_voxels_scanned_) +
                              " map_version=" +
                              std::to_string(cached_map_version_) +
+                             " rebuild_period_sec=" +
+                             std::to_string(config_.surface_cache_rebuild_period_sec) +
                              " build_ms=" +
                              std::to_string(last_cache_build_ms_));
   }
@@ -545,6 +575,7 @@ class NvbloxMapBackend : public MapBackend {
   std::atomic_uint64_t map_version_{0};
   std::atomic_uint64_t integrated_frames_{0};
   mutable bool surface_cache_ready_{false};
+  mutable bool surface_cache_dirty_{false};
   mutable std::vector<SurfaceBlockCache, Eigen::aligned_allocator<SurfaceBlockCache>>
       surface_cache_blocks_;
   mutable std::shared_ptr<const GeometrySurfaceCache> geometry_surface_cache_;
@@ -554,6 +585,8 @@ class NvbloxMapBackend : public MapBackend {
   mutable std::uint64_t cached_map_version_{0};
   mutable std::uint64_t cache_rebuilds_{0};
   mutable double last_cache_build_ms_{0.0};
+  mutable std::chrono::steady_clock::time_point last_cache_rebuild_time_ =
+      std::chrono::steady_clock::time_point::min();
   rclcpp::Logger logger_;
 };
 

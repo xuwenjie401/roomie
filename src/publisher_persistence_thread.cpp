@@ -178,8 +178,10 @@ std_msgs::msg::String PublisherPersistenceThread::buildMapStats(
   stream << std::fixed << std::setprecision(2)
          << "map_backend=" << config_.map_backend
          << " map_version=" << snapshot.map_version
+         << " latest_map_version=" << snapshot.latest_map_version
          << " has_map=" << (snapshot.has_map ? "true" : "false")
          << " cache_ready=" << (snapshot.surface_cache_ready ? "true" : "false")
+         << " cache_dirty=" << (snapshot.cache_dirty ? "true" : "false")
          << " surface_points=" << snapshot.surface_points_world.size()
          << " cached_surface_points=" << snapshot.cached_surface_points
          << " tsdf_blocks=" << snapshot.tsdf_blocks
@@ -190,6 +192,8 @@ std_msgs::msg::String PublisherPersistenceThread::buildMapStats(
          << " surface_extract_ms=" << snapshot.surface_extract_ms
          << " cache_build_ms=" << snapshot.cache_build_ms
          << " frustum_filter_ms=" << snapshot.frustum_filter_ms
+         << " surface_cache_rebuild_period_sec="
+         << config_.surface_cache_rebuild_period_sec
          << " publish_period_sec=" << config_.publish_period_sec;
   message.data = stream.str();
   return message;
