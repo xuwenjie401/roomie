@@ -77,7 +77,7 @@ PublisherPersistenceThread::PublisherPersistenceThread(rclcpp::Node& node,
   map_stats_pub_ = node_.create_publisher<std_msgs::msg::String>(
       "/roomie/map_stats",
       rclcpp::QoS(1).reliable());
-  if (config_.save_instance_map && !config_.save_dsg_service.empty()) {
+  if (config_.save_scene_graph && !config_.save_dsg_service.empty()) {
     save_dsg_service_ = node_.create_service<std_srvs::srv::Trigger>(
         config_.save_dsg_service,
         [this](const std::shared_ptr<std_srvs::srv::Trigger::Request> request,
@@ -206,13 +206,41 @@ void PublisherPersistenceThread::handleSaveDsg(
   const TimeNanoseconds saved_time_ns = node_.now().nanoseconds();
   ObjectGraphSavePaths paths;
   std::string error;
-  const ObjectGraphSnapshot snapshot = instance_store_.snapshotObjectGraph();
-  if (!saveObjectGraphSnapshotJson(snapshot,
-                                   config_.world_frame,
+  if (!resolveObjectGraphSavePaths(config_.scene_graph_save_path,
                                    saved_time_ns,
-                                   config_.instance_map_save_path,
+                                   config_.snapshot_image_subdir,
                                    &paths,
                                    &error)) {
+    response->success = false;
+    response->message = "failed to resolve DSG save path: " + error;
+    RCLCPP_WARN(node_.get_logger(), "%s", response->message.c_str());
+    RunLogger::logGlobal("persistence", response->message);
+    return;
+  }
+
+  ObjectGraphSnapshot snapshot;
+  if (!instance_store_.prepareSceneGraphForSave(&snapshot,
+                                                paths.snapshot_image_dir,
+                                                paths.snapshot_uri_prefix,
+                                                &error)) {
+    response->success = false;
+    response->message = "failed to prepare DSG: " + error;
+    RCLCPP_WARN(node_.get_logger(), "%s", response->message.c_str());
+    RunLogger::logGlobal("persistence", response->message);
+    return;
+  }
+
+  if (!saveObjectGraphSnapshotJsonAtomic(snapshot,
+                                         config_.world_frame,
+                                         saved_time_ns,
+                                         paths.primary_path,
+                                         &error) ||
+      (!paths.latest_path.empty() &&
+       !saveObjectGraphSnapshotJsonAtomic(snapshot,
+                                          config_.world_frame,
+                                          saved_time_ns,
+                                          paths.latest_path,
+                                          &error))) {
     response->success = false;
     response->message = "failed to save DSG: " + error;
     RCLCPP_WARN(node_.get_logger(), "%s", response->message.c_str());
@@ -223,9 +251,13 @@ void PublisherPersistenceThread::handleSaveDsg(
   std::ostringstream stream;
   stream << "saved DSG objects=" << snapshot.objects.size()
          << " relations=" << snapshot.relations.size()
+         << " snapshot_images=" << snapshot.snapshot_images.size()
          << " path=" << paths.primary_path.string();
   if (!paths.latest_path.empty()) {
     stream << " latest=" << paths.latest_path.string();
+  }
+  if (!snapshot.snapshot_images.empty() && !paths.snapshot_image_dir.empty()) {
+    stream << " snapshots=" << paths.snapshot_image_dir.string();
   }
   response->success = true;
   response->message = stream.str();

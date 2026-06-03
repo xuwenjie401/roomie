@@ -34,17 +34,17 @@ RoomiePipeline::RoomiePipeline(rclcpp::Node& node, PipelineConfig config)
                          " raw_detections=" + config_.raw_detections_topic);
   }
 
-  if (config_.load_instance_map) {
-    if (config_.instance_map_load_path.empty()) {
+  if (config_.load_scene_graph) {
+    if (config_.scene_graph_load_path.empty()) {
       const std::string message =
-          "persistence.load_instance_map is true but instance_map_load_path is empty";
+          "persistence.load_scene_graph is true but scene_graph_load_path is empty";
       RCLCPP_WARN(node.get_logger(), "%s", message.c_str());
       RunLogger::logGlobal("persistence", message);
     } else {
       ObjectGraphSnapshot snapshot;
       std::string loaded_world_frame;
       std::string error;
-      if (loadObjectGraphSnapshotJson(config_.instance_map_load_path,
+      if (loadObjectGraphSnapshotJson(config_.scene_graph_load_path,
                                       &snapshot,
                                       &loaded_world_frame,
                                       &error)) {
@@ -56,26 +56,30 @@ RoomiePipeline::RoomiePipeline(rclcpp::Node& node, PipelineConfig config)
         }
         if (instance_map_thread_.loadObjectGraphSnapshot(snapshot, &error)) {
           RCLCPP_INFO(node.get_logger(),
-                      "loaded roomie DSG objects=%zu relations=%zu from %s",
+                      "loaded roomie scene graph objects=%zu relations=%zu from %s",
                       snapshot.objects.size(),
                       snapshot.relations.size(),
-                      config_.instance_map_load_path.c_str());
+                      config_.scene_graph_load_path.c_str());
           RunLogger::logGlobal(
               "persistence",
-              "loaded DSG objects=" + std::to_string(snapshot.objects.size()) +
+              "loaded scene_graph objects=" + std::to_string(snapshot.objects.size()) +
                   " relations=" + std::to_string(snapshot.relations.size()) +
-                  " path=" + config_.instance_map_load_path);
+                  " path=" + config_.scene_graph_load_path);
         } else {
-          RCLCPP_WARN(node.get_logger(), "failed to restore DSG tracks: %s", error.c_str());
-          RunLogger::logGlobal("persistence", "failed to restore DSG tracks: " + error);
+          RCLCPP_WARN(node.get_logger(),
+                      "failed to restore scene graph tracks: %s",
+                      error.c_str());
+          RunLogger::logGlobal("persistence",
+                               "failed to restore scene graph tracks: " + error);
         }
       } else {
         RCLCPP_WARN(node.get_logger(),
-                    "failed to load DSG from %s: %s",
-                    config_.instance_map_load_path.c_str(),
+                    "failed to load scene graph from %s: %s",
+                    config_.scene_graph_load_path.c_str(),
                     error.c_str());
         RunLogger::logGlobal("persistence",
-                             "failed to load DSG path=" + config_.instance_map_load_path +
+                             "failed to load scene_graph path=" +
+                                 config_.scene_graph_load_path +
                                  " error=" + error);
       }
     }

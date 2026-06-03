@@ -10,6 +10,7 @@
 #include <limits>
 #include <map>
 #include <memory>
+#include <optional>
 #include <set>
 #include <sstream>
 #include <tuple>
@@ -1198,8 +1199,29 @@ InstanceRecord recordFromTrack(const InstanceTrack& track) {
   record.source_cameras = track.source_cameras;
   record.source_track_ids.push_back(track.track_id);
   record.observation_timestamps_ns = track.observation_timestamps_ns;
+  record.snapshot_image_index = track.snapshot.image_index;
+  record.snapshot_bbox_xyxy = track.snapshot.bbox_xyxy;
+  record.snapshot_quality = track.snapshot.quality;
   record.near_surface_voxels = track.near_surface_voxels;
   return record;
+}
+
+ObjectSnapshotRemakerConfig snapshotRemakerConfigFromPipeline(
+    const PipelineConfig& config) {
+  ObjectSnapshotRemakerConfig remaker_config;
+  remaker_config.enabled =
+      config.load_scene_graph && config.freeze_instances && config.snapshot_remake_enabled;
+  remaker_config.staging_dir = config.snapshot_staging_dir;
+  remaker_config.first_min_quality = config.instance_snapshot_first_min_quality;
+  remaker_config.min_quality = config.instance_snapshot_min_quality;
+  remaker_config.min_box_area_px = config.instance_snapshot_min_box_area_px;
+  remaker_config.position_weight = config.instance_snapshot_position_weight;
+  remaker_config.size_weight = config.instance_snapshot_size_weight;
+  remaker_config.replace_min_quality_delta =
+      config.instance_snapshot_replace_min_quality_delta;
+  remaker_config.replace_min_quality_ratio =
+      config.instance_snapshot_replace_min_quality_ratio;
+  return remaker_config;
 }
 
 }  // namespace
@@ -1210,7 +1232,8 @@ InstanceMapThread::InstanceMapThread(ThreadSafeQueue<InferenceResponse>& respons
     : WorkerThread("instance_map_thread"),
       response_queue_(response_queue),
       map_projector_(map_projector),
-      config_(std::move(config)) {}
+      config_(std::move(config)),
+      snapshot_remaker_(snapshotRemakerConfigFromPipeline(config_)) {}
 
 bool InstanceMapThread::enqueueDetections(InferenceResponse response) {
   return response_queue_.pushDropOldest(std::move(response));
@@ -1238,10 +1261,38 @@ ObjectGraphSnapshot InstanceMapThread::snapshotObjectGraph() const {
   return object_graph_.snapshot();
 }
 
+bool InstanceMapThread::prepareSceneGraphForSave(
+    ObjectGraphSnapshot* snapshot,
+    const std::filesystem::path& snapshot_image_dir,
+    const std::string& snapshot_uri_prefix,
+    std::string* error) const {
+  if (snapshot == nullptr) {
+    if (error != nullptr) {
+      *error = "null ObjectGraphSnapshot output";
+    }
+    return false;
+  }
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    *snapshot = object_graph_.snapshot();
+  }
+  if (!config_.snapshot_remake_enabled) {
+    if (error != nullptr) {
+      error->clear();
+    }
+    return true;
+  }
+  return snapshot_remaker_.populateSnapshot(snapshot,
+                                            snapshot_image_dir,
+                                            snapshot_uri_prefix,
+                                            error);
+}
+
 bool InstanceMapThread::loadObjectGraphSnapshot(const ObjectGraphSnapshot& snapshot,
                                                 std::string* error) {
   std::lock_guard<std::mutex> lock(mutex_);
   object_graph_.loadSnapshot(snapshot);
+  snapshot_remaker_.loadSnapshot(snapshot);
   tracks_.clear();
 
   std::set<int> used_track_ids;
@@ -1314,6 +1365,7 @@ bool InstanceMapThread::loadObjectGraphSnapshot(const ObjectGraphSnapshot& snaps
     track.geometry_evaluation_reason = object.geometry_evaluation_reason;
     track.source_cameras = object.source_cameras;
     track.observation_timestamps_ns = object.observation_timestamps_ns;
+    track.snapshot = object.snapshot;
     track.near_surface_voxels = object.near_surface_voxels;
     track.label_weights = object.label_weights;
     track.semantic_weights = object.semantic_weights;
@@ -1362,6 +1414,11 @@ void InstanceMapThread::run() {
 }
 
 void InstanceMapThread::applyDetections(const InferenceResponse& response) {
+  if (config_.freeze_instances) {
+    applyFrozenInstanceSnapshotRemake(response);
+    return;
+  }
+
   const auto apply_start = std::chrono::steady_clock::now();
   std::vector<InstanceObservation, Eigen::aligned_allocator<InstanceObservation>> observations;
   observations.reserve(response.detections.size());
@@ -1383,7 +1440,8 @@ void InstanceMapThread::applyDetections(const InferenceResponse& response) {
   for (const RawDetection& detection : response.detections) {
     const std::string label = diagnosticsLabel(detection.label);
     ++raw_by_label[label];
-    std::optional<InstanceObservation> observation = makeObservation(response, detection);
+    std::optional<InstanceObservation> observation =
+        makeObservation(response, detection);
     if (observation) {
       ++observed_by_label[label];
       observations.push_back(std::move(*observation));
@@ -1565,6 +1623,96 @@ void InstanceMapThread::applyDetections(const InferenceResponse& response) {
   }
 }
 
+void InstanceMapThread::applyFrozenInstanceSnapshotRemake(
+    const InferenceResponse& response) {
+  if (!config_.load_scene_graph || !config_.snapshot_remake_enabled) {
+    return;
+  }
+
+  const auto apply_start = std::chrono::steady_clock::now();
+  std::vector<InstanceObservation, Eigen::aligned_allocator<InstanceObservation>> observations;
+  observations.reserve(response.detections.size());
+  std::map<std::string, std::size_t> raw_by_label;
+  std::map<std::string, std::size_t> observed_by_label;
+  std::map<std::string, std::size_t> make_rejected_by_label;
+  std::map<std::string, std::size_t> matched_by_label;
+  std::size_t rejected = 0;
+
+  for (const RawDetection& detection : response.detections) {
+    const std::string label = diagnosticsLabel(detection.label);
+    ++raw_by_label[label];
+    std::optional<InstanceObservation> observation =
+        makeObservation(response, detection);
+    if (observation) {
+      ++observed_by_label[label];
+      observations.push_back(std::move(*observation));
+    } else {
+      ++make_rejected_by_label[label];
+      ++rejected;
+    }
+  }
+
+  std::vector<ObjectSnapshotRemakeCandidate> candidates;
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    candidates.reserve(observations.size());
+    for (const InstanceObservation& observation : observations) {
+      const std::optional<std::size_t> track_index =
+          findBestFrozenTrack(observation);
+      if (!track_index) {
+        continue;
+      }
+      const InstanceTrack& track = tracks_[*track_index];
+      ObjectSnapshotRemakeCandidate candidate;
+      candidate.object_id = track.object_id;
+      candidate.bbox_xyxy = observation.detection.box_xyxy;
+      candidate.bbox_quality = observation.bbox_quality;
+      candidate.time_ns = observation.time_ns;
+      candidate.camera_id = observation.camera_id;
+      candidates.push_back(std::move(candidate));
+      ++matched_by_label[diagnosticsLabel(track.label)];
+    }
+  }
+
+  std::string error;
+  const ObjectSnapshotRemakeFrameResult result =
+      snapshot_remaker_.submitFrame(response.source_rgb_960,
+                                    response.time_ns,
+                                    response.camera_id,
+                                    candidates,
+                                    &error);
+  const double apply_ms = elapsedMs(apply_start, std::chrono::steady_clock::now());
+  std::ostringstream stream;
+  stream << std::fixed << std::setprecision(2)
+         << "remake camera=" << response.camera_id
+         << " t=" << response.time_ns
+         << " raw=" << response.detections.size()
+         << " observed=" << observations.size()
+         << " rejected=" << rejected
+         << " matched=" << candidates.size()
+         << " candidate_count=" << result.candidate_count
+         << " saved_frame=" << (result.saved_frame ? "true" : "false")
+         << " improved_objects=" << result.improved_objects
+         << " first_snapshot_objects=" << result.first_snapshot_objects
+         << " replaced_objects=" << result.replaced_objects
+         << " quality_rejected=" << result.quality_rejected_candidates
+         << " replace_rejected=" << result.replace_rejected_candidates
+         << " apply_ms=" << apply_ms;
+  if (!error.empty()) {
+    stream << " error=" << error;
+  }
+  RunLogger::logGlobal("instance_snapshot_remake", stream.str());
+
+  std::ostringstream detail;
+  detail << "labels camera=" << response.camera_id
+         << " t=" << response.time_ns
+         << " raw=" << formatLabelCounts(raw_by_label)
+         << " observed=" << formatLabelCounts(observed_by_label)
+         << " make_rejected=" << formatLabelCounts(make_rejected_by_label)
+         << " matched=" << formatLabelCounts(matched_by_label);
+  RunLogger::logGlobal("instance_snapshot_remake_detail", detail.str());
+}
+
 std::optional<InstanceObservation> InstanceMapThread::makeObservation(
     const InferenceResponse& response,
     const RawDetection& detection) const {
@@ -1595,6 +1743,43 @@ std::optional<InstanceObservation> InstanceMapThread::makeObservation(
                                                     config_.boxer_input_size,
                                                     &observation.camera_distance_m);
   return observation;
+}
+
+std::optional<std::size_t> InstanceMapThread::findBestFrozenTrack(
+    const InstanceObservation& observation) const {
+  float best_score = -1.0f;
+  std::optional<std::size_t> best_index;
+  for (std::size_t i = 0; i < tracks_.size(); ++i) {
+    const InstanceTrack& track = tracks_[i];
+    if (track.object_id < 0 || !track.publishable) {
+      continue;
+    }
+    if (!semanticCompatible(track, observation)) {
+      continue;
+    }
+
+    const float iou = trackDetectionIou(track, observation.detection);
+    const float distance =
+        (track.center_world - observation.detection.center_world).norm();
+    const bool passes_iou = iou >= config_.instance_match_iou_threshold;
+    const bool passes_distance =
+        config_.instance_match_center_distance_m > 0.0f &&
+        distance <= config_.instance_match_center_distance_m;
+    if (!passes_iou && !passes_distance) {
+      continue;
+    }
+
+    const float distance_score =
+        config_.instance_match_center_distance_m > kEpsilon
+            ? std::max(0.0f, 1.0f - distance / config_.instance_match_center_distance_m)
+            : 0.0f;
+    const float score = iou + 0.25f * distance_score;
+    if (score > best_score) {
+      best_score = score;
+      best_index = i;
+    }
+  }
+  return best_index;
 }
 
 std::optional<std::size_t> InstanceMapThread::findBestTrack(
@@ -1685,7 +1870,8 @@ bool InstanceMapThread::createTrack(const InstanceObservation& observation) {
   }
   updateObjectQualityScore(&track);
   tracks_.push_back(std::move(track));
-  return maybePromoteOrUpdateObject(&tracks_.back());
+  const bool promoted = maybePromoteOrUpdateObject(&tracks_.back());
+  return promoted;
 }
 
 bool InstanceMapThread::updateTrack(InstanceTrack* track,
@@ -1766,7 +1952,8 @@ bool InstanceMapThread::updateTrack(InstanceTrack* track,
     track->state = InstanceTrackState::kStable;
   }
   updateObjectQualityScore(track);
-  return maybePromoteOrUpdateObject(track);
+  const bool promoted = maybePromoteOrUpdateObject(track);
+  return promoted;
 }
 
 void InstanceMapThread::ageUnmatchedTracks(const std::vector<bool>& track_matched,
@@ -1896,6 +2083,10 @@ std::size_t InstanceMapThread::mergeDuplicateStableTracks(
         winner.observation_quality_history.insert(winner.observation_quality_history.end(),
                                                   loser.observation_quality_history.begin(),
                                                   loser.observation_quality_history.end());
+        if (loser.snapshot.valid() &&
+            (!winner.snapshot.valid() || loser.snapshot.quality >= winner.snapshot.quality)) {
+          winner.snapshot = loser.snapshot;
+        }
         appendUniqueVoxelRefs(&winner.near_surface_voxels, loser.near_surface_voxels);
         for (const auto& [label, weight] : loser.label_weights) {
           winner.label_weights[label] += weight;

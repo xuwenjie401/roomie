@@ -444,7 +444,6 @@ PipelineConfig PipelineConfig::declareAndLoad(rclcpp::Node& node) {
                node.declare_parameter<double>(
                    "instance.confirmed_geometry_center_shift_min_extent_m",
                    config.instance_confirmed_geometry_center_shift_min_extent_m)));
-
   config.input_queue_size = positiveSizeOrDefault(
       node.declare_parameter<int>("queues.input_queue_size",
                                   static_cast<int>(config.input_queue_size)),
@@ -503,16 +502,56 @@ PipelineConfig PipelineConfig::declareAndLoad(rclcpp::Node& node) {
       node.declare_parameter<double>("publishing.publish_period_sec",
                                      config.publish_period_sec));
 
-  config.load_instance_map = node.declare_parameter<bool>(
-      "persistence.load_instance_map", config.load_instance_map);
-  config.instance_map_load_path = node.declare_parameter<std::string>(
-      "persistence.instance_map_load_path", config.instance_map_load_path);
-  config.save_instance_map = node.declare_parameter<bool>(
-      "persistence.save_instance_map", config.save_instance_map);
-  config.instance_map_save_path = node.declare_parameter<std::string>(
-      "persistence.instance_map_save_path", config.instance_map_save_path);
+  config.load_scene_graph = node.declare_parameter<bool>(
+      "persistence.load_scene_graph", config.load_scene_graph);
+  config.scene_graph_load_path = node.declare_parameter<std::string>(
+      "persistence.scene_graph_load_path", config.scene_graph_load_path);
+  config.freeze_instances = node.declare_parameter<bool>(
+      "persistence.freeze_instances", config.freeze_instances);
+  config.save_scene_graph = node.declare_parameter<bool>(
+      "persistence.save_scene_graph", config.save_scene_graph);
+  config.scene_graph_save_path = node.declare_parameter<std::string>(
+      "persistence.scene_graph_save_path", config.scene_graph_save_path);
   config.save_dsg_service = node.declare_parameter<std::string>(
       "persistence.save_dsg_service", config.save_dsg_service);
+  config.snapshot_remake_enabled = node.declare_parameter<bool>(
+      "persistence.snapshot_remake_enabled", config.snapshot_remake_enabled);
+  config.snapshot_staging_dir = node.declare_parameter<std::string>(
+      "persistence.snapshot_staging_dir", config.snapshot_staging_dir);
+  config.snapshot_image_subdir = node.declare_parameter<std::string>(
+      "persistence.snapshot_image_subdir", config.snapshot_image_subdir);
+  config.instance_snapshot_first_min_quality = static_cast<float>(std::clamp(
+      node.declare_parameter<double>("persistence.snapshot_first_min_quality",
+                                     config.instance_snapshot_first_min_quality),
+      0.0,
+      1.0));
+  config.instance_snapshot_min_quality = static_cast<float>(std::clamp(
+      node.declare_parameter<double>("persistence.snapshot_min_quality",
+                                     config.instance_snapshot_min_quality),
+      0.0,
+      1.0));
+  config.instance_snapshot_min_box_area_px = static_cast<float>(
+      std::max(0.0,
+               node.declare_parameter<double>("persistence.snapshot_min_box_area_px",
+                                              config.instance_snapshot_min_box_area_px)));
+  config.instance_snapshot_position_weight = static_cast<float>(
+      std::max(0.0,
+               node.declare_parameter<double>("persistence.snapshot_position_weight",
+                                              config.instance_snapshot_position_weight)));
+  config.instance_snapshot_size_weight = static_cast<float>(
+      std::max(0.0,
+               node.declare_parameter<double>("persistence.snapshot_size_weight",
+                                              config.instance_snapshot_size_weight)));
+  config.instance_snapshot_replace_min_quality_delta = static_cast<float>(
+      std::max(0.0,
+               node.declare_parameter<double>(
+                   "persistence.snapshot_replace_min_quality_delta",
+                   config.instance_snapshot_replace_min_quality_delta)));
+  config.instance_snapshot_replace_min_quality_ratio = static_cast<float>(
+      std::max(1.0,
+               node.declare_parameter<double>(
+                   "persistence.snapshot_replace_min_quality_ratio",
+                   config.instance_snapshot_replace_min_quality_ratio)));
 
   config.file_logging_enabled = node.declare_parameter<bool>(
       "logging.enabled", config.file_logging_enabled);

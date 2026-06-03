@@ -120,7 +120,6 @@ struct PipelineConfig {
   float instance_confirmed_geometry_far_center_shift_ratio = 0.08f;
   float instance_confirmed_geometry_far_center_shift_min_m = 0.04f;
   float instance_confirmed_geometry_center_shift_min_extent_m = 0.25f;
-
   std::size_t input_queue_size = 30;
   std::size_t output_queue_size = 2;
   std::size_t sync_queue_size = 30;
@@ -143,11 +142,22 @@ struct PipelineConfig {
   bool freeze_tsdf_map = false;
   bool save_map = false;
   std::string map_save_path;
-  bool load_instance_map = false;
-  std::string instance_map_load_path;
-  bool save_instance_map = true;
-  std::string instance_map_save_path;
+  bool load_scene_graph = false;
+  std::string scene_graph_load_path;
+  bool freeze_instances = false;
+  bool save_scene_graph = true;
+  std::string scene_graph_save_path;
   std::string save_dsg_service = "/roomie/save_dsg";
+  bool snapshot_remake_enabled = false;
+  std::string snapshot_staging_dir = "/tmp/roomie_object_snapshots";
+  std::string snapshot_image_subdir = "snapshots";
+  float instance_snapshot_first_min_quality = 0.05f;
+  float instance_snapshot_min_quality = 0.18f;
+  float instance_snapshot_min_box_area_px = 300.0f;
+  float instance_snapshot_position_weight = 0.5f;
+  float instance_snapshot_size_weight = 0.5f;
+  float instance_snapshot_replace_min_quality_delta = 0.12f;
+  float instance_snapshot_replace_min_quality_ratio = 1.20f;
 
   bool file_logging_enabled = true;
   std::string file_logging_root_dir =

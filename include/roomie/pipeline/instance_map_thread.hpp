@@ -1,13 +1,15 @@
 #pragma once
 
-#include <map>
 #include <mutex>
 #include <optional>
+#include <filesystem>
 #include <string>
 #include <vector>
+#include <map>
 
 #include "roomie/pipeline/interfaces.hpp"
 #include "roomie/dsg/object_graph.hpp"
+#include "roomie/dsg/object_snapshot_remaker.hpp"
 #include "roomie/pipeline/pipeline_config.hpp"
 #include "roomie/pipeline/thread_safe_queue.hpp"
 #include "roomie/pipeline/worker_thread.hpp"
@@ -26,6 +28,10 @@ class InstanceMapThread : public WorkerThread, public InstanceStore {
   std::vector<InstanceRecord, Eigen::aligned_allocator<InstanceRecord>>
   snapshotTrackedInstances() const override;
   ObjectGraphSnapshot snapshotObjectGraph() const override;
+  bool prepareSceneGraphForSave(ObjectGraphSnapshot* snapshot,
+                                const std::filesystem::path& snapshot_image_dir,
+                                const std::string& snapshot_uri_prefix,
+                                std::string* error) const override;
   bool loadObjectGraphSnapshot(const ObjectGraphSnapshot& snapshot, std::string* error = nullptr);
 
  protected:
@@ -33,8 +39,11 @@ class InstanceMapThread : public WorkerThread, public InstanceStore {
 
  private:
   void applyDetections(const InferenceResponse& response);
+  void applyFrozenInstanceSnapshotRemake(const InferenceResponse& response);
   std::optional<InstanceObservation> makeObservation(const InferenceResponse& response,
                                                      const RawDetection& detection) const;
+  std::optional<std::size_t> findBestFrozenTrack(
+      const InstanceObservation& observation) const;
   std::optional<std::size_t> findBestTrack(const InstanceObservation& observation,
                                            const std::vector<bool>& track_reserved) const;
   bool shouldRejectAsDuplicateOfConfirmed(const InstanceObservation& observation) const;
@@ -77,6 +86,7 @@ class InstanceMapThread : public WorkerThread, public InstanceStore {
   std::uint64_t frame_index_ = 0;
   TimeNanoseconds last_geometry_maintenance_ns_ = 0;
   ObjectGraph object_graph_;
+  ObjectSnapshotRemaker snapshot_remaker_;
   std::vector<InstanceTrack, Eigen::aligned_allocator<InstanceTrack>> tracks_;
 };
 

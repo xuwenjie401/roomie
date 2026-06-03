@@ -38,6 +38,7 @@ add_library(
   src/detection_bridge_thread.cpp
   src/dsg/object_graph.cpp
   src/dsg/object_graph_io.cpp
+  src/dsg/object_snapshot_remaker.cpp
   src/image_utils.cpp
   src/instance_map_thread.cpp
   src/map_backend.cpp
@@ -131,6 +132,12 @@ install(PROGRAMS
   scripts/roomie_dsg_viewer.py
   scripts/roomie_offline_room_partition_ui.py
   DESTINATION lib/${PROJECT_NAME})
+
+if(BUILD_TESTING)
+  find_package(ament_cmake_gtest REQUIRED)
+  ament_add_gtest(test_object_snapshots test/test_object_snapshots.cpp)
+  target_link_libraries(test_object_snapshots roomie_pipeline)
+endif()
 
 ament_export_targets(roomie-targets HAS_LIBRARY_TARGET)
 ament_export_dependencies(

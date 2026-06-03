@@ -78,6 +78,10 @@ void ObjectGraph::updateNodeFromTrack(const InstanceTrack& track) {
   appendUnique(&node->source_track_ids, track.track_id);
   appendUniqueVector(&node->source_cameras, track.source_cameras);
   appendUniqueVector(&node->observation_timestamps_ns, track.observation_timestamps_ns);
+  if (track.snapshot.valid() &&
+      (!node->snapshot.valid() || track.snapshot.quality >= node->snapshot.quality)) {
+    node->snapshot = track.snapshot;
+  }
   node->near_surface_voxels = track.near_surface_voxels;
   node->label_weights = track.label_weights;
   node->semantic_weights = track.semantic_weights;
@@ -104,6 +108,9 @@ bool ObjectGraph::removeNode(int object_id) {
 void ObjectGraph::loadSnapshot(const ObjectGraphSnapshot& snapshot) {
   objects_ = snapshot.objects;
   relations_ = snapshot.relations;
+  snapshot_images_ = snapshot.snapshot_images;
+  has_scene_graph_envelope_ = snapshot.has_scene_graph_envelope;
+  scene_graph_json_ = snapshot.scene_graph_json;
   next_object_id_ = snapshot.next_object_id;
   for (const ObjectNode& object : objects_) {
     next_object_id_ = std::max(next_object_id_, object.object_id + 1);
@@ -115,6 +122,9 @@ ObjectGraphSnapshot ObjectGraph::snapshot() const {
   snapshot.next_object_id = next_object_id_;
   snapshot.objects = objects_;
   snapshot.relations = relations_;
+  snapshot.snapshot_images = snapshot_images_;
+  snapshot.has_scene_graph_envelope = has_scene_graph_envelope_;
+  snapshot.scene_graph_json = scene_graph_json_;
   return snapshot;
 }
 
@@ -189,6 +199,7 @@ ObjectNode ObjectGraph::nodeFromTrack(const InstanceTrack& track, int object_id)
   node.source_track_ids.push_back(track.track_id);
   node.source_cameras = track.source_cameras;
   node.observation_timestamps_ns = track.observation_timestamps_ns;
+  node.snapshot = track.snapshot;
   node.near_surface_voxels = track.near_surface_voxels;
   node.label_weights = track.label_weights;
   node.semantic_weights = track.semantic_weights;
@@ -232,6 +243,9 @@ InstanceRecord ObjectGraph::recordFromNode(const ObjectNode& node) {
   record.source_cameras = node.source_cameras;
   record.source_track_ids = node.source_track_ids;
   record.observation_timestamps_ns = node.observation_timestamps_ns;
+  record.snapshot_image_index = node.snapshot.image_index;
+  record.snapshot_bbox_xyxy = node.snapshot.bbox_xyxy;
+  record.snapshot_quality = node.snapshot.quality;
   record.near_surface_voxels = node.near_surface_voxels;
   return record;
 }

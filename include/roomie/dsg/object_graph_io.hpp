@@ -10,10 +10,18 @@ namespace roomie {
 struct ObjectGraphSavePaths {
   std::filesystem::path primary_path;
   std::filesystem::path latest_path;
+  std::filesystem::path snapshot_image_dir;
+  std::string snapshot_uri_prefix;
 };
 
 bool resolveObjectGraphSavePaths(const std::string& configured_path,
                                  TimeNanoseconds saved_time_ns,
+                                 ObjectGraphSavePaths* paths,
+                                 std::string* error);
+
+bool resolveObjectGraphSavePaths(const std::string& configured_path,
+                                 TimeNanoseconds saved_time_ns,
+                                 const std::string& snapshot_image_subdir,
                                  ObjectGraphSavePaths* paths,
                                  std::string* error);
 

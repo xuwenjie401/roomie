@@ -1,12 +1,14 @@
 #include "roomie/dsg/object_graph_io.hpp"
 
 #include <algorithm>
+#include <array>
 #include <cctype>
 #include <chrono>
 #include <cstdint>
 #include <ctime>
 #include <fstream>
 #include <iomanip>
+#include <map>
 #include <sstream>
 #include <utility>
 
@@ -15,7 +17,7 @@
 namespace roomie {
 namespace {
 
-constexpr int kRoomieObjectGraphFormatVersion = 1;
+constexpr int kRoomieObjectGraphFormatVersion = 2;
 constexpr const char* kRoomieObjectGraphFormat = "roomie_object_graph";
 constexpr const char* kRoomieManualSceneGraphFormat = "roomie_manual_scene_graph";
 
@@ -57,12 +59,39 @@ std::string saveTimeSuffix(TimeNanoseconds saved_time_ns) {
   return stream.str();
 }
 
+std::string pathStem(const std::filesystem::path& path) {
+  const std::string stem = path.stem().string();
+  return stem.empty() ? "roomie_dsg" : stem;
+}
+
+std::string cleanSubdir(std::string value) {
+  if (value.empty()) {
+    return "snapshots";
+  }
+  for (char& c : value) {
+    if (c == '\\') {
+      c = '/';
+    }
+  }
+  while (!value.empty() && value.front() == '/') {
+    value.erase(value.begin());
+  }
+  while (!value.empty() && value.back() == '/') {
+    value.pop_back();
+  }
+  return value.empty() ? "snapshots" : value;
+}
+
 json vector3fToJson(const Eigen::Vector3f& value) {
   return json::array({value.x(), value.y(), value.z()});
 }
 
 json vector3iToJson(const Eigen::Vector3i& value) {
   return json::array({value.x(), value.y(), value.z()});
+}
+
+json bboxToJson(const std::array<float, 4>& value) {
+  return json::array({value[0], value[1], value[2], value[3]});
 }
 
 Eigen::Vector3f vector3fFromJson(const json& value) {
@@ -83,6 +112,18 @@ Eigen::Vector3i vector3iFromJson(const json& value) {
   }
   for (int i = 0; i < 3 && i < static_cast<int>(value.size()); ++i) {
     result[i] = value.at(static_cast<std::size_t>(i)).get<int>();
+  }
+  return result;
+}
+
+std::array<float, 4> bboxFromJson(const json& value) {
+  std::array<float, 4> result = {0.0f, 0.0f, 0.0f, 0.0f};
+  if (!value.is_array()) {
+    return result;
+  }
+  for (int i = 0; i < 4 && i < static_cast<int>(value.size()); ++i) {
+    result[static_cast<std::size_t>(i)] =
+        value.at(static_cast<std::size_t>(i)).get<float>();
   }
   return result;
 }
@@ -199,6 +240,60 @@ std::map<int, float> semanticWeightsFromJson(const json& value) {
   return weights;
 }
 
+json snapshotRefToJson(const ObjectSnapshotRef& snapshot) {
+  json value;
+  value["image_index"] = snapshot.image_index;
+  value["bbox_xyxy"] = bboxToJson(snapshot.bbox_xyxy);
+  value["quality"] = snapshot.quality;
+  value["time_ns"] = snapshot.time_ns;
+  value["camera_id"] = snapshot.camera_id;
+  return value;
+}
+
+ObjectSnapshotRef snapshotRefFromJson(const json& value) {
+  ObjectSnapshotRef snapshot;
+  if (!value.is_object()) {
+    return snapshot;
+  }
+  snapshot.image_index = value.value("image_index", -1);
+  snapshot.bbox_xyxy = bboxFromJson(value.value("bbox_xyxy", json::array()));
+  snapshot.quality = value.value("quality", 0.0f);
+  snapshot.time_ns = value.value("time_ns", TimeNanoseconds{0});
+  snapshot.camera_id = value.value("camera_id", std::string());
+  return snapshot;
+}
+
+json snapshotImageToJson(const ObjectSnapshotImage& image) {
+  json value;
+  value["image_index"] = image.image_index;
+  value["uri"] = image.uri;
+  value["width"] = image.width;
+  value["height"] = image.height;
+  value["encoding"] = image.encoding;
+  value["time_ns"] = image.time_ns;
+  value["camera_id"] = image.camera_id;
+  if (!image.source_path.empty()) {
+    value["source_path"] = image.source_path;
+  }
+  return value;
+}
+
+ObjectSnapshotImage snapshotImageFromJson(const json& value) {
+  ObjectSnapshotImage image;
+  if (!value.is_object()) {
+    return image;
+  }
+  image.image_index = value.value("image_index", -1);
+  image.uri = value.value("uri", std::string());
+  image.width = value.value("width", 0);
+  image.height = value.value("height", 0);
+  image.encoding = value.value("encoding", std::string());
+  image.time_ns = value.value("time_ns", TimeNanoseconds{0});
+  image.camera_id = value.value("camera_id", std::string());
+  image.source_path = value.value("source_path", std::string());
+  return image;
+}
+
 json objectNodeToJson(const ObjectNode& object) {
   json value;
   value["object_id"] = object.object_id;
@@ -240,6 +335,9 @@ json objectNodeToJson(const ObjectNode& object) {
   value["source_track_ids"] = vectorToJsonArray(object.source_track_ids);
   value["source_cameras"] = vectorToJsonArray(object.source_cameras);
   value["observation_timestamps_ns"] = vectorToJsonArray(object.observation_timestamps_ns);
+  if (object.snapshot.valid()) {
+    value["snapshot"] = snapshotRefToJson(object.snapshot);
+  }
   value["near_surface_voxels"] = json::array();
   for (const VoxelRef& ref : object.near_surface_voxels) {
     value["near_surface_voxels"].push_back(voxelRefToJson(ref));
@@ -301,6 +399,7 @@ ObjectNode objectNodeFromJson(const json& value) {
       value.value("source_cameras", std::vector<std::string>());
   object.observation_timestamps_ns =
       value.value("observation_timestamps_ns", std::vector<TimeNanoseconds>());
+  object.snapshot = snapshotRefFromJson(value.value("snapshot", json::object()));
 
   const json near_surface_voxels = value.value("near_surface_voxels", json::array());
   if (near_surface_voxels.is_array()) {
@@ -335,9 +434,9 @@ ObjectRelation relationFromJson(const json& value) {
   return relation;
 }
 
-json snapshotToJson(const ObjectGraphSnapshot& snapshot,
-                    const std::string& world_frame,
-                    TimeNanoseconds saved_time_ns) {
+json objectGraphToJson(const ObjectGraphSnapshot& snapshot,
+                       const std::string& world_frame,
+                       TimeNanoseconds saved_time_ns) {
   json root;
   root["format"] = kRoomieObjectGraphFormat;
   root["format_version"] = kRoomieObjectGraphFormatVersion;
@@ -352,10 +451,57 @@ json snapshotToJson(const ObjectGraphSnapshot& snapshot,
   for (const ObjectRelation& relation : snapshot.relations) {
     root["relations"].push_back(relationToJson(relation));
   }
+  root["snapshot_images"] = json::array();
+  for (const ObjectSnapshotImage& image : snapshot.snapshot_images) {
+    root["snapshot_images"].push_back(snapshotImageToJson(image));
+  }
   root["notes"] =
       "near_surface_voxels are cached map-local references for debugging; "
       "runtime geometry checks rebuild object-map coupling from the current map.";
   return root;
+}
+
+void updateTopLevelObjectSnapshots(json* root,
+                                   const ObjectGraphSnapshot& snapshot) {
+  if (root == nullptr || !root->contains("objects") || !root->at("objects").is_array()) {
+    return;
+  }
+  std::map<int, ObjectSnapshotRef> snapshot_by_object_id;
+  for (const ObjectNode& object : snapshot.objects) {
+    snapshot_by_object_id[object.object_id] = object.snapshot;
+  }
+  for (json& object_json : root->at("objects")) {
+    if (!object_json.is_object()) {
+      continue;
+    }
+    const int object_id = object_json.value("object_id", -1);
+    const auto it = snapshot_by_object_id.find(object_id);
+    if (it == snapshot_by_object_id.end() || !it->second.valid()) {
+      object_json.erase("snapshot");
+      continue;
+    }
+    object_json["snapshot"] = snapshotRefToJson(it->second);
+  }
+}
+
+json snapshotToJson(const ObjectGraphSnapshot& snapshot,
+                    const std::string& world_frame,
+                    TimeNanoseconds saved_time_ns) {
+  const json object_graph = objectGraphToJson(snapshot, world_frame, saved_time_ns);
+  if (!snapshot.has_scene_graph_envelope || snapshot.scene_graph_json.empty()) {
+    return object_graph;
+  }
+  try {
+    json root = json::parse(snapshot.scene_graph_json);
+    root["object_graph"] = object_graph;
+    root["world_frame"] = world_frame;
+    root["saved_time_ns"] = saved_time_ns;
+    root["snapshot_images"] = object_graph.value("snapshot_images", json::array());
+    updateTopLevelObjectSnapshots(&root, snapshot);
+    return root;
+  } catch (const std::exception&) {
+    return object_graph;
+  }
 }
 
 ObjectGraphSnapshot snapshotFromJson(const json& root) {
@@ -375,6 +521,13 @@ ObjectGraphSnapshot snapshotFromJson(const json& root) {
     snapshot.relations.reserve(relations.size());
     for (const json& relation_json : relations) {
       snapshot.relations.push_back(relationFromJson(relation_json));
+    }
+  }
+  const json snapshot_images = root.value("snapshot_images", json::array());
+  if (snapshot_images.is_array()) {
+    snapshot.snapshot_images.reserve(snapshot_images.size());
+    for (const json& image_json : snapshot_images) {
+      snapshot.snapshot_images.push_back(snapshotImageFromJson(image_json));
     }
   }
   return snapshot;
@@ -418,20 +571,40 @@ bool resolveObjectGraphSavePaths(const std::string& configured_path,
                                  TimeNanoseconds saved_time_ns,
                                  ObjectGraphSavePaths* paths,
                                  std::string* error) {
+  return resolveObjectGraphSavePaths(configured_path,
+                                     saved_time_ns,
+                                     "snapshots",
+                                     paths,
+                                     error);
+}
+
+bool resolveObjectGraphSavePaths(const std::string& configured_path,
+                                 TimeNanoseconds saved_time_ns,
+                                 const std::string& snapshot_image_subdir,
+                                 ObjectGraphSavePaths* paths,
+                                 std::string* error) {
   if (paths == nullptr) {
     setError(error, "null ObjectGraphSavePaths output");
     return false;
   }
   if (configured_path.empty()) {
-    setError(error, "persistence.instance_map_save_path is empty");
+    setError(error, "persistence.scene_graph_save_path is empty");
     return false;
   }
 
   const std::filesystem::path base_path(configured_path);
+  const std::string snapshot_subdir = cleanSubdir(snapshot_image_subdir);
   paths->primary_path.clear();
   paths->latest_path.clear();
+  paths->snapshot_image_dir.clear();
+  paths->snapshot_uri_prefix.clear();
   if (hasJsonExtension(base_path)) {
     paths->primary_path = base_path;
+    const std::string dir_name = pathStem(base_path) + "_snapshots";
+    paths->snapshot_image_dir =
+        base_path.parent_path().empty() ? std::filesystem::path(dir_name)
+                                        : base_path.parent_path() / dir_name;
+    paths->snapshot_uri_prefix = dir_name;
     return true;
   }
 
@@ -439,6 +612,9 @@ bool resolveObjectGraphSavePaths(const std::string& configured_path,
   filename << "roomie_dsg_" << saveTimeSuffix(saved_time_ns) << ".json";
   paths->primary_path = base_path / filename.str();
   paths->latest_path = base_path / "latest.json";
+  const std::string snapshot_run_dir = pathStem(paths->primary_path);
+  paths->snapshot_image_dir = base_path / snapshot_subdir / snapshot_run_dir;
+  paths->snapshot_uri_prefix = snapshot_subdir + "/" + snapshot_run_dir;
   return true;
 }
 
@@ -515,6 +691,22 @@ bool loadObjectGraphSnapshotJson(const std::filesystem::path& path,
       return false;
     }
     *snapshot = snapshotFromJson(*object_graph_root);
+    if (format == kRoomieManualSceneGraphFormat) {
+      snapshot->has_scene_graph_envelope = true;
+      snapshot->scene_graph_json = root.dump();
+    }
+    const std::filesystem::path base_dir = path.parent_path();
+    for (ObjectSnapshotImage& image : snapshot->snapshot_images) {
+      if (!image.source_path.empty() && std::filesystem::exists(image.source_path)) {
+        continue;
+      }
+      if (image.uri.empty()) {
+        continue;
+      }
+      const std::filesystem::path uri_path(image.uri);
+      image.source_path =
+          (uri_path.is_absolute() ? uri_path : base_dir / uri_path).string();
+    }
     if (world_frame != nullptr) {
       *world_frame = object_graph_root->value(
           "world_frame",

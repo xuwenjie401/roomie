@@ -314,6 +314,9 @@ void DetectionBridgeThread::forwardBackendResponses() {
     if (pending) {
       response.has_camera_pose = true;
       response.T_world_camera = pending->T_world_camera;
+      if (config_.snapshot_remake_enabled) {
+        response.source_rgb_960 = pending->image;
+      }
     }
     double roundtrip_ms = 0.0;
     if (pending) {

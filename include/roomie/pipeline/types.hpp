@@ -168,6 +168,7 @@ struct InferenceResponse {
   float python_postprocess_ms = 0.0f;
   std::vector<Raw2dDetection> filtered_2d_detections;
   std::vector<RawDetection, Eigen::aligned_allocator<RawDetection>> detections;
+  ImageBuffer source_rgb_960;
 };
 
 struct VoxelRef {
@@ -211,6 +212,9 @@ struct InstanceRecord {
   std::vector<std::string> source_cameras;
   std::vector<int> source_track_ids;
   std::vector<TimeNanoseconds> observation_timestamps_ns;
+  int snapshot_image_index = -1;
+  std::array<float, 4> snapshot_bbox_xyxy = {0.0f, 0.0f, 0.0f, 0.0f};
+  float snapshot_quality = 0.0f;
   std::vector<VoxelRef, Eigen::aligned_allocator<VoxelRef>> near_surface_voxels;
 };
 

@@ -1,7 +1,8 @@
 #pragma once
 
-#include <optional>
 #include <memory>
+#include <optional>
+#include <filesystem>
 #include <vector>
 
 #include "roomie/dsg/object_graph.hpp"
@@ -40,6 +41,10 @@ class InstanceStore {
   virtual std::vector<InstanceRecord, Eigen::aligned_allocator<InstanceRecord>>
   snapshotTrackedInstances() const = 0;
   virtual ObjectGraphSnapshot snapshotObjectGraph() const = 0;
+  virtual bool prepareSceneGraphForSave(ObjectGraphSnapshot* snapshot,
+                                        const std::filesystem::path& snapshot_image_dir,
+                                        const std::string& snapshot_uri_prefix,
+                                        std::string* error) const = 0;
 };
 
 }  // namespace roomie

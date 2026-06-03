@@ -100,9 +100,11 @@ def load_pipeline_params(config_path: Path) -> dict[str, Any]:
 
 def resolve_object_graph_path(params: dict[str, Any]) -> Path | None:
   persistence = params.get("persistence", {}) if isinstance(params, dict) else {}
+  if not bool(persistence.get("load_scene_graph", False)):
+    return None
   candidates: list[Path] = []
-  load_path = str(persistence.get("instance_map_load_path", "") or "").strip()
-  save_path = str(persistence.get("instance_map_save_path", "") or "").strip()
+  load_path = str(persistence.get("scene_graph_load_path", "") or "").strip()
+  save_path = str(persistence.get("scene_graph_save_path", "") or "").strip()
   if load_path:
     candidates.append(Path(load_path).expanduser())
   if save_path:
@@ -117,11 +119,21 @@ def resolve_object_graph_path(params: dict[str, Any]) -> Path | None:
   return candidates[0] if candidates else None
 
 
+def resolve_scene_graph_load_path(params: dict[str, Any]) -> Path | None:
+  persistence = params.get("persistence", {}) if isinstance(params, dict) else {}
+  if not bool(persistence.get("load_scene_graph", False)):
+    return None
+  configured = str(persistence.get("scene_graph_load_path", "") or "").strip()
+  if not configured:
+    return None
+  return Path(configured).expanduser()
+
+
 def resolve_scene_graph_save_base(params: dict[str, Any], override: Path | None) -> Path:
   if override is not None:
     return override.expanduser()
   persistence = params.get("persistence", {}) if isinstance(params, dict) else {}
-  configured = str(persistence.get("instance_map_save_path", "") or "").strip()
+  configured = str(persistence.get("scene_graph_save_path", "") or "").strip()
   if configured:
     path = Path(configured).expanduser()
     if path.suffix.lower() == ".json":
@@ -319,11 +331,13 @@ class PartitionState:
                settings: GridSettings,
                room_height_m: float,
                object_graph_path: Path | None,
+               scene_graph_load_path: Path | None,
                scene_graph_save_base: Path):
     self.params = params
     self.settings = settings
     self.room_height_m = room_height_m
     self.object_graph_path = object_graph_path
+    self.scene_graph_load_path = scene_graph_load_path
     self.scene_graph_save_base = scene_graph_save_base
     self.lock = threading.Lock()
     self.grid: GridMap | None = None
@@ -340,7 +354,9 @@ class PartitionState:
     self.load_saved_scene_graph()
 
   def load_saved_scene_graph(self) -> None:
-    path = latest_scene_graph_path(self.scene_graph_save_base)
+    if self.scene_graph_load_path is None:
+      return
+    path = self.scene_graph_load_path
     if not path.exists():
       return
     try:
@@ -428,6 +444,7 @@ class PartitionState:
       saved_path = self.saved_path
       last_error = self.last_error
       object_graph_path = str(self.object_graph_path) if self.object_graph_path else ""
+      scene_graph_load_path = str(self.scene_graph_load_path) if self.scene_graph_load_path else ""
       scene_graph_save_base = str(self.scene_graph_save_base)
     grid_json = None
     if grid is not None:
@@ -458,6 +475,7 @@ class PartitionState:
             "floor_band_m": settings.floor_band_m,
         },
         "object_graph_path": object_graph_path,
+        "scene_graph_load_path": scene_graph_load_path,
         "scene_graph_save_base": scene_graph_save_base,
         "saved_path": saved_path,
         "last_error": last_error,
@@ -1395,12 +1413,14 @@ class OfflineRoomPartitionNode(Node):
         max_grid_cells=args.max_grid_cells,
     )
     object_graph_path = resolve_object_graph_path(params)
+    scene_graph_load_path = resolve_scene_graph_load_path(params)
     save_base = resolve_scene_graph_save_base(params, args.scene_graph_save_path)
     self.state = PartitionState(
         params=params,
         settings=settings,
         room_height_m=args.room_height,
         object_graph_path=object_graph_path,
+        scene_graph_load_path=scene_graph_load_path,
         scene_graph_save_base=save_base,
     )
     self.last_room_marker_ids: set[int] = set()
@@ -1421,8 +1441,8 @@ class OfflineRoomPartitionNode(Node):
     self.timer = self.create_timer(1.0, self.publish_room_markers)
     self.get_logger().info(f"subscribing map surface: {map_topic}")
     self.get_logger().info(f"publishing manual room boxes: {marker_topic}")
-    if object_graph_path is not None:
-      self.get_logger().info(f"using instance map: {object_graph_path}")
+    if scene_graph_load_path is not None:
+      self.get_logger().info(f"loading scene graph: {scene_graph_load_path}")
     self.get_logger().info(f"manual scene graph save base: {save_base}")
     if self.state.rooms:
       self.get_logger().info(f"loaded manual rooms: {len(self.state.rooms)}")

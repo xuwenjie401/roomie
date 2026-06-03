@@ -146,11 +146,22 @@ roomie_pipeline_node:
       publish_period_sec: 5.0
 
     persistence:
-      load_instance_map: false
-      instance_map_load_path: /home/agxi/Datasets/output/jarvis_home/instances/latest.json
-      save_instance_map: true
-      instance_map_save_path: /home/agxi/Datasets/output/jarvis_home/instances/
+      load_scene_graph: false
+      scene_graph_load_path: /home/agxi/Datasets/output/jarvis_home/instances/latest.json
+      freeze_instances: false
+      save_scene_graph: true
+      scene_graph_save_path: /home/agxi/Datasets/output/jarvis_home/instances/
       save_dsg_service: /roomie/save_dsg
+      snapshot_remake_enabled: false
+      snapshot_staging_dir: /tmp/roomie_object_snapshots
+      snapshot_image_subdir: snapshots
+      snapshot_first_min_quality: 0.05
+      snapshot_min_quality: 0.18
+      snapshot_min_box_area_px: 300.0
+      snapshot_position_weight: 0.5
+      snapshot_size_weight: 0.5
+      snapshot_replace_min_quality_delta: 0.12
+      snapshot_replace_min_quality_ratio: 1.20
 
     logging:
       enabled: true

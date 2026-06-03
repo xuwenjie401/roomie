@@ -1,5 +1,6 @@
 #pragma once
 
+#include <array>
 #include <map>
 #include <string>
 #include <vector>
@@ -12,6 +13,27 @@ enum class InstanceTrackState {
   kTentative,
   kStable,
   kInactive,
+};
+
+struct ObjectSnapshotRef {
+  int image_index = -1;
+  std::array<float, 4> bbox_xyxy = {0.0f, 0.0f, 0.0f, 0.0f};
+  float quality = 0.0f;
+  TimeNanoseconds time_ns = 0;
+  std::string camera_id;
+
+  bool valid() const { return image_index >= 0; }
+};
+
+struct ObjectSnapshotImage {
+  int image_index = -1;
+  std::string uri;
+  int width = 0;
+  int height = 0;
+  std::string encoding;
+  TimeNanoseconds time_ns = 0;
+  std::string camera_id;
+  std::string source_path;
 };
 
 struct InstanceObservation {
@@ -81,6 +103,7 @@ struct InstanceTrack {
   std::vector<std::string> source_cameras;
   std::vector<TimeNanoseconds> observation_timestamps_ns;
   std::vector<ObservationQualitySample> observation_quality_history;
+  ObjectSnapshotRef snapshot;
   std::vector<VoxelRef, Eigen::aligned_allocator<VoxelRef>> near_surface_voxels;
   std::map<std::string, float> label_weights;
   std::map<int, float> semantic_weights;
@@ -135,6 +158,7 @@ struct ObjectNode {
   std::vector<int> source_track_ids;
   std::vector<std::string> source_cameras;
   std::vector<TimeNanoseconds> observation_timestamps_ns;
+  ObjectSnapshotRef snapshot;
   std::vector<VoxelRef, Eigen::aligned_allocator<VoxelRef>> near_surface_voxels;
   std::map<std::string, float> label_weights;
   std::map<int, float> semantic_weights;
@@ -144,6 +168,9 @@ struct ObjectGraphSnapshot {
   int next_object_id = 0;
   std::vector<ObjectNode, Eigen::aligned_allocator<ObjectNode>> objects;
   std::vector<ObjectRelation> relations;
+  std::vector<ObjectSnapshotImage> snapshot_images;
+  bool has_scene_graph_envelope = false;
+  std::string scene_graph_json;
 };
 
 class ObjectGraph {
@@ -167,6 +194,9 @@ class ObjectGraph {
   int next_object_id_ = 0;
   std::vector<ObjectNode, Eigen::aligned_allocator<ObjectNode>> objects_;
   std::vector<ObjectRelation> relations_;
+  std::vector<ObjectSnapshotImage> snapshot_images_;
+  bool has_scene_graph_envelope_ = false;
+  std::string scene_graph_json_;
 };
 
 }  // namespace roomie
