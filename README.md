@@ -1,5 +1,5 @@
 <div align="center">
-  <img src="assets/instance_view.png" alt="Roomie object-aware 3D map in RViz" width="100%">
+  <img src="assets/roomie_QA.png" alt="Roomie Scene QA preview" width="100%">
 
   <h1>Roomie</h1>
 
@@ -23,7 +23,7 @@ Instead, Roomie projects near-surface geometry from the maintained 3D map into
 the current camera and builds the 60 x 60 patch-depth input used by the model.
 This keeps detection grounded in the map state rather than a single noisy frame.
 
-<video src="assets/roomie_QA.mp4" controls width="100%"></video>
+<img src="assets/instance_view.png" alt="Roomie object-aware 3D map in RViz" width="100%">
 
 ## Pipeline
 
