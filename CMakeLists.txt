@@ -131,7 +131,10 @@ install(PROGRAMS
   scripts/roomie_python_inference_worker.py
   scripts/roomie_dsg_viewer.py
   scripts/roomie_offline_room_partition_ui.py
+  scripts/roomie_scene_qa.py
+  scripts/roomie_scene_qa_viewer.py
   DESTINATION lib/${PROJECT_NAME})
+install(DIRECTORY scripts/scene_qa DESTINATION lib/${PROJECT_NAME})
 
 if(BUILD_TESTING)
   find_package(ament_cmake_gtest REQUIRED)

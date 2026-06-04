@@ -1,0 +1,14 @@
+{
+  "graph_json": "/home/agxi/Datasets/output/jarvis_home/instances/latest.dam_described.json",
+  "gemini_model": "gemini-flash-latest",
+  "embedding_model": "/home/agxi/huggingface/sentence_t5_large",
+  "embedding_backend": "embedding",
+  "device": "auto",
+  "top_k": 12,
+  "max_iterations": 10,
+  "temperature": 0.2,
+  "max_output_tokens": 4096,
+  "snapshot_max_side_px": 1024,
+  "snapshot_bbox_pad_px": 8,
+  "system_prompt_path": "prompts/system.txt"
+}
