@@ -200,13 +200,17 @@ DetectionBridgeThread::DetectionBridgeThread(
   raw_detection_pub_ = node.create_publisher<visualization_msgs::msg::MarkerArray>(
       config_.raw_detections_topic,
       rclcpp::QoS(1).reliable());
-  RCLCPP_INFO(logger_,
-              "detection bridge enabled: debug_image=%s raw_3d=%s max_fps=%.2f "
-              "min_patch_coverage=%.3f",
-              config_.detection_debug_image_topic.c_str(),
-              config_.raw_detections_topic.c_str(),
-              config_.max_inference_fps,
-              config_.min_patch_coverage_ratio);
+  if (config_.detection_enabled) {
+    RCLCPP_INFO(logger_,
+                "detection bridge enabled: debug_image=%s raw_3d=%s max_fps=%.2f "
+                "min_patch_coverage=%.3f",
+                config_.detection_debug_image_topic.c_str(),
+                config_.raw_detections_topic.c_str(),
+                config_.max_inference_fps,
+                config_.min_patch_coverage_ratio);
+  } else {
+    RCLCPP_INFO(logger_, "detection bridge disabled by config");
+  }
 }
 
 void DetectionBridgeThread::run() {

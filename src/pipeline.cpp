@@ -103,7 +103,7 @@ RoomiePipeline::RoomiePipeline(rclcpp::Node& node, PipelineConfig config)
   mapping_camera.depth_max_m = config_.depth_max_m;
   mapping_camera.mask_robot_threshold = config_.mask_robot_threshold;
   mapping_camera.enable_mapping = true;
-  mapping_camera.enable_detection = true;
+  mapping_camera.enable_detection = config_.detection_enabled;
 
   RosIoSubscriptionConfig ros_io_config;
   ros_io_config.world_frame = config_.world_frame;
@@ -126,10 +126,12 @@ void RoomiePipeline::start() {
     return;
   }
   RunLogger::logGlobal("pipeline", "start");
-  python_backend_.start();
+  if (config_.detection_enabled) {
+    python_backend_.start();
+    detection_bridge_thread_.start();
+  }
   map_thread_.start();
   instance_map_thread_.start();
-  detection_bridge_thread_.start();
   publisher_persistence_thread_.start();
   ros_io_thread_.start();
   started_ = true;
@@ -145,11 +147,15 @@ void RoomiePipeline::stop() {
   detection_queue_.stop();
   mapping_queue_.stop();
   inference_response_queue_.stop();
-  detection_bridge_thread_.stop();
+  if (config_.detection_enabled) {
+    detection_bridge_thread_.stop();
+  }
   publisher_persistence_thread_.stop();
   instance_map_thread_.stop();
   map_thread_.stop();
-  python_backend_.stop();
+  if (config_.detection_enabled) {
+    python_backend_.stop();
+  }
   RunLogger::logGlobal("pipeline", "stopped");
   started_ = false;
 }

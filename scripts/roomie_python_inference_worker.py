@@ -196,6 +196,13 @@ class InferenceRuntime:
         if boxer_repo not in sys.path:
             sys.path.insert(0, boxer_repo)
 
+        # OWLv2 and DINOv3 resolve their companion weights through
+        # BOXER_CKPT_DIR at import time.  Derive it from the explicitly
+        # configured BoxerNet checkpoint so the ROS-launched worker does not
+        # depend on a shell-specific environment variable.
+        boxer_ckpt = os.path.abspath(os.path.expanduser(args.ckpt))
+        os.environ.setdefault("BOXER_CKPT_DIR", os.path.dirname(boxer_ckpt))
+
         import numpy as np
         import torch
         import torch.nn.functional as F

@@ -53,14 +53,15 @@ struct PipelineConfig {
   int patch_depth_zbuffer_splat_radius_cells = 1;
   float patch_depth_zbuffer_front_quantile = 0.25f;
   int patch_depth_zbuffer_min_cells_per_patch = 1;
+  bool detection_enabled = true;
   double max_inference_fps = 10.0;
   bool python_backend_enabled = true;
-  std::string python_executable = "/home/agxi/miniconda3/envs/jarvis/bin/python";
+  std::string python_executable = "/home/lindenbot/miniconda3/envs/jarvis/bin/python";
   std::string python_worker_script =
-      "/home/agxi/RealityLab/jarvis/src/roomie/scripts/roomie_python_inference_worker.py";
-  std::string boxer_repo_path = "/home/agxi/RealityLab/boxer";
+      "/home/lindenbot/RealityLab/jarvis/src/roomie/scripts/roomie_python_inference_worker.py";
+  std::string boxer_repo_path = "/home/lindenbot/RealityLab/boxer";
   std::string boxernet_ckpt_path =
-      "/home/agxi/huggingface/boxer/boxernet_hw960in4x6d768-3e37cfc4.ckpt";
+      "/home/lindenbot/hugging_face/boxer/boxernet_hw960in4x6d768-3e37cfc4.ckpt";
   std::string inference_device = "cuda";
   std::string inference_precision = "auto";
   std::vector<std::string> text_prompts = {"lvisplus"};
@@ -161,7 +162,7 @@ struct PipelineConfig {
 
   bool file_logging_enabled = true;
   std::string file_logging_root_dir =
-      "/home/agxi/RealityLab/jarvis/src/roomie/logs/roomie_runs";
+      "/home/lindenbot/RealityLab/jarvis/src/roomie/logs/roomie_runs";
   double file_logging_period_sec = 2.0;
 
   static PipelineConfig declareAndLoad(rclcpp::Node& node);

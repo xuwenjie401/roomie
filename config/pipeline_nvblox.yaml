@@ -45,10 +45,10 @@ roomie_pipeline_node:
       surface_visualization_distance_vox: 1.0
       surface_cache_rebuild_period_sec: 5.0
       load_map: true
-      map_load_path: /home/agxi/Datasets/output/jarvis_home/nvblox/color_tsdf_map_0526_1639.nvblox
+      map_load_path: /home/lindenbot/Datasets/output/jarvis_home/nvblox/color_tsdf_map_0526_1639.nvblox
       freeze_tsdf_map: true
       save_map: false
-      map_save_path: /home/agxi/Datasets/output/jarvis_home/nvblox/
+      map_save_path: /home/lindenbot/Datasets/output/jarvis_home/nvblox/
 
     detection:
       boxer_input_size: 960
@@ -60,10 +60,10 @@ roomie_pipeline_node:
       patch_depth_zbuffer_min_cells_per_patch: 1
       max_inference_fps: 10.0
       python_backend_enabled: true
-      python_executable: /home/agxi/miniconda3/envs/jarvis/bin/python
-      python_worker_script: /home/agxi/RealityLab/jarvis/src/roomie/scripts/roomie_python_inference_worker.py
-      boxer_repo_path: /home/agxi/RealityLab/boxer
-      boxernet_ckpt_path: /home/agxi/huggingface/boxer/boxernet_hw960in4x6d768-3e37cfc4.ckpt
+      python_executable: /home/lindenbot/miniconda3/envs/jarvis/bin/python
+      python_worker_script: /home/lindenbot/RealityLab/jarvis/src/roomie/scripts/roomie_python_inference_worker.py
+      boxer_repo_path: /home/lindenbot/RealityLab/boxer
+      boxernet_ckpt_path: /home/lindenbot/hugging_face/boxer/boxernet_hw960in4x6d768-3e37cfc4.ckpt
       inference_device: cuda
       inference_precision: auto
       text_prompts: [lvisplus]
@@ -147,14 +147,14 @@ roomie_pipeline_node:
 
     persistence:
       load_scene_graph: true
-      # scene_graph_load_path: /home/agxi/Datasets/output/jarvis_home/instances/roomie_dsg_0601.json
-      scene_graph_load_path: /home/agxi/Datasets/output/jarvis_home/instances/latest.json
+      # scene_graph_load_path: /home/lindenbot/Datasets/output/jarvis_home/instances/roomie_dsg_0601.json
+      scene_graph_load_path: /home/lindenbot/Datasets/output/jarvis_home/instances/latest.json
       freeze_instances: true
       save_scene_graph: true
-      scene_graph_save_path: /home/agxi/Datasets/output/jarvis_home/instances/
+      scene_graph_save_path: /home/lindenbot/Datasets/output/jarvis_home/instances/
       save_dsg_service: /roomie/save_dsg
       snapshot_remake_enabled: true
-      snapshot_staging_dir: /home/agxi/Datasets/output/jarvis_home/snapshots/
+      snapshot_staging_dir: /home/lindenbot/Datasets/output/jarvis_home/snapshots/
       snapshot_image_subdir: snapshots
       snapshot_first_min_quality: 0.05
       snapshot_min_quality: 0.18
@@ -166,5 +166,5 @@ roomie_pipeline_node:
 
     logging:
       enabled: true
-      root_dir: /home/agxi/RealityLab/jarvis/src/roomie/logs/roomie_runs
+      root_dir: /home/lindenbot/RealityLab/jarvis/src/roomie/logs/roomie_runs
       period_sec: 2.0

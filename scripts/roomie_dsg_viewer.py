@@ -21,7 +21,7 @@ import numpy as np
 import yaml
 
 
-DEFAULT_JSON = Path("/home/agxi/Datasets/output/jarvis_home/instances/latest.json")
+DEFAULT_JSON = Path("/home/lindenbot/Datasets/output/jarvis_home/instances/latest.json")
 DEFAULT_CONFIG = Path(__file__).resolve().parents[1] / "config" / "pipeline_nvblox.yaml"
 
 

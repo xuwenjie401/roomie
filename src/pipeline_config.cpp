@@ -161,6 +161,8 @@ PipelineConfig PipelineConfig::declareAndLoad(rclcpp::Node& node) {
       node.declare_parameter<int>("detection.patch_depth_zbuffer_min_cells_per_patch",
                                   config.patch_depth_zbuffer_min_cells_per_patch),
       config.patch_depth_zbuffer_min_cells_per_patch);
+  config.detection_enabled = node.declare_parameter<bool>(
+      "detection.enabled", config.detection_enabled);
   config.max_inference_fps = std::max(
       0.0,
       node.declare_parameter<double>("detection.max_inference_fps",

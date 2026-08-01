@@ -1,0 +1,25 @@
+roomie_agibot_head_rgbd_adapter:
+  ros__parameters:
+    calibration_file: /home/lindenbot/sensor_base/agibot_genie/roomie_base/calib/head_camera_params.yaml
+
+    color_topic: /gdk/camera/head_color
+    depth_topic: /gdk/camera/head_depth
+
+    output_color_topic: /roomie/input/head_color/image_rect
+    output_depth_topic: /roomie/input/head_color/depth_registered
+    output_mask_topic: /roomie/input/head_color/robot_mask
+    output_camera_info_topic: /roomie/input/head_color/camera_info
+    output_frame: head_color
+
+    input_depth_scale: 0.001
+    depth_min_m: 0.1
+    depth_max_m: 6.0
+    sync_tolerance_sec: 0.002
+    sync_queue_size: 60
+    publish_zero_robot_mask: true
+
+    # genie_bag_player already publishes the calibrated transforms on
+    # /tf_static. Enable this when connecting directly to a source which does
+    # not publish the head-camera static tree.
+    publish_static_tf: false
+    status_period_sec: 5.0

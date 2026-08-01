@@ -26,7 +26,7 @@ from roomie_dsg_viewer import (
 
 
 DEFAULT_DAAAM_SRC = Path("/home/agxi/RealityLab/memory_ws/src/daaam/src")
-LOCAL_DAM_MODEL = Path("/home/agxi/huggingface/DAM-3B")
+LOCAL_DAM_MODEL = Path("/home/lindenbot/hugging_face/DAM-3B")
 DEFAULT_QUERY = (
     "Describe only the visible object inside the masked region in detail. "
     "Include its color, material, shape, parts, pose, and distinctive visual "

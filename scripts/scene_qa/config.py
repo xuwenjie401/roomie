@@ -9,9 +9,9 @@ from typing import Any
 
 
 DEFAULT_DESCRIBED_JSON = Path(
-    "/home/agxi/Datasets/output/jarvis_home/instances/latest.dam_described.json"
+    "/home/lindenbot/Datasets/output/jarvis_home/instances/latest.dam_described.json"
 )
-DEFAULT_EMBEDDING_MODEL = Path("/home/agxi/huggingface/sentence_t5_large")
+DEFAULT_EMBEDDING_MODEL = Path("/home/lindenbot/hugging_face/sentence_t5_large")
 DEFAULT_GEMINI_MODEL = "gemini-flash-latest"
 DEFAULT_QA_CONFIG_NAME = "config.json"
 DEFAULT_SYSTEM_PROMPT_PATH = Path("prompts/system.txt")

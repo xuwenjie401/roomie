@@ -267,14 +267,19 @@ void RosIoThread::attachNode(rclcpp::Node& node) {
   tf_static_subscription_.reset();
   tf_buffer_ = std::make_shared<tf2::BufferCore>(
       tf2::durationFromSec(config_.tf_buffer_duration_sec));
-  const auto input_qos =
+  const auto sensor_qos =
       rclcpp::QoS(static_cast<std::size_t>(std::max<std::size_t>(1, config_.input_queue_size)))
-          .reliable();
+          .best_effort()
+          .durability_volatile();
+  const auto tf_qos =
+      rclcpp::QoS(static_cast<std::size_t>(std::max<std::size_t>(1, config_.input_queue_size)))
+          .reliable()
+          .durability_volatile();
 
   if (!config_.tf_topic.empty()) {
     tf_subscription_ = node.create_subscription<tf2_msgs::msg::TFMessage>(
         config_.tf_topic,
-        input_qos,
+        tf_qos,
         [this](tf2_msgs::msg::TFMessage::SharedPtr msg) {
           handleTf(std::move(msg), false);
         });
@@ -304,7 +309,7 @@ void RosIoThread::attachNode(rclcpp::Node& node) {
     if (!camera.rgb_topic.empty()) {
       subscriptions.rgb = node.create_subscription<sensor_msgs::msg::Image>(
           camera.rgb_topic,
-          input_qos,
+          sensor_qos,
           [this, camera_id = camera.camera_id](sensor_msgs::msg::Image::SharedPtr msg) {
             handleRgb(camera_id, std::move(msg));
           });
@@ -312,7 +317,7 @@ void RosIoThread::attachNode(rclcpp::Node& node) {
     if (!camera.robot_mask_topic.empty()) {
       subscriptions.robot_mask = node.create_subscription<sensor_msgs::msg::Image>(
           camera.robot_mask_topic,
-          input_qos,
+          sensor_qos,
           [this, camera_id = camera.camera_id](sensor_msgs::msg::Image::SharedPtr msg) {
             handleRobotMask(camera_id, std::move(msg));
           });
@@ -320,7 +325,7 @@ void RosIoThread::attachNode(rclcpp::Node& node) {
     if (!camera.depth_topic.empty()) {
       subscriptions.depth = node.create_subscription<sensor_msgs::msg::Image>(
           camera.depth_topic,
-          input_qos,
+          sensor_qos,
           [this, camera_id = camera.camera_id](sensor_msgs::msg::Image::SharedPtr msg) {
             handleDepth(camera_id, std::move(msg));
           });
@@ -328,7 +333,7 @@ void RosIoThread::attachNode(rclcpp::Node& node) {
     if (!camera.camera_info_topic.empty()) {
       subscriptions.camera_info = node.create_subscription<sensor_msgs::msg::CameraInfo>(
           camera.camera_info_topic,
-          input_qos,
+          sensor_qos,
           [this, camera_id = camera.camera_id](sensor_msgs::msg::CameraInfo::SharedPtr msg) {
             handleCameraInfo(camera_id, std::move(msg));
           });

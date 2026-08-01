@@ -11,11 +11,11 @@ endif()
 
 option(ROOMIE_ENABLE_NVBLOX "Build the nvblox-backed map backend" OFF)
 set(ROOMIE_NVBLOX_SOURCE_DIR
-    "/home/agxi/RealityLab/map_ws/src/nvblox"
+    "/home/lindenbot/RealityLab/map_ws/src/nvblox"
     CACHE PATH
     "Path to the nvblox source tree used when nvblox is not installed")
 set(ROOMIE_NVBLOX_LIBRARY_DIR
-    "/home/agxi/RealityLab/map_ws/install/nvblox_ros/lib"
+    "/home/lindenbot/RealityLab/map_ws/install/nvblox_ros/lib"
     CACHE PATH
     "Runtime library directory for the local nvblox install")
 
@@ -128,6 +128,7 @@ install(TARGETS roomie_pipeline_node RUNTIME DESTINATION lib/${PROJECT_NAME})
 install(DIRECTORY include/ DESTINATION include/${PROJECT_NAME})
 install(DIRECTORY config launch rviz DESTINATION share/${PROJECT_NAME})
 install(PROGRAMS
+  scripts/roomie_agibot_head_rgbd_adapter.py
   scripts/roomie_python_inference_worker.py
   scripts/roomie_dsg_viewer.py
   scripts/roomie_offline_room_partition_ui.py
@@ -138,8 +139,13 @@ install(DIRECTORY scripts/scene_qa DESTINATION lib/${PROJECT_NAME})
 
 if(BUILD_TESTING)
   find_package(ament_cmake_gtest REQUIRED)
+  find_package(ament_cmake_pytest REQUIRED)
   ament_add_gtest(test_object_snapshots test/test_object_snapshots.cpp)
   target_link_libraries(test_object_snapshots roomie_pipeline)
+  ament_add_pytest_test(
+    test_agibot_head_rgbd_adapter
+    test/test_agibot_head_rgbd_adapter.py
+    TIMEOUT 60)
 endif()
 
 ament_export_targets(roomie-targets HAS_LIBRARY_TARGET)
