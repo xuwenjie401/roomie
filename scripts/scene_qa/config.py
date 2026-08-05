@@ -13,6 +13,8 @@ DEFAULT_DESCRIBED_JSON = Path(
 )
 DEFAULT_EMBEDDING_MODEL = Path("/home/lindenbot/hugging_face/sentence_t5_large")
 DEFAULT_GEMINI_MODEL = "gemini-flash-latest"
+DEFAULT_DOUBAO_MODEL = "doubao-seed-2-0-lite-260215"
+DEFAULT_DOUBAO_BASE_URL = "https://ark.cn-beijing.volces.com/api/v3"
 DEFAULT_QA_CONFIG_NAME = "config.json"
 DEFAULT_SYSTEM_PROMPT_PATH = Path("prompts/system.txt")
 FALLBACK_SYSTEM_PROMPT = """You are a scene understanding assistant for a Roomie 3D scene graph.
@@ -81,6 +83,8 @@ class SceneQaConfig:
 
     graph_json: Path = DEFAULT_DESCRIBED_JSON
     gemini_model: str = DEFAULT_GEMINI_MODEL
+    doubao_model: str = DEFAULT_DOUBAO_MODEL
+    doubao_base_url: str = DEFAULT_DOUBAO_BASE_URL
     embedding_model: Path = DEFAULT_EMBEDDING_MODEL
     embedding_backend: str = "embedding"
     device: str = "auto"
@@ -132,6 +136,10 @@ class SceneQaConfig:
         return cls(
             graph_json=_path_or_default(data.get("graph_json"), defaults.graph_json),
             gemini_model=str(data.get("gemini_model") or defaults.gemini_model),
+            doubao_model=str(data.get("doubao_model") or defaults.doubao_model),
+            doubao_base_url=str(
+                data.get("doubao_base_url") or defaults.doubao_base_url
+            ).rstrip("/"),
             embedding_model=_path_or_default(
                 data.get("embedding_model"), defaults.embedding_model
             ),

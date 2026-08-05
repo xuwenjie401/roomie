@@ -64,7 +64,8 @@ PublisherPersistenceThread::PublisherPersistenceThread(rclcpp::Node& node,
       node_(node),
       instance_store_(instance_store),
       map_thread_(map_thread),
-      config_(std::move(config)) {
+      config_(std::move(config)),
+      save_dsg_jobs_(8, ChannelPolicy::kRejectNewest) {
   object_marker_pub_ = node_.create_publisher<visualization_msgs::msg::MarkerArray>(
       config_.object_markers_topic,
       rclcpp::QoS(1).reliable());
@@ -88,31 +89,53 @@ PublisherPersistenceThread::PublisherPersistenceThread(rclcpp::Node& node,
 }
 
 void PublisherPersistenceThread::run() {
-  const auto period = std::chrono::duration<double>(config_.publish_period_sec);
-  while (!stopRequested()) {
-    const MapBackendSnapshot map_snapshot = map_thread_.debugSnapshot();
-    map_surface_pub_->publish(buildMapSurfaceCloud(map_snapshot));
-    const std_msgs::msg::String map_stats = buildMapStats(map_snapshot);
-    map_stats_pub_->publish(map_stats);
-    object_marker_pub_->publish(buildObjectMarkers());
-    instance_marker_pub_->publish(buildTrackedInstanceMarkers());
+  const auto period = std::chrono::duration_cast<
+      std::chrono::steady_clock::duration>(
+      std::chrono::duration<double>(config_.publish_period_sec));
+  auto next_publish = std::chrono::steady_clock::now();
+  while (!stopRequested() || !save_dsg_jobs_.empty()) {
     const auto now = std::chrono::steady_clock::now();
-    if (now - last_log_time_ >=
-        std::chrono::duration<double>(config_.file_logging_period_sec)) {
-      last_log_time_ = now;
-      RunLogger::logGlobal("map", map_stats.data);
-      const std::size_t object_count = instance_store_.snapshotInstances().size();
-      const std::size_t tracked_instance_count =
-          instance_store_.snapshotTrackedInstances().size();
-      RunLogger::logGlobal("publisher",
-                           "published surface_points=" +
-                               std::to_string(map_snapshot.debug_surface_points.size()) +
-                               " objects=" + std::to_string(object_count) +
-                               " tracked_instances=" +
-                               std::to_string(tracked_instance_count));
+    if (!stopRequested() && now >= next_publish) {
+      const MapBackendSnapshot map_snapshot = map_thread_.debugSnapshot();
+      map_surface_pub_->publish(buildMapSurfaceCloud(map_snapshot));
+      const std_msgs::msg::String map_stats = buildMapStats(map_snapshot);
+      map_stats_pub_->publish(map_stats);
+      object_marker_pub_->publish(buildObjectMarkers());
+      instance_marker_pub_->publish(buildTrackedInstanceMarkers());
+      if (now - last_log_time_ >=
+          std::chrono::duration<double>(config_.file_logging_period_sec)) {
+        last_log_time_ = now;
+        RunLogger::logGlobal("map", map_stats.data);
+        const std::size_t object_count =
+            instance_store_.snapshotInstances().size();
+        const std::size_t tracked_instance_count =
+            instance_store_.snapshotTrackedInstances().size();
+        RunLogger::logGlobal(
+            "publisher",
+            "published surface_points=" +
+                std::to_string(map_snapshot.debug_surface_points.size()) +
+                " objects=" + std::to_string(object_count) +
+                " tracked_instances=" +
+                std::to_string(tracked_instance_count));
+      }
+      next_publish = now + period;
     }
-    std::this_thread::sleep_for(period);
+
+    SaveDsgJob job;
+    const auto wait = stopRequested()
+                          ? std::chrono::milliseconds::zero()
+                          : std::chrono::duration_cast<std::chrono::milliseconds>(
+                                std::max(next_publish -
+                                             std::chrono::steady_clock::now(),
+                                         std::chrono::steady_clock::duration::zero()));
+    if (save_dsg_jobs_.waitPopFor(&job, wait)) {
+      persistSaveDsgJob(std::move(job));
+    }
   }
+}
+
+void PublisherPersistenceThread::onStopRequested() {
+  save_dsg_jobs_.stop();
 }
 
 sensor_msgs::msg::PointCloud2 PublisherPersistenceThread::buildMapSurfaceCloud(
@@ -201,7 +224,7 @@ std_msgs::msg::String PublisherPersistenceThread::buildMapStats(
 
 void PublisherPersistenceThread::handleSaveDsg(
     const std::shared_ptr<std_srvs::srv::Trigger::Request> request,
-    std::shared_ptr<std_srvs::srv::Trigger::Response> response) const {
+    std::shared_ptr<std_srvs::srv::Trigger::Response> response) {
   (void)request;
   const TimeNanoseconds saved_time_ns = node_.now().nanoseconds();
   ObjectGraphSavePaths paths;
@@ -218,8 +241,14 @@ void PublisherPersistenceThread::handleSaveDsg(
     return;
   }
 
-  ObjectGraphSnapshot snapshot;
-  if (!instance_store_.prepareSceneGraphForSave(&snapshot,
+  SaveDsgJob job;
+  job.job_id = next_save_job_id_.fetch_add(1, std::memory_order_relaxed);
+  if (job.job_id == 0) {
+    job.job_id = next_save_job_id_.fetch_add(1, std::memory_order_relaxed);
+  }
+  job.saved_time_ns = saved_time_ns;
+  job.paths = paths;
+  if (!instance_store_.prepareSceneGraphForSave(&job.snapshot,
                                                 paths.snapshot_image_dir,
                                                 paths.snapshot_uri_prefix,
                                                 &error)) {
@@ -230,39 +259,61 @@ void PublisherPersistenceThread::handleSaveDsg(
     return;
   }
 
-  if (!saveObjectGraphSnapshotJsonAtomic(snapshot,
-                                         config_.world_frame,
-                                         saved_time_ns,
-                                         paths.primary_path,
-                                         &error) ||
-      (!paths.latest_path.empty() &&
-       !saveObjectGraphSnapshotJsonAtomic(snapshot,
-                                          config_.world_frame,
-                                          saved_time_ns,
-                                          paths.latest_path,
-                                          &error))) {
+  const std::uint64_t job_id = job.job_id;
+  const std::size_t object_count = job.snapshot.objects.size();
+  const std::filesystem::path primary_path = job.paths.primary_path;
+  const PushResult<SaveDsgJob> queued = save_dsg_jobs_.tryPush(std::move(job));
+  if (!queued.accepted()) {
     response->success = false;
-    response->message = "failed to save DSG: " + error;
+    response->message = "failed to queue DSG export: queue is full or stopping";
     RCLCPP_WARN(node_.get_logger(), "%s", response->message.c_str());
     RunLogger::logGlobal("persistence", response->message);
     return;
   }
 
   std::ostringstream stream;
-  stream << "saved DSG objects=" << snapshot.objects.size()
-         << " relations=" << snapshot.relations.size()
-         << " snapshot_images=" << snapshot.snapshot_images.size()
-         << " path=" << paths.primary_path.string();
-  if (!paths.latest_path.empty()) {
-    stream << " latest=" << paths.latest_path.string();
-  }
-  if (!snapshot.snapshot_images.empty() && !paths.snapshot_image_dir.empty()) {
-    stream << " snapshots=" << paths.snapshot_image_dir.string();
-  }
+  stream << "queued DSG export job=" << job_id
+         << " objects=" << object_count
+         << " path=" << primary_path.string();
   response->success = true;
   response->message = stream.str();
   RCLCPP_INFO(node_.get_logger(), "%s", response->message.c_str());
   RunLogger::logGlobal("persistence", response->message);
+}
+
+void PublisherPersistenceThread::persistSaveDsgJob(SaveDsgJob job) const {
+  std::string error;
+  const bool saved = saveObjectGraphSnapshotJsonAtomic(
+                         job.snapshot, config_.world_frame,
+                         job.saved_time_ns, job.paths.primary_path, &error) &&
+                     (job.paths.latest_path.empty() ||
+                      saveObjectGraphSnapshotJsonAtomic(
+                          job.snapshot, config_.world_frame,
+                          job.saved_time_ns, job.paths.latest_path, &error));
+  if (!saved) {
+    const std::string message =
+        "DSG export job=" + std::to_string(job.job_id) +
+        " failed: " + error;
+    RCLCPP_WARN(node_.get_logger(), "%s", message.c_str());
+    RunLogger::logGlobal("persistence", message);
+    return;
+  }
+
+  std::ostringstream stream;
+  stream << "completed DSG export job=" << job.job_id
+         << " objects=" << job.snapshot.objects.size()
+         << " relations=" << job.snapshot.relations.size()
+         << " snapshot_images=" << job.snapshot.snapshot_images.size()
+         << " path=" << job.paths.primary_path.string();
+  if (!job.paths.latest_path.empty()) {
+    stream << " latest=" << job.paths.latest_path.string();
+  }
+  if (!job.snapshot.snapshot_images.empty() &&
+      !job.paths.snapshot_image_dir.empty()) {
+    stream << " snapshots=" << job.paths.snapshot_image_dir.string();
+  }
+  RCLCPP_INFO(node_.get_logger(), "%s", stream.str().c_str());
+  RunLogger::logGlobal("persistence", stream.str());
 }
 
 visualization_msgs::msg::MarkerArray PublisherPersistenceThread::buildObjectMarkers() const {

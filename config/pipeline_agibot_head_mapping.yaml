@@ -50,7 +50,12 @@ roomie_pipeline_node:
       min_color_weight: 0.1
       surface_visualization_distance_vox: 1.0
       surface_cache_rebuild_period_sec: 1.0
-      load_map: false
+      # Coordinated recovery resolves the immutable nvblox checkpoint from
+      # persistence.scene_store_path. Keep map_load_path unset in this mode;
+      # use map_load_mode: seed plus an explicit path only to import a map from
+      # a different lineage (that intentionally discards durable scene state).
+      load_map: true
+      map_load_mode: coordinated
       freeze_tsdf_map: false
       save_map: true
       map_save_path: /home/lindenbot/Datasets/output/roomie_agibot_head/nvblox/
@@ -84,15 +89,20 @@ roomie_pipeline_node:
       robot_mask_dilate_px: 3
       show_3d_label_score: true
 
+    perception:
+      deadline_ms: 10000
+
+    instance:
+      observation_history_capacity: 256
+
     queues:
       input_queue_size: 60
-      output_queue_size: 2
-      sync_queue_size: 60
       pending_frame_limit: 120
       mapping_queue_size: 30
       detection_queue_size: 2
       inference_request_queue_size: 1
       inference_response_queue_size: 1
+      shutdown_drain_timeout_ms: 5000
 
     sync:
       max_image_stamp_delta_sec: 0.002
@@ -104,7 +114,67 @@ roomie_pipeline_node:
     publishing:
       publish_period_sec: 1.0
 
+    artifacts:
+      # Keep the default mapping-only launch free of semantic worker startup.
+      # The launch file enables this complete chain together with Boxer.
+      snapshot_enabled: false
+      asset_store_root: /home/lindenbot/Datasets/output/roomie_agibot_head/assets
+      snapshot_top_k: 3
+      snapshot_queue_size: 32
+      snapshot_control_queue_size: 64
+      snapshot_minimum_quality: 0.02
+      snapshot_azimuth_bucket_degrees: 45.0
+      snapshot_elevation_bucket_degrees: 30.0
+      snapshot_scale_bucket_ratio: 1.41421356
+      snapshot_diversity_min_quality_ratio: 0.65
+      asset_gc_grace_period_sec: 300.0
+      asset_gc_period_ms: 60000
+      dam_enabled: false
+      dam_model_id: nvidia-dam-3b-official-v1
+      dam_prompt_hash: ""
+      dam_output_schema_version: roomie.dam.v1
+      dam_python_executable: /home/lindenbot/RealityLab/.venvs/roomie-dam/bin/python
+      dam_worker_script: /home/lindenbot/RealityLab/jarvis/src/roomie/scripts/roomie_python_dam_worker.py
+      dam_source: /home/lindenbot/RealityLab/describe-anything
+      dam_model_path: /home/lindenbot/hugging_face/DAM-3B
+      dam_conversation_mode: v1
+      dam_prompt_mode: full+focal_crop
+      dam_query: |-
+        <image>
+        Describe only the visible object inside the masked region in detail.
+        Include its color, material, shape, parts, pose, and distinctive visual
+        details. Do not describe unrelated background.
+      dam_max_new_tokens: 256
+      dam_temperature: 0.2
+      dam_top_p: 0.9
+      dam_bbox_pad_px: 2.0
+      dam_startup_timeout_ms: 120000
+      dam_request_timeout_ms: 120000
+      dam_shutdown_timeout_ms: 500
+      new_object_window_ms: 10000
+      new_object_interactive_limit: 5
+      embedding_enabled: false
+      embedding_model_id: sentence-t5-large.local.v1
+      embedding_dimension: 768
+      embedding_python_executable: /home/lindenbot/miniconda3/envs/jarvis/bin/python
+      embedding_worker_script: /home/lindenbot/RealityLab/jarvis/src/roomie/scripts/roomie_sentence_transformer_worker.py
+      embedding_model_path: /home/lindenbot/hugging_face/sentence_t5_large
+      embedding_device: cpu
+      embedding_batch_size: 16
+      embedding_record_history_capacity: 1024
+      embedding_startup_timeout_ms: 120000
+      embedding_request_timeout_ms: 120000
+      embedding_shutdown_timeout_ms: 500
+
     persistence:
+      scene_store_enabled: true
+      scene_store_path: /home/lindenbot/Datasets/output/roomie_agibot_head/roomie_scene.sqlite3
+      scene_store_flush_period_ms: 1000
+      scene_store_flush_batch_size: 16
+      scene_store_queue_size: 64
+      scene_store_soft_lag_revisions: 32
+      scene_store_hard_lag_revisions: 64
+      scene_store_terminal_failure_timeout_ms: 5000
       load_scene_graph: false
       freeze_instances: false
       # The launch file overrides this to true with enable_boxer:=true.

@@ -14,6 +14,7 @@ import cv2
 from geometry_msgs.msg import TransformStamped
 import numpy as np
 import rclpy
+from rclpy.executors import ExternalShutdownException
 from rclpy.node import Node
 from rclpy.qos import (
     DurabilityPolicy,
@@ -758,7 +759,7 @@ def main(args: list[str] | None = None) -> None:
     try:
         node = AgibotHeadRgbdAdapter()
         rclpy.spin(node)
-    except KeyboardInterrupt:
+    except (KeyboardInterrupt, ExternalShutdownException):
         pass
     finally:
         if node is not None:

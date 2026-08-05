@@ -1,7 +1,8 @@
-#include <filesystem>
-#include <fstream>
+#include <atomic>
 #include <chrono>
 #include <cstdint>
+#include <filesystem>
+#include <fstream>
 #include <memory>
 #include <optional>
 #include <string>
@@ -29,10 +30,25 @@ std::filesystem::path makeTempDir(const std::string& name) {
 ObjectSnapshotRef makeRef(int image_index, float quality) {
   ObjectSnapshotRef ref;
   ref.image_index = image_index;
+  ref.source_frame_asset_id = "sha256-frame";
+  ref.evidence_hash = "sha256-evidence";
   ref.bbox_xyxy = {1.0f, 1.0f, 5.0f, 5.0f};
+  ref.crop_xywh = {1.0f, 1.0f, 4.0f, 4.0f};
+  ref.crop_output_scale = {2.0f, 2.0f};
+  ref.mask_source = "bbox_fallback";
   ref.quality = quality;
+  ref.quality_components["blur"] = 0.9f;
+  ref.viewpoint_azimuth_rad = 0.25f;
+  ref.viewpoint_elevation_rad = -0.1f;
+  ref.viewpoint_scale = 0.2f;
   ref.time_ns = 123;
   ref.camera_id = "head";
+  ref.provenance.run_id = RunId{11, 12};
+  ref.provenance.frame_id = 13;
+  ref.provenance.request_id = 14;
+  ref.provenance.sensor_time_ns = 123;
+  ref.provenance.includes_current_frame = true;
+  ref.provenance.causality_verified = true;
   return ref;
 }
 
@@ -60,18 +76,14 @@ ImageBuffer makeRgbImage(int width, int height) {
 
 class FakeMapProjector final : public MapProjector {
  public:
-  bool enqueueMappingFrame(MappingFrame) override { return true; }
+  bool enqueueFrameBundle(FrameBundlePtr) override { return true; }
 
-  std::optional<PatchDepth> projectPatchDepth(const DetectionFrame&) override {
+  std::optional<PatchDepth> projectPatchDepth(const FrameBundle&) override {
     return std::nullopt;
   }
 
   MapBackendSnapshot snapshotSurfacePoints() const override {
     return MapBackendSnapshot{};
-  }
-
-  std::shared_ptr<const GeometrySurfaceCache> geometrySurfaceCache() const override {
-    return nullptr;
   }
 
   std::vector<VoxelRef, Eigen::aligned_allocator<VoxelRef>>
@@ -121,6 +133,15 @@ TEST(ObjectGraphIo, SnapshotJsonRoundTrip) {
   ASSERT_EQ(loaded.objects.size(), 1U);
   ASSERT_TRUE(loaded.objects.front().snapshot.valid());
   EXPECT_EQ(loaded.objects.front().snapshot.image_index, 0);
+  EXPECT_EQ(loaded.objects.front().snapshot.source_frame_asset_id,
+            "sha256-frame");
+  EXPECT_EQ(loaded.objects.front().snapshot.evidence_hash,
+            "sha256-evidence");
+  EXPECT_EQ(loaded.objects.front().snapshot.crop_xywh,
+            (std::array<float, 4>{1.0f, 1.0f, 4.0f, 4.0f}));
+  EXPECT_EQ(loaded.objects.front().snapshot.quality_components.at("blur"),
+            0.9f);
+  EXPECT_EQ(loaded.objects.front().snapshot.provenance.frame_id, 13u);
   ASSERT_EQ(loaded.snapshot_images.size(), 1U);
   EXPECT_EQ(loaded.snapshot_images.front().uri, "snapshots/snapshot_0000.bmp");
   EXPECT_TRUE(std::filesystem::exists(loaded.snapshot_images.front().source_path));
@@ -177,7 +198,10 @@ TEST(ObjectGraphIo, ManualSceneGraphPreservesEnvelopeWhenSavingSnapshots) {
   root["rooms"] = nlohmann::json::array(
       {{{"room_id", 3}, {"name", "kitchen"}, {"object_ids", nlohmann::json::array({7})}}});
   root["objects"] = nlohmann::json::array(
-      {{{"object_id", 7}, {"label", "chair"}, {"room_id", 3}}});
+      {{{"object_id", 7},
+        {"label", "chair"},
+        {"description", "human-authored note"},
+        {"room_id", 3}}});
   root["object_graph"] = {
       {"format", "roomie_object_graph"},
       {"format_version", 2},
@@ -207,6 +231,7 @@ TEST(ObjectGraphIo, ManualSceneGraphPreservesEnvelopeWhenSavingSnapshots) {
       << error;
   ASSERT_TRUE(loaded.has_scene_graph_envelope);
   ASSERT_EQ(loaded.objects.size(), 1U);
+  EXPECT_EQ(loaded.objects.front().description, "human-authored note");
   loaded.objects.front().snapshot = makeRef(0, 0.82f);
   ObjectSnapshotImage image;
   image.image_index = 0;
@@ -230,12 +255,141 @@ TEST(ObjectGraphIo, ManualSceneGraphPreservesEnvelopeWhenSavingSnapshots) {
   ASSERT_TRUE(saved_stream);
   const nlohmann::json saved = nlohmann::json::parse(saved_stream);
   EXPECT_EQ(saved.value("format", std::string()), "roomie_manual_scene_graph");
+  EXPECT_EQ(saved.value("format_version", 0), 3);
+  EXPECT_FALSE(saved.contains("object_graph"));
   ASSERT_TRUE(saved.contains("rooms"));
   EXPECT_EQ(saved.at("rooms").at(0).value("room_id", -1), 3);
-  ASSERT_TRUE(saved.at("object_graph").at("objects").at(0).contains("snapshot"));
+  ASSERT_EQ(saved.at("objects").size(), 1U);
   ASSERT_TRUE(saved.at("objects").at(0).contains("snapshot"));
   ASSERT_TRUE(saved.contains("snapshot_images"));
   EXPECT_EQ(saved.at("snapshot_images").size(), 1U);
+  ASSERT_TRUE(saved.contains("migration_warnings"));
+  EXPECT_FALSE(saved.at("migration_warnings").empty());
+
+  ObjectGraphSnapshot reloaded;
+  ASSERT_TRUE(loadObjectGraphSnapshotJson(
+      saved_path, &reloaded, &world_frame, &error)) << error;
+  ASSERT_EQ(reloaded.objects.size(), 1U);
+  EXPECT_EQ(reloaded.objects.front().description, "human-authored note");
+  ASSERT_EQ(reloaded.rooms.size(), 1U);
+}
+
+TEST(ObjectGraphIo, ManualEnvelopeRejectsConflictingDuplicateObjects) {
+  const std::filesystem::path dir =
+      makeTempDir("manual_scene_graph_object_conflict");
+  const std::filesystem::path path = dir / "manual_scene_graph.json";
+  nlohmann::json root;
+  root["format"] = "roomie_manual_scene_graph";
+  root["format_version"] = 1;
+  root["objects"] = nlohmann::json::array(
+      {{{"object_id", 7}, {"label", "table"}}});
+  root["object_graph"] = {
+      {"format", "roomie_object_graph"},
+      {"format_version", 2},
+      {"objects", nlohmann::json::array(
+                      {{{"object_id", 7}, {"label", "chair"}}})},
+      {"relations", nlohmann::json::array()},
+  };
+  {
+    std::ofstream stream(path, std::ios::out | std::ios::trunc);
+    stream << root.dump(2) << '\n';
+  }
+
+  ObjectGraphSnapshot loaded;
+  std::string world_frame;
+  std::string error;
+  EXPECT_FALSE(loadObjectGraphSnapshotJson(path, &loaded, &world_frame,
+                                           &error));
+  EXPECT_NE(error.find("object conflict"), std::string::npos) << error;
+  EXPECT_NE(error.find("label"), std::string::npos) << error;
+}
+
+TEST(ObjectGraphIo, LegacyV1AndSchemaV3TypedRoomsRelationsAreCompatible) {
+  const std::filesystem::path dir = makeTempDir("schema_v1_v3_compat");
+  const std::filesystem::path legacy_path = dir / "legacy_v1.json";
+  nlohmann::json legacy = {
+      {"format", "roomie_object_graph"},
+      {"format_version", 1},
+      {"world_frame", "map"},
+      {"next_object_id", 2},
+      {"objects", nlohmann::json::array(
+                      {{{"object_id", 1}, {"label", "cup"}}})},
+      {"relations", nlohmann::json::array()},
+  };
+  {
+    std::ofstream stream(legacy_path, std::ios::out | std::ios::trunc);
+    stream << legacy.dump(2) << '\n';
+  }
+  ObjectGraphSnapshot loaded_v1;
+  std::string world_frame;
+  std::string error;
+  ASSERT_TRUE(loadObjectGraphSnapshotJson(
+      legacy_path, &loaded_v1, &world_frame, &error)) << error;
+  ASSERT_EQ(loaded_v1.objects.size(), 1U);
+  EXPECT_TRUE(loaded_v1.objects.front().description.empty());
+
+  RoomNode room;
+  room.room_id = 9;
+  room.revision = 4;
+  room.label = "kitchen";
+  room.center_world = Eigen::Vector3f(1.0f, 2.0f, 1.5f);
+  room.size_m = Eigen::Vector3f(4.0f, 5.0f, 3.0f);
+  room.min_xy = {-1.0f, -0.5f};
+  room.max_xy = {3.0f, 4.5f};
+  room.has_xy_bounds = true;
+  loaded_v1.rooms.push_back(room);
+  ObjectRelation containment;
+  setRelationEndpoints(
+      &containment, SceneEntityRef{SceneEntityType::kRoom, 9},
+      SceneEntityRef{SceneEntityType::kObject, 1});
+  containment.relation_type = "room_contains_object";
+  containment.confidence = 1.0f;
+  containment.revision = 5;
+  containment.derived = true;
+  loaded_v1.relations.push_back(containment);
+
+  const std::filesystem::path v3_path = dir / "canonical_v3.json";
+  ASSERT_TRUE(saveObjectGraphSnapshotJsonAtomic(
+      loaded_v1, "map", 456, v3_path, &error)) << error;
+  std::ifstream stream(v3_path);
+  const nlohmann::json v3 = nlohmann::json::parse(stream);
+  EXPECT_EQ(v3.value("format_version", 0), 3);
+  ASSERT_EQ(v3.at("objects").size(), 1U);
+  ASSERT_EQ(v3.at("rooms").size(), 1U);
+  ASSERT_EQ(v3.at("relations").size(), 1U);
+  EXPECT_EQ(v3.at("relations").at(0).at("source").value(
+                "type", std::string()), "room");
+  EXPECT_TRUE(v3.at("objects").at(0).value(
+                  "description", std::string("unexpected")).empty());
+
+  ObjectGraphSnapshot loaded_v3;
+  ASSERT_TRUE(loadObjectGraphSnapshotJson(
+      v3_path, &loaded_v3, &world_frame, &error)) << error;
+  ASSERT_EQ(loaded_v3.rooms.size(), 1U);
+  ASSERT_EQ(loaded_v3.relations.size(), 1U);
+  EXPECT_EQ(relationSource(loaded_v3.relations.front()).type,
+            SceneEntityType::kRoom);
+  EXPECT_EQ(relationTarget(loaded_v3.relations.front()).id, 1);
+}
+
+TEST(ObjectGraph, DescriptionIsNotSynthesizedFromDetectorLabel) {
+  ObjectGraph graph;
+  InstanceTrack track;
+  track.track_id = 4;
+  track.state = InstanceTrackState::kStable;
+  track.label = "detector chair";
+  const int object_id = graph.createNodeFromTrack(track);
+  ObjectGraphSnapshot created = graph.snapshot();
+  ASSERT_EQ(created.objects.size(), 1U);
+  EXPECT_TRUE(created.objects.front().description.empty());
+
+  track.object_id = object_id;
+  track.label = "updated chair";
+  graph.updateNodeFromTrack(track);
+  const ObjectGraphSnapshot updated = graph.snapshot();
+  ASSERT_EQ(updated.objects.size(), 1U);
+  EXPECT_EQ(updated.objects.front().label, "updated chair");
+  EXPECT_TRUE(updated.objects.front().description.empty());
 }
 
 TEST(ObjectSnapshotRemaker, KeepsOnlySignificantObjectSnapshotImprovements) {
@@ -414,6 +568,76 @@ TEST(InstanceMapThread, FrozenSnapshotRemakeMatchesInactivePublishableObjects) {
   ASSERT_EQ(saved.snapshot_images.size(), 1U);
   EXPECT_TRUE(std::filesystem::exists(saved.snapshot_images.front().source_path));
   EXPECT_EQ(saved.objects.front().snapshot.camera_id, "head");
+}
+
+TEST(InstanceMapThread,
+     PersistenceAdmissionAndTerminalSinkFuseRejectBeforeReducer) {
+  PipelineConfig config;
+  ThreadSafeQueue<InferenceResponse> queue(4);
+  FakeMapProjector projector;
+  InstanceMapThread instance_map(queue, projector, config);
+
+  ObjectGraphSnapshot loaded;
+  loaded.objects.push_back(makeObject(7));
+  std::string error;
+  ASSERT_TRUE(instance_map.loadObjectGraphSnapshot(loaded, &error)) << error;
+  const SceneRevision loaded_revision = instance_map.sceneSnapshot().revision();
+
+  std::atomic_bool admission_allowed{false};
+  std::atomic_int sink_calls{0};
+  instance_map.setSceneContentAdmission(
+      [&admission_allowed]() { return admission_allowed.load(); });
+  instance_map.setSceneCommitSink(
+      [&sink_calls](const SceneApplyResult&) {
+        ++sink_calls;
+        return false;
+      });
+  instance_map.start();
+
+  ApplyHumanAnnotationCommand blocked;
+  blocked.object_id = 7;
+  blocked.patch.label = "blocked";
+  const auto blocked_result = instance_map.applySceneCommandAndWait(
+      SceneCommand{blocked}, std::chrono::seconds(1));
+  ASSERT_TRUE(blocked_result.has_value());
+  EXPECT_EQ(blocked_result->status, SceneApplyStatus::kRejected);
+  EXPECT_NE(blocked_result->reason.find("persistence admission"),
+            std::string::npos);
+  EXPECT_EQ(blocked_result->revision, loaded_revision);
+  EXPECT_EQ(sink_calls.load(), 0);
+
+  admission_allowed.store(true);
+  ApplyHumanAnnotationCommand first = blocked;
+  first.patch.label = "committed once";
+  const auto committed = instance_map.applySceneCommandAndWait(
+      SceneCommand{first}, std::chrono::seconds(1));
+  ASSERT_TRUE(committed.has_value());
+  ASSERT_TRUE(committed->committedRevision()) << committed->reason;
+  EXPECT_EQ(committed->revision, loaded_revision + 1);
+  EXPECT_EQ(sink_calls.load(), 1);
+
+  ApplyHumanAnnotationCommand after_fuse = blocked;
+  after_fuse.patch.label = "must not commit";
+  const auto rejected = instance_map.applySceneCommandAndWait(
+      SceneCommand{after_fuse}, std::chrono::seconds(1));
+  ASSERT_TRUE(rejected.has_value());
+  EXPECT_EQ(rejected->status, SceneApplyStatus::kRejected);
+  EXPECT_NE(rejected->reason.find("commit fuse"), std::string::npos);
+  EXPECT_EQ(rejected->revision, committed->revision);
+  EXPECT_EQ(sink_calls.load(), 1);
+
+  AdvanceSurfaceCommand advance;
+  advance.surface.map_epoch = RunId{4, 5};
+  advance.surface.surface_revision = 1;
+  advance.surface.source_map_revision = 1;
+  const auto metadata = instance_map.applySceneCommandAndWait(
+      SceneCommand{advance}, std::chrono::seconds(1));
+  ASSERT_TRUE(metadata.has_value());
+  EXPECT_EQ(metadata->status, SceneApplyStatus::kMetadataUpdated);
+  EXPECT_EQ(metadata->revision, committed->revision);
+  EXPECT_EQ(sink_calls.load(), 1);
+
+  instance_map.stop();
 }
 
 }  // namespace

@@ -1,6 +1,7 @@
 #pragma once
 
 #include <array>
+#include <cstdint>
 #include <map>
 #include <string>
 #include <vector>
@@ -17,12 +18,27 @@ enum class InstanceTrackState {
 
 struct ObjectSnapshotRef {
   int image_index = -1;
+  // Online snapshots address the durable full-frame PNG directly. A legacy
+  // image_index may coexist for v1/v2 JSON viewers.
+  std::string source_frame_asset_id;
+  std::string evidence_hash;
   std::array<float, 4> bbox_xyxy = {0.0f, 0.0f, 0.0f, 0.0f};
+  std::array<float, 4> crop_xywh = {0.0f, 0.0f, 0.0f, 0.0f};
+  std::array<float, 2> crop_output_scale = {1.0f, 1.0f};
+  std::string mask_source = "bbox_fallback";
+  std::string mask_ref;
   float quality = 0.0f;
+  std::map<std::string, float> quality_components;
+  float viewpoint_azimuth_rad = 0.0f;
+  float viewpoint_elevation_rad = 0.0f;
+  float viewpoint_scale = 1.0f;
   TimeNanoseconds time_ns = 0;
   std::string camera_id;
+  FrameProvenance provenance;
 
-  bool valid() const { return image_index >= 0; }
+  bool valid() const {
+    return image_index >= 0 || !source_frame_asset_id.empty();
+  }
 };
 
 struct ObjectSnapshotImage {
@@ -110,11 +126,83 @@ struct InstanceTrack {
 };
 
 struct ObjectRelation {
+  // Legacy object-object endpoints. They remain populated for v1/v2 readers,
+  // while source/target below are authoritative for schema v3 and can also
+  // address rooms.
   int source_object_id = -1;
   int target_object_id = -1;
   std::string relation_type;
   float confidence = 0.0f;
   std::string description;
+  enum class EntityType {
+    kObject,
+    kRoom,
+  };
+  struct EntityRef {
+    EntityType type = EntityType::kObject;
+    int id = -1;
+
+    bool valid() const { return id >= 0; }
+    bool operator==(const EntityRef& other) const {
+      return type == other.type && id == other.id;
+    }
+    bool operator!=(const EntityRef& other) const {
+      return !(*this == other);
+    }
+  };
+  EntityRef source;
+  EntityRef target;
+  std::uint64_t revision = 0;
+  bool derived = false;
+};
+
+using SceneEntityType = ObjectRelation::EntityType;
+using SceneEntityRef = ObjectRelation::EntityRef;
+
+inline SceneEntityRef relationSource(const ObjectRelation& relation) {
+  if (relation.source.valid()) {
+    return relation.source;
+  }
+  return SceneEntityRef{SceneEntityType::kObject,
+                        relation.source_object_id};
+}
+
+inline SceneEntityRef relationTarget(const ObjectRelation& relation) {
+  if (relation.target.valid()) {
+    return relation.target;
+  }
+  return SceneEntityRef{SceneEntityType::kObject,
+                        relation.target_object_id};
+}
+
+inline void setRelationEndpoints(ObjectRelation* relation,
+                                 SceneEntityRef source,
+                                 SceneEntityRef target) {
+  if (relation == nullptr) {
+    return;
+  }
+  relation->source = source;
+  relation->target = target;
+  relation->source_object_id =
+      source.type == SceneEntityType::kObject ? source.id : -1;
+  relation->target_object_id =
+      target.type == SceneEntityType::kObject ? target.id : -1;
+}
+
+struct RoomNode {
+  EIGEN_MAKE_ALIGNED_OPERATOR_NEW
+
+  int room_id = -1;
+  std::uint64_t revision = 0;
+  std::string label;
+  std::string color;
+  Eigen::Vector3f center_world = Eigen::Vector3f::Zero();
+  Eigen::Vector3f size_m = Eigen::Vector3f::Zero();
+  std::array<float, 2> min_xy = {0.0f, 0.0f};
+  std::array<float, 2> max_xy = {0.0f, 0.0f};
+  bool has_xy_bounds = false;
+  float height_m = 0.0f;
+  std::map<std::string, std::string> attributes;
 };
 
 struct ObjectNode {
@@ -165,10 +253,13 @@ struct ObjectNode {
 };
 
 struct ObjectGraphSnapshot {
+  int schema_version = 3;
   int next_object_id = 0;
   std::vector<ObjectNode, Eigen::aligned_allocator<ObjectNode>> objects;
+  std::vector<RoomNode, Eigen::aligned_allocator<RoomNode>> rooms;
   std::vector<ObjectRelation> relations;
   std::vector<ObjectSnapshotImage> snapshot_images;
+  std::vector<std::string> import_warnings;
   bool has_scene_graph_envelope = false;
   std::string scene_graph_json;
 };
@@ -193,8 +284,10 @@ class ObjectGraph {
 
   int next_object_id_ = 0;
   std::vector<ObjectNode, Eigen::aligned_allocator<ObjectNode>> objects_;
+  std::vector<RoomNode, Eigen::aligned_allocator<RoomNode>> rooms_;
   std::vector<ObjectRelation> relations_;
   std::vector<ObjectSnapshotImage> snapshot_images_;
+  std::vector<std::string> import_warnings_;
   bool has_scene_graph_envelope_ = false;
   std::string scene_graph_json_;
 };

@@ -11,14 +11,15 @@ class CpuPointMapBackend : public MapBackend {
  public:
   explicit CpuPointMapBackend(PipelineConfig config);
 
-  void integrateFrame(const MappingFrame& frame) override;
+  MapIntegrationResult integrateFrame(const FrameBundle& frame) override;
+  SurfaceRefreshResult refreshSurface(const MapIntegrationResult& integration,
+                                      bool force_full_rebuild) override;
   MapBackendSnapshot snapshot() const override;
-  std::shared_ptr<const GeometrySurfaceCache> geometrySurfaceCache() const override;
   std::vector<VoxelRef, Eigen::aligned_allocator<VoxelRef>> collectNearSurfaceVoxels(
       const RawDetection& detection) const override;
 
  private:
-  void appendDepthFramePoints(const MappingFrame& frame);
+  void appendDepthFramePoints(const FrameBundle& frame);
 
   PipelineConfig config_;
   mutable std::mutex mutex_;

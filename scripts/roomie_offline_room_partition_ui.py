@@ -1,4 +1,12 @@
 #!/usr/bin/env python3
+"""DEPRECATED compatibility-only room editor.
+
+This tool exports legacy/manual scene-graph JSON; that file is not the live
+authoritative Roomie scene. New integrations must submit versioned room patches
+to /roomie/mutate_scene so SceneReducer derives containment and persists the
+result through the single-writer path.
+"""
+
 from __future__ import annotations
 
 import argparse
@@ -846,7 +854,7 @@ button.danger { border-color: #8f4c4c; color: #ffb3b3; }
 <body>
 <main>
   <div class="topbar">
-    <strong>Manual Rooms</strong>
+    <strong>Manual Rooms — compatibility export only</strong>
     <span id="mapStatus" class="status">waiting for map</span>
   </div>
   <div class="stage"><canvas id="canvas"></canvas></div>
@@ -858,7 +866,7 @@ button.danger { border-color: #8f4c4c; color: #ffb3b3; }
     <div class="row actions">
       <button id="confirmBtn">Confirm</button>
       <button id="deleteBtn" class="danger">Delete</button>
-      <button id="saveBtn">Save JSON</button>
+      <button id="saveBtn">Export compatibility JSON</button>
     </div>
   </div>
   <div class="section">
@@ -1496,7 +1504,7 @@ def start_http_server(node: OfflineRoomPartitionNode,
 
 
 def parse_args() -> tuple[argparse.Namespace, list[str]]:
-  parser = argparse.ArgumentParser()
+  parser = argparse.ArgumentParser(description=__doc__)
   parser.add_argument("--pipeline-config", type=Path,
                       default=default_pipeline_config_path())
   parser.add_argument("--map-topic", default="")
@@ -1520,6 +1528,9 @@ def main() -> None:
   params = load_pipeline_params(args.pipeline_config.expanduser())
   rclpy.init(args=ros_args)
   node = OfflineRoomPartitionNode(args, params)
+  node.get_logger().warning(
+      "DEPRECATED compatibility-only UI: exported JSON does not mutate the "
+      "live authoritative scene; use /roomie/mutate_scene for live edits")
   server = None
   if not args.marker_only:
     server = start_http_server(node, args.host, args.port)

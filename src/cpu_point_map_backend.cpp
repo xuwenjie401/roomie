@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <limits>
 #include <mutex>
 #include <utility>
 
@@ -48,14 +49,75 @@ bool isRobotMaskedPixel(const ImageBuffer& mask,
 CpuPointMapBackend::CpuPointMapBackend(PipelineConfig config)
     : config_(std::move(config)) {}
 
-void CpuPointMapBackend::integrateFrame(const MappingFrame& frame) {
+MapIntegrationResult CpuPointMapBackend::integrateFrame(const FrameBundle& frame) {
+  MapIntegrationResult result;
   if (config_.freeze_tsdf_map) {
-    return;
+    result.success = true;
+    result.map_revision = map_version_.load();
+    result.integrated_through_ns = frame.provenance.sensor_time_ns;
+    return result;
+  }
+  if (!frame.depth || frame.depth->empty() ||
+      !hasUsableIntrinsics(frame.intrinsics)) {
+    result.error = "CPU map integration requires depth and valid intrinsics";
+    return result;
   }
   std::lock_guard<std::mutex> lock(mutex_);
   appendDepthFramePoints(frame);
   ++integrated_frames_;
   ++map_version_;
+  result.success = true;
+  result.map_changed = true;
+  result.map_revision = map_version_.load();
+  result.integrated_through_ns = frame.provenance.sensor_time_ns;
+  result.updated_blocks_complete = false;
+  return result;
+}
+
+SurfaceRefreshResult CpuPointMapBackend::refreshSurface(
+    const MapIntegrationResult& integration,
+    bool force_full_rebuild) {
+  (void)force_full_rebuild;
+  std::lock_guard<std::mutex> lock(mutex_);
+  SurfaceRefreshResult result;
+  result.success = integration.success || config_.freeze_tsdf_map;
+  result.full_rebuild = true;
+  result.source_map_revision = map_version_.load();
+  result.diagnostics.map_version = result.source_map_revision;
+  result.diagnostics.latest_map_version = result.source_map_revision;
+  result.diagnostics.has_map = !map_points_world_.empty();
+  result.diagnostics.surface_cache_ready = true;
+  result.diagnostics.cached_surface_points = map_points_world_.size();
+  result.diagnostics.selected_blocks = map_points_world_.empty() ? 0U : 1U;
+  result.diagnostics.cache_rebuilds = integrated_frames_.load();
+  result.diagnostics.surface_points_world = map_points_world_;
+  result.diagnostics.debug_surface_points.reserve(map_points_world_.size());
+
+  if (map_points_world_.empty()) {
+    return result;
+  }
+
+  Eigen::Vector3f min_point =
+      Eigen::Vector3f::Constant(std::numeric_limits<float>::infinity());
+  Eigen::Vector3f max_point =
+      Eigen::Vector3f::Constant(-std::numeric_limits<float>::infinity());
+  MapSurfacePointVector points;
+  points.reserve(map_points_world_.size());
+  for (const Eigen::Vector3f& point_world : map_points_world_) {
+    MapSurfacePoint point;
+    point.position_world = point_world;
+    point.weight = 1.0f;
+    points.push_back(point);
+    result.diagnostics.debug_surface_points.push_back(point);
+    min_point = min_point.cwiseMin(point_world);
+    max_point = max_point.cwiseMax(point_world);
+  }
+  constexpr float kBoundsPadding = 1.0e-4f;
+  min_point.array() -= kBoundsPadding;
+  max_point.array() += kBoundsPadding;
+  result.blocks.push_back(makeSurfaceBlock(
+      BlockIndex(0, 0, 0), SurfaceAabb(min_point, max_point), std::move(points)));
+  return result;
 }
 
 MapBackendSnapshot CpuPointMapBackend::snapshot() const {
@@ -79,21 +141,6 @@ MapBackendSnapshot CpuPointMapBackend::snapshot() const {
   return snapshot;
 }
 
-std::shared_ptr<const GeometrySurfaceCache> CpuPointMapBackend::geometrySurfaceCache() const {
-  std::lock_guard<std::mutex> lock(mutex_);
-  auto cache = std::make_shared<GeometrySurfaceCache>();
-  cache->map_version = map_version_.load();
-  cache->has_map = !map_points_world_.empty();
-  cache->surface_points.reserve(map_points_world_.size());
-  for (const Eigen::Vector3f& point : map_points_world_) {
-    MapSurfacePoint surface_point;
-    surface_point.position_world = point;
-    surface_point.weight = 1.0f;
-    cache->surface_points.push_back(surface_point);
-  }
-  return cache;
-}
-
 std::vector<VoxelRef, Eigen::aligned_allocator<VoxelRef>>
 CpuPointMapBackend::collectNearSurfaceVoxels(const RawDetection& detection) const {
   (void)detection;
@@ -103,15 +150,16 @@ CpuPointMapBackend::collectNearSurfaceVoxels(const RawDetection& detection) cons
   return {};
 }
 
-void CpuPointMapBackend::appendDepthFramePoints(const MappingFrame& frame) {
-  if (frame.depth.empty() || !hasUsableIntrinsics(frame.intrinsics) ||
+void CpuPointMapBackend::appendDepthFramePoints(const FrameBundle& frame) {
+  if (!frame.depth || frame.depth->empty() ||
+      !hasUsableIntrinsics(frame.intrinsics) ||
       map_points_world_.size() >= kMaxPlaceholderMapPoints) {
     return;
   }
 
-  const int width = frame.depth.width;
-  const int height = frame.depth.height;
-  const std::size_t depth_count = frame.depth.depth_m.size();
+  const int width = frame.depth->width;
+  const int height = frame.depth->height;
+  const std::size_t depth_count = frame.depth->depth_m.size();
   const std::size_t pixel_count =
       static_cast<std::size_t>(width) * static_cast<std::size_t>(height);
   if (width <= 0 || height <= 0 || depth_count < pixel_count) {
@@ -129,14 +177,14 @@ void CpuPointMapBackend::appendDepthFramePoints(const MappingFrame& frame) {
   for (std::size_t linear = 0;
        linear < pixel_count && map_points_world_.size() < kMaxPlaceholderMapPoints;
        linear += stride) {
-    const float z = frame.depth.depth_m[linear];
+    const float z = frame.depth->depth_m[linear];
     if (!std::isfinite(z) || z < config_.depth_min_m || z > max_integration_depth) {
       continue;
     }
 
     const int y = static_cast<int>(linear / static_cast<std::size_t>(width));
     const int x = static_cast<int>(linear % static_cast<std::size_t>(width));
-    if (isRobotMaskedPixel(frame.robot_mask,
+    if (frame.robot_mask && isRobotMaskedPixel(*frame.robot_mask,
                            x,
                            y,
                            width,

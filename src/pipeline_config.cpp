@@ -124,6 +124,13 @@ PipelineConfig PipelineConfig::declareAndLoad(rclcpp::Node& node) {
       node.declare_parameter<bool>("tsdf.load_map", config.load_map);
   config.map_load_path =
       node.declare_parameter<std::string>("tsdf.map_load_path", config.map_load_path);
+  config.map_load_mode = node.declare_parameter<std::string>(
+      "tsdf.map_load_mode", config.map_load_mode);
+  if (config.map_load_mode != "coordinated" &&
+      config.map_load_mode != "seed") {
+    throw std::invalid_argument(
+        "tsdf.map_load_mode must be 'coordinated' or 'seed'");
+  }
   config.freeze_tsdf_map =
       node.declare_parameter<bool>("tsdf.freeze_tsdf_map", config.freeze_tsdf_map);
   config.save_map =
@@ -167,6 +174,10 @@ PipelineConfig PipelineConfig::declareAndLoad(rclcpp::Node& node) {
       0.0,
       node.declare_parameter<double>("detection.max_inference_fps",
                                      config.max_inference_fps));
+  config.perception_deadline_ms = positiveIntOrDefault(
+      node.declare_parameter<int>("perception.deadline_ms",
+                                  config.perception_deadline_ms),
+      config.perception_deadline_ms);
   config.python_backend_enabled = node.declare_parameter<bool>(
       "detection.python_backend_enabled", config.python_backend_enabled);
   config.python_executable = node.declare_parameter<std::string>(
@@ -350,14 +361,6 @@ PipelineConfig PipelineConfig::declareAndLoad(rclcpp::Node& node) {
       0.0,
       node.declare_parameter<double>("instance.high_quality_min_mass",
                                      config.instance_high_quality_min_mass)));
-  config.instance_geometry_check_period_sec = std::max(
-      0.0,
-      node.declare_parameter<double>("instance.geometry_check_period_sec",
-                                     config.instance_geometry_check_period_sec));
-  config.instance_geometry_recent_window_sec = std::max(
-      0.0,
-      node.declare_parameter<double>("instance.geometry_recent_window_sec",
-                                     config.instance_geometry_recent_window_sec));
   config.instance_geometry_shell_thickness_m = positiveFloatOrDefault(
       node.declare_parameter<double>("instance.geometry_shell_thickness_m",
                                      config.instance_geometry_shell_thickness_m),
@@ -380,46 +383,6 @@ PipelineConfig PipelineConfig::declareAndLoad(rclcpp::Node& node) {
                                      config.instance_geometry_suppress_score),
       0.0,
       1.0));
-  config.instance_geometry_recover_score = static_cast<float>(std::clamp(
-      node.declare_parameter<double>("instance.geometry_recover_score",
-                                     config.instance_geometry_recover_score),
-      0.0,
-      1.0));
-  if (config.instance_geometry_recover_score < config.instance_geometry_suppress_score) {
-    std::swap(config.instance_geometry_recover_score,
-              config.instance_geometry_suppress_score);
-  }
-  config.instance_geometry_failures_before_suppress = positiveIntOrDefault(
-      node.declare_parameter<int>("instance.geometry_failures_before_suppress",
-                                  config.instance_geometry_failures_before_suppress),
-      config.instance_geometry_failures_before_suppress);
-  config.instance_geometry_inactive_delete_bad_count = positiveIntOrDefault(
-      node.declare_parameter<int>("instance.geometry_inactive_delete_bad_count",
-                                  config.instance_geometry_inactive_delete_bad_count),
-      config.instance_geometry_inactive_delete_bad_count);
-  config.instance_geometry_empty_small_object_max_volume_m3 = static_cast<float>(
-      std::max(0.0,
-               node.declare_parameter<double>(
-                   "instance.geometry_empty_small_object_max_volume_m3",
-                   config.instance_geometry_empty_small_object_max_volume_m3)));
-  config.instance_geometry_empty_small_object_max_extent_m = static_cast<float>(
-      std::max(0.0,
-               node.declare_parameter<double>(
-                   "instance.geometry_empty_small_object_max_extent_m",
-                   config.instance_geometry_empty_small_object_max_extent_m)));
-  config.instance_geometry_reevaluate_center_delta_m = positiveFloatOrDefault(
-      node.declare_parameter<double>("instance.geometry_reevaluate_center_delta_m",
-                                     config.instance_geometry_reevaluate_center_delta_m),
-      config.instance_geometry_reevaluate_center_delta_m);
-  config.instance_geometry_reevaluate_size_ratio = static_cast<float>(std::clamp(
-      node.declare_parameter<double>("instance.geometry_reevaluate_size_ratio",
-                                     config.instance_geometry_reevaluate_size_ratio),
-      0.0,
-      1.0));
-  config.instance_geometry_reevaluate_yaw_delta_deg = positiveFloatOrDefault(
-      node.declare_parameter<double>("instance.geometry_reevaluate_yaw_delta_deg",
-                                     config.instance_geometry_reevaluate_yaw_delta_deg),
-      config.instance_geometry_reevaluate_yaw_delta_deg);
   config.instance_confirmed_geometry_edge_freeze_weight = static_cast<float>(std::clamp(
       node.declare_parameter<double>(
           "instance.confirmed_geometry_edge_freeze_weight",
@@ -446,18 +409,15 @@ PipelineConfig PipelineConfig::declareAndLoad(rclcpp::Node& node) {
                node.declare_parameter<double>(
                    "instance.confirmed_geometry_center_shift_min_extent_m",
                    config.instance_confirmed_geometry_center_shift_min_extent_m)));
+  config.instance_observation_history_capacity = positiveSizeOrDefault(
+      node.declare_parameter<int>(
+          "instance.observation_history_capacity",
+          static_cast<int>(config.instance_observation_history_capacity)),
+      config.instance_observation_history_capacity);
   config.input_queue_size = positiveSizeOrDefault(
       node.declare_parameter<int>("queues.input_queue_size",
                                   static_cast<int>(config.input_queue_size)),
       config.input_queue_size);
-  config.output_queue_size = positiveSizeOrDefault(
-      node.declare_parameter<int>("queues.output_queue_size",
-                                  static_cast<int>(config.output_queue_size)),
-      config.output_queue_size);
-  config.sync_queue_size = positiveSizeOrDefault(
-      node.declare_parameter<int>("queues.sync_queue_size",
-                                  static_cast<int>(config.sync_queue_size)),
-      config.sync_queue_size);
   config.pending_frame_limit = positiveSizeOrDefault(
       node.declare_parameter<int>("queues.pending_frame_limit",
                                   static_cast<int>(config.pending_frame_limit)),
@@ -478,6 +438,10 @@ PipelineConfig PipelineConfig::declareAndLoad(rclcpp::Node& node) {
       node.declare_parameter<int>("queues.inference_response_queue_size",
                                   static_cast<int>(config.inference_response_queue_size)),
       config.inference_response_queue_size);
+  config.shutdown_drain_timeout_ms = positiveIntOrDefault(
+      node.declare_parameter<int>("queues.shutdown_drain_timeout_ms",
+                                  config.shutdown_drain_timeout_ms),
+      config.shutdown_drain_timeout_ms);
 
   config.max_image_stamp_delta_sec = positiveDoubleOrDefault(
       node.declare_parameter<double>("sync.max_image_stamp_delta_sec",
@@ -508,6 +472,187 @@ PipelineConfig PipelineConfig::declareAndLoad(rclcpp::Node& node) {
       "persistence.load_scene_graph", config.load_scene_graph);
   config.scene_graph_load_path = node.declare_parameter<std::string>(
       "persistence.scene_graph_load_path", config.scene_graph_load_path);
+  config.scene_store_enabled = node.declare_parameter<bool>(
+      "persistence.scene_store_enabled", config.scene_store_enabled);
+  config.scene_store_path = node.declare_parameter<std::string>(
+      "persistence.scene_store_path", config.scene_store_path);
+  config.scene_store_flush_period_ms = positiveIntOrDefault(
+      node.declare_parameter<int>("persistence.scene_store_flush_period_ms",
+                                  config.scene_store_flush_period_ms),
+      config.scene_store_flush_period_ms);
+  config.scene_store_flush_batch_size = positiveSizeOrDefault(
+      node.declare_parameter<int>("persistence.scene_store_flush_batch_size",
+                                  static_cast<int>(
+                                      config.scene_store_flush_batch_size)),
+      config.scene_store_flush_batch_size);
+  config.scene_store_queue_size = positiveSizeOrDefault(
+      node.declare_parameter<int>("persistence.scene_store_queue_size",
+                                  static_cast<int>(
+                                      config.scene_store_queue_size)),
+      config.scene_store_queue_size);
+  config.scene_store_soft_lag_revisions = positiveSizeOrDefault(
+      node.declare_parameter<int>(
+          "persistence.scene_store_soft_lag_revisions",
+          static_cast<int>(config.scene_store_soft_lag_revisions)),
+      static_cast<std::size_t>(config.scene_store_soft_lag_revisions));
+  config.scene_store_hard_lag_revisions = positiveSizeOrDefault(
+      node.declare_parameter<int>(
+          "persistence.scene_store_hard_lag_revisions",
+          static_cast<int>(config.scene_store_hard_lag_revisions)),
+      static_cast<std::size_t>(config.scene_store_hard_lag_revisions));
+  config.scene_store_hard_lag_revisions = std::max(
+      config.scene_store_hard_lag_revisions,
+      config.scene_store_soft_lag_revisions);
+  config.scene_store_terminal_failure_timeout_ms = positiveIntOrDefault(
+      node.declare_parameter<int>(
+          "persistence.scene_store_terminal_failure_timeout_ms",
+          config.scene_store_terminal_failure_timeout_ms),
+      config.scene_store_terminal_failure_timeout_ms);
+  config.online_snapshot_enabled = node.declare_parameter<bool>(
+      "artifacts.snapshot_enabled", config.online_snapshot_enabled);
+  config.asset_store_root = node.declare_parameter<std::string>(
+      "artifacts.asset_store_root", config.asset_store_root);
+  config.snapshot_top_k = positiveSizeOrDefault(
+      node.declare_parameter<int>("artifacts.snapshot_top_k",
+                                  static_cast<int>(config.snapshot_top_k)),
+      config.snapshot_top_k);
+  config.snapshot_queue_size = positiveSizeOrDefault(
+      node.declare_parameter<int>("artifacts.snapshot_queue_size",
+                                  static_cast<int>(config.snapshot_queue_size)),
+      config.snapshot_queue_size);
+  config.snapshot_control_queue_size = positiveSizeOrDefault(
+      node.declare_parameter<int>(
+          "artifacts.snapshot_control_queue_size",
+          static_cast<int>(config.snapshot_control_queue_size)),
+      config.snapshot_control_queue_size);
+  config.snapshot_minimum_quality = static_cast<float>(std::clamp(
+      node.declare_parameter<double>("artifacts.snapshot_minimum_quality",
+                                     config.snapshot_minimum_quality),
+      0.0,
+      1.0));
+  config.snapshot_azimuth_bucket_degrees = positiveFloatOrDefault(
+      node.declare_parameter<double>("artifacts.snapshot_azimuth_bucket_degrees",
+                                     config.snapshot_azimuth_bucket_degrees),
+      config.snapshot_azimuth_bucket_degrees);
+  config.snapshot_elevation_bucket_degrees = positiveFloatOrDefault(
+      node.declare_parameter<double>("artifacts.snapshot_elevation_bucket_degrees",
+                                     config.snapshot_elevation_bucket_degrees),
+      config.snapshot_elevation_bucket_degrees);
+  config.snapshot_scale_bucket_ratio = static_cast<float>(std::max(
+      1.0001,
+      node.declare_parameter<double>("artifacts.snapshot_scale_bucket_ratio",
+                                     config.snapshot_scale_bucket_ratio)));
+  config.snapshot_diversity_min_quality_ratio = static_cast<float>(std::clamp(
+      node.declare_parameter<double>(
+          "artifacts.snapshot_diversity_min_quality_ratio",
+          config.snapshot_diversity_min_quality_ratio),
+      0.0,
+      1.0));
+  config.asset_gc_grace_period_sec = std::max(
+      0.0,
+      node.declare_parameter<double>("artifacts.asset_gc_grace_period_sec",
+                                     config.asset_gc_grace_period_sec));
+  config.asset_gc_period_ms = positiveIntOrDefault(
+      node.declare_parameter<int>("artifacts.asset_gc_period_ms",
+                                  config.asset_gc_period_ms),
+      config.asset_gc_period_ms);
+  config.dam_artifacts_enabled = node.declare_parameter<bool>(
+      "artifacts.dam_enabled", config.dam_artifacts_enabled);
+  config.dam_model_id = node.declare_parameter<std::string>(
+      "artifacts.dam_model_id", config.dam_model_id);
+  config.dam_prompt_hash = node.declare_parameter<std::string>(
+      "artifacts.dam_prompt_hash", config.dam_prompt_hash);
+  config.dam_output_schema_version = node.declare_parameter<std::string>(
+      "artifacts.dam_output_schema_version",
+      config.dam_output_schema_version);
+  config.dam_python_executable = node.declare_parameter<std::string>(
+      "artifacts.dam_python_executable", config.dam_python_executable);
+  config.dam_worker_script = node.declare_parameter<std::string>(
+      "artifacts.dam_worker_script", config.dam_worker_script);
+  config.dam_source = node.declare_parameter<std::string>(
+      "artifacts.dam_source", config.dam_source);
+  config.dam_model_path = node.declare_parameter<std::string>(
+      "artifacts.dam_model_path", config.dam_model_path);
+  config.dam_conversation_mode = node.declare_parameter<std::string>(
+      "artifacts.dam_conversation_mode", config.dam_conversation_mode);
+  config.dam_prompt_mode = node.declare_parameter<std::string>(
+      "artifacts.dam_prompt_mode", config.dam_prompt_mode);
+  config.dam_query = node.declare_parameter<std::string>(
+      "artifacts.dam_query", config.dam_query);
+  config.dam_max_new_tokens = positiveIntOrDefault(
+      node.declare_parameter<int>("artifacts.dam_max_new_tokens",
+                                  config.dam_max_new_tokens),
+      config.dam_max_new_tokens);
+  config.dam_temperature = std::max(
+      0.0, node.declare_parameter<double>("artifacts.dam_temperature",
+                                          config.dam_temperature));
+  config.dam_top_p = std::clamp(
+      node.declare_parameter<double>("artifacts.dam_top_p",
+                                     config.dam_top_p),
+      0.0, 1.0);
+  config.dam_bbox_pad_px = std::max(
+      0.0, node.declare_parameter<double>("artifacts.dam_bbox_pad_px",
+                                          config.dam_bbox_pad_px));
+  config.dam_startup_timeout_ms = positiveIntOrDefault(
+      node.declare_parameter<int>("artifacts.dam_startup_timeout_ms",
+                                  config.dam_startup_timeout_ms),
+      config.dam_startup_timeout_ms);
+  config.dam_request_timeout_ms = positiveIntOrDefault(
+      node.declare_parameter<int>("artifacts.dam_request_timeout_ms",
+                                  config.dam_request_timeout_ms),
+      config.dam_request_timeout_ms);
+  config.dam_shutdown_timeout_ms = positiveIntOrDefault(
+      node.declare_parameter<int>("artifacts.dam_shutdown_timeout_ms",
+                                  config.dam_shutdown_timeout_ms),
+      config.dam_shutdown_timeout_ms);
+  config.artifact_new_object_window_ms = positiveIntOrDefault(
+      node.declare_parameter<int>("artifacts.new_object_window_ms",
+                                  config.artifact_new_object_window_ms),
+      config.artifact_new_object_window_ms);
+  config.artifact_new_object_interactive_limit = positiveSizeOrDefault(
+      node.declare_parameter<int>(
+          "artifacts.new_object_interactive_limit",
+          static_cast<int>(config.artifact_new_object_interactive_limit)),
+      config.artifact_new_object_interactive_limit);
+  config.embedding_artifacts_enabled = node.declare_parameter<bool>(
+      "artifacts.embedding_enabled", config.embedding_artifacts_enabled);
+  config.embedding_model_id = node.declare_parameter<std::string>(
+      "artifacts.embedding_model_id", config.embedding_model_id);
+  config.embedding_dimension = positiveSizeOrDefault(
+      node.declare_parameter<int>("artifacts.embedding_dimension",
+                                  static_cast<int>(config.embedding_dimension)),
+      config.embedding_dimension);
+  config.embedding_python_executable = node.declare_parameter<std::string>(
+      "artifacts.embedding_python_executable",
+      config.embedding_python_executable);
+  config.embedding_worker_script = node.declare_parameter<std::string>(
+      "artifacts.embedding_worker_script", config.embedding_worker_script);
+  config.embedding_model_path = node.declare_parameter<std::string>(
+      "artifacts.embedding_model_path", config.embedding_model_path);
+  config.embedding_device = node.declare_parameter<std::string>(
+      "artifacts.embedding_device", config.embedding_device);
+  config.embedding_batch_size = positiveSizeOrDefault(
+      node.declare_parameter<int>(
+          "artifacts.embedding_batch_size",
+          static_cast<int>(config.embedding_batch_size)),
+      config.embedding_batch_size);
+  config.embedding_record_history_capacity = positiveSizeOrDefault(
+      node.declare_parameter<int>(
+          "artifacts.embedding_record_history_capacity",
+          static_cast<int>(config.embedding_record_history_capacity)),
+      config.embedding_record_history_capacity);
+  config.embedding_startup_timeout_ms = positiveIntOrDefault(
+      node.declare_parameter<int>("artifacts.embedding_startup_timeout_ms",
+                                  config.embedding_startup_timeout_ms),
+      config.embedding_startup_timeout_ms);
+  config.embedding_request_timeout_ms = positiveIntOrDefault(
+      node.declare_parameter<int>("artifacts.embedding_request_timeout_ms",
+                                  config.embedding_request_timeout_ms),
+      config.embedding_request_timeout_ms);
+  config.embedding_shutdown_timeout_ms = positiveIntOrDefault(
+      node.declare_parameter<int>("artifacts.embedding_shutdown_timeout_ms",
+                                  config.embedding_shutdown_timeout_ms),
+      config.embedding_shutdown_timeout_ms);
   config.freeze_instances = node.declare_parameter<bool>(
       "persistence.freeze_instances", config.freeze_instances);
   config.save_scene_graph = node.declare_parameter<bool>(

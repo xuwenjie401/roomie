@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""WebGL scene QA viewer for Roomie DSG JSON files."""
+"""Browser UI for live or explicit offline Roomie scene QA."""
 
 from __future__ import annotations
 
@@ -31,10 +31,12 @@ from roomie_dsg_viewer import (  # noqa: E402
     resolve_points_from_config,
 )
 from scene_qa.config import SceneQaConfig, default_qa_config_path  # noqa: E402
+from scene_qa.doubao_agent import DoubaoSceneQaAgent  # noqa: E402
 from scene_qa.embeddings import ObjectSearchIndex  # noqa: E402
 from scene_qa.gemini_agent import GeminiSceneQaAgent  # noqa: E402
 from scene_qa.graph_store import GraphStore  # noqa: E402
-from scene_qa.tools import create_default_tool_registry  # noqa: E402
+from scene_qa.live_query import LiveSceneQueryClient, RosQuerySceneTransport  # noqa: E402
+from scene_qa.tools import create_default_tool_registry, create_live_tool_registry  # noqa: E402
 
 
 PALETTE = [
@@ -108,9 +110,38 @@ def highlight_groups_from_history(history: dict[str, Any]) -> list[dict[str, Any
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--qa-config", type=Path, default=None, help=f"scene QA JSON config (default: {default_qa_config_path()})")
-    parser.add_argument("--json", type=Path, default=None, help="Roomie DSG JSON path; overrides QA config")
-    parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG, help="pipeline YAML used if QA config has no graph_json")
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument(
+        "--live",
+        action="store_true",
+        help="use the live QueryScene service (default)",
+    )
+    mode.add_argument(
+        "--offline-json",
+        "--json",
+        dest="offline_json",
+        type=Path,
+        default=None,
+        help="explicitly use a static Roomie DSG JSON",
+    )
+    parser.add_argument("--service", default="/roomie/query_scene", help="live QueryScene service")
+    parser.add_argument("--session-ttl-ms", type=int, default=30_000)
+    parser.add_argument("--service-timeout-sec", type=float, default=10.0)
+    parser.add_argument(
+        "--config",
+        type=Path,
+        default=DEFAULT_CONFIG,
+        help="pipeline YAML used to resolve an offline point cloud",
+    )
     parser.add_argument("--model", default=None, help="Gemini model; overrides QA config")
+    parser.add_argument("--doubao-model", default=None, help="Doubao model; overrides QA config")
+    parser.add_argument("--doubao-base-url", default=None, help="Ark API v3 base URL; overrides QA config")
+    parser.add_argument(
+        "--default-provider",
+        choices=["gemini", "doubao"],
+        default="gemini",
+        help="initial provider selected in the browser",
+    )
     parser.add_argument("--embedding-model", type=Path, default=None, help="local SentenceTransformer checkpoint")
     parser.add_argument("--embedding-backend", choices=["embedding", "lexical"], default=None)
     parser.add_argument("--device", default=None, help="embedding device: auto, cuda, or cpu")
@@ -126,8 +157,19 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--point-size", type=float, default=2.5, help="initial WebGL point size")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8776)
+    parser.add_argument(
+        "--browser",
+        choices=["auto", "off"],
+        default="auto",
+        help="open the system browser after binding the server (default: auto)",
+    )
     parser.add_argument("--no-browser", action="store_true")
     parser.add_argument("--api-key", default=None, help="Gemini API key; defaults to GEMINI_API_KEY or GOOGLE_API_KEY")
+    parser.add_argument(
+        "--doubao-api-key",
+        default=None,
+        help="Doubao key; defaults to DOUBAO_API_KEY or ARK_API_KEY",
+    )
     return parser.parse_args()
 
 
@@ -139,7 +181,7 @@ def load_qa_config(path_arg: Path | None) -> SceneQaConfig:
 
 
 def resolve_graph_json(args: argparse.Namespace, config: SceneQaConfig) -> Path:
-    explicit = as_path(args.json)
+    explicit = as_path(args.offline_json)
     if explicit is not None:
         return explicit
     configured = config.graph_json.expanduser()
@@ -157,8 +199,14 @@ def resolve_graph_json(args: argparse.Namespace, config: SceneQaConfig) -> Path:
 
 def apply_cli_overrides(config: SceneQaConfig, args: argparse.Namespace) -> SceneQaConfig:
     return SceneQaConfig(
-        graph_json=resolve_graph_json(args, config),
+        graph_json=(
+            resolve_graph_json(args, config)
+            if args.offline_json is not None
+            else config.graph_json
+        ),
         gemini_model=args.model or config.gemini_model,
+        doubao_model=args.doubao_model or config.doubao_model,
+        doubao_base_url=(args.doubao_base_url or config.doubao_base_url).rstrip("/"),
         embedding_model=args.embedding_model or config.embedding_model,
         embedding_backend=args.embedding_backend or config.embedding_backend,
         device=args.device or config.device,
@@ -181,6 +229,21 @@ def graph_payload(graph: GraphStore) -> dict[str, Any]:
         "objects": [graph.object_to_dict(obj) for obj in graph.object_records()],
         "rooms": [graph.room_to_dict(room) for room in graph.room_records()],
         "snapshot_images": graph.graph.get("snapshot_images", []),
+    }
+
+
+def live_graph_payload(service_name: str) -> dict[str, Any]:
+    """Return an empty graph shell that the browser enriches from live tool results."""
+
+    return {
+        "format": "roomie_live_query",
+        "world_frame": "map",
+        "saved_time": None,
+        "objects": [],
+        "rooms": [],
+        "snapshot_images": [],
+        "live": True,
+        "service": service_name,
     }
 
 
@@ -300,6 +363,41 @@ HTML = r"""<!doctype html>
       line-height: 1.4;
       color: var(--text);
       background: #fff;
+    }
+    .provider-row {
+      display: grid;
+      grid-template-columns: auto minmax(0, 1fr);
+      align-items: center;
+      gap: 9px;
+    }
+    .provider-toggle {
+      display: inline-grid;
+      grid-template-columns: repeat(2, minmax(74px, 1fr));
+      padding: 3px;
+      border: 1px solid var(--line);
+      border-radius: 9px;
+      background: #f3f5f1;
+    }
+    button.provider-button {
+      height: 29px;
+      border: 0;
+      background: transparent;
+      color: var(--muted);
+      font-size: 12px;
+      font-weight: 650;
+    }
+    button.provider-button.active {
+      background: #fff;
+      color: var(--accent);
+      box-shadow: 0 1px 4px rgba(24, 37, 31, .14);
+    }
+    .provider-status {
+      min-width: 0;
+      color: var(--muted);
+      font-size: 11px;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
     }
     button {
       height: 34px;
@@ -626,11 +724,18 @@ HTML = r"""<!doctype html>
       </header>
       <div class="ask-box">
         <textarea id="question" placeholder="Ask about objects, rooms, spatial relations, or visual details."></textarea>
+        <div class="provider-row">
+          <div class="provider-toggle" role="group" aria-label="Model provider">
+            <button class="provider-button active" type="button" data-provider="gemini" aria-pressed="true">Gemini</button>
+            <button class="provider-button" type="button" data-provider="doubao" aria-pressed="false">Doubao</button>
+          </div>
+          <div class="provider-status" id="providerStatus">Loading providers...</div>
+        </div>
         <button id="askBtn" class="primary">Ask</button>
       </div>
       <div class="scroll">
         <div class="answer" id="answerBox">
-          <div class="label">Final answer</div>
+          <div class="label" id="answerLabel">Final answer</div>
           <div class="text" id="answerText">No question asked yet.</div>
           <div class="reasoning" id="reasoningText"></div>
         </div>
@@ -672,6 +777,7 @@ HTML = r"""<!doctype html>
       lastEventId: 0,
       pollTimer: null,
       asking: false,
+      provider: 'gemini',
       yaw: 2.45,
       pitch: 0.72,
       distance: 8,
@@ -706,6 +812,8 @@ HTML = r"""<!doctype html>
     const objectList = document.getElementById('objectList');
     const traceList = document.getElementById('traceList');
     const progressList = document.getElementById('progressList');
+    const providerStatus = document.getElementById('providerStatus');
+    const providerButtons = Array.from(document.querySelectorAll('[data-provider]'));
     const showPoints = document.getElementById('showPoints');
     const showRooms = document.getElementById('showRooms');
     const pointSize = document.getElementById('pointSize');
@@ -715,6 +823,36 @@ HTML = r"""<!doctype html>
       return String(text ?? '').replace(/[&<>"']/g, ch => ({
         '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
       }[ch]));
+    }
+    function providerInfo(name) {
+      return state.graph?.qa?.providers?.[name] || null;
+    }
+    function selectProvider(name) {
+      const info = providerInfo(name);
+      if (!info || !info.available || state.asking) return;
+      state.provider = name;
+      for (const button of providerButtons) {
+        const active = button.dataset.provider === name;
+        button.classList.toggle('active', active);
+        button.setAttribute('aria-pressed', active ? 'true' : 'false');
+      }
+      providerStatus.textContent = `${info.label || name} · ${info.model || ''}`;
+      document.getElementById('answerLabel').textContent = `Final answer · ${info.label || name}`;
+    }
+    function updateProviderControls() {
+      for (const button of providerButtons) {
+        const info = providerInfo(button.dataset.provider);
+        button.disabled = state.asking || !info?.available;
+        button.title = info?.available ? (info.model || '') : (info?.error || 'Provider unavailable');
+      }
+      const preferred = providerInfo(state.provider)?.available
+        ? state.provider
+        : (state.graph?.qa?.default_provider || state.provider);
+      const available = providerInfo(preferred)?.available
+        ? preferred
+        : providerButtons.map(button => button.dataset.provider).find(name => providerInfo(name)?.available);
+      if (available) selectProvider(available);
+      else providerStatus.textContent = 'No model provider is available';
     }
     function fmt(value, digits = 3) {
       if (value === null || value === undefined || Number.isNaN(Number(value))) return '';
@@ -957,7 +1095,11 @@ HTML = r"""<!doctype html>
     }
     function uploadRoomBoxes() {
       const lines = [], colors = [];
-      for (const room of state.rooms) appendRoomBox(lines, colors, room);
+      for (const room of state.rooms) {
+        const hasBox = (Array.isArray(room.center_world) && Array.isArray(room.size_m)) ||
+          (Array.isArray(room.min_xy) && Array.isArray(room.max_xy));
+        if (hasBox) appendRoomBox(lines, colors, room);
+      }
       state.roomVertexCount = lines.length / 3;
       const gl = state.gl;
       gl.bindBuffer(gl.ARRAY_BUFFER, state.roomPositionBuffer);
@@ -1030,6 +1172,9 @@ HTML = r"""<!doctype html>
         include(state.pointBounds.min, state.pointBounds.max);
       }
       for (const room of state.rooms) {
+        const hasBox = (Array.isArray(room.center_world) && Array.isArray(room.size_m)) ||
+          (Array.isArray(room.min_xy) && Array.isArray(room.max_xy));
+        if (!hasBox) continue;
         const corners = roomCorners(room);
         include([
           Math.min(...corners.map(p => p[0])),
@@ -1114,6 +1259,72 @@ HTML = r"""<!doctype html>
         seen.add(id);
         return true;
       });
+    }
+    function mergeSceneFromHistory(history) {
+      if (!history || !state.graph?.live) return;
+      const objects = new Map(state.objects.map(object => [Number(object.object_id), object]));
+      const rooms = new Map(state.rooms.map(room => [String(room.room_id), room]));
+
+      function mergeObject(candidate) {
+        const id = Number(candidate?.object_id);
+        if (!Number.isFinite(id)) return;
+        const geometry = candidate.geometry && typeof candidate.geometry === 'object'
+          ? candidate.geometry : {};
+        const normalized = {
+          ...candidate,
+          object_id: id,
+          label: candidate.label || candidate.display_description || 'object',
+          description: candidate.description || candidate.canonical_description || candidate.display_description || '',
+          center_world: candidate.center_world || geometry.center_world,
+          size_m: candidate.size_m || geometry.size_m,
+          yaw_rad: candidate.yaw_rad ?? geometry.yaw_rad
+        };
+        const useful = Object.fromEntries(Object.entries(normalized).filter(([, value]) => value !== null && value !== undefined && value !== ''));
+        objects.set(id, {...(objects.get(id) || {}), ...useful});
+      }
+      function walkRooms(node) {
+        if (!node) return;
+        if (Array.isArray(node)) { node.forEach(walkRooms); return; }
+        if (typeof node !== 'object') return;
+        if (node.room_id !== undefined && Array.isArray(node.object_ids)) {
+          const key = String(node.room_id);
+          rooms.set(key, {
+            ...(rooms.get(key) || {}),
+            ...node,
+            room_id: key,
+            label: node.label || node.name || key
+          });
+        }
+        for (const value of Object.values(node)) walkRooms(value);
+      }
+      for (const iteration of history.iterations || []) {
+        for (const call of iteration.function_calls || []) {
+          responseObjectsFromCall(call).forEach(mergeObject);
+          walkRooms(call.response);
+        }
+      }
+      for (const room of rooms.values()) {
+        for (const objectId of room.object_ids || []) {
+          const object = objects.get(Number(objectId));
+          if (!object) continue;
+          const membership = {room_id: room.room_id, label: room.label};
+          object.rooms = [
+            ...(object.rooms || []).filter(item => String(item.room_id) !== String(room.room_id)),
+            membership
+          ];
+        }
+      }
+      state.objects = [...objects.values()].sort((a, b) => Number(a.object_id) - Number(b.object_id));
+      state.rooms = [...rooms.values()].sort((a, b) => String(a.room_id).localeCompare(String(b.room_id)));
+      state.graph.objects = state.objects;
+      state.graph.rooms = state.rooms;
+      if (state.selectedId === null && state.objects.length) state.selectedId = state.objects[0].object_id;
+      computeBounds();
+      uploadRoomBoxes();
+      const session = history.read_session || {};
+      const revision = session.scene_revision === undefined ? '?' : session.scene_revision;
+      document.getElementById('graphMeta').textContent =
+        `LIVE ${state.graph.service} | revision ${revision} | ${state.objects.length} traced objects | ${state.rooms.length} rooms`;
     }
     function snapshotImageMeta(imageIndex) {
       return (state.graph?.snapshot_images || []).find(img => Number(img.image_index) === Number(imageIndex)) || null;
@@ -1239,11 +1450,13 @@ HTML = r"""<!doctype html>
     async function askQuestion() {
       const query = questionInput.value.trim();
       if (!query) return;
+      const provider = state.provider;
       askBtn.disabled = true;
       askBtn.textContent = 'Asking...';
       document.getElementById('answerText').textContent = 'Working...';
       document.getElementById('reasoningText').textContent = '';
       state.asking = true;
+      updateProviderControls();
       state.progressEvents = [];
       state.lastEventId = 0;
       renderProgress();
@@ -1253,11 +1466,13 @@ HTML = r"""<!doctype html>
         const response = await fetch('/ask', {
           method: 'POST',
           headers: {'Content-Type': 'application/json'},
-          body: JSON.stringify({query})
+          body: JSON.stringify({query, provider})
         });
         const data = await response.json();
         if (!response.ok) throw new Error(data.error || response.statusText);
         state.lastHistory = data.history;
+        state.provider = data.provider || provider;
+        mergeSceneFromHistory(data.history);
         document.getElementById('answerText').textContent = typeof data.answer === 'string' ? data.answer : JSON.stringify(data.answer, null, 2);
         document.getElementById('reasoningText').textContent = data.reasoning || '';
         setHighlights(data.highlight_groups || []);
@@ -1271,6 +1486,7 @@ HTML = r"""<!doctype html>
         renderProgress();
         askBtn.disabled = false;
         askBtn.textContent = 'Ask';
+        updateProviderControls();
       }
     }
     canvas.addEventListener('mousedown', event => {
@@ -1300,6 +1516,9 @@ HTML = r"""<!doctype html>
       render();
     }, {passive: false});
     askBtn.addEventListener('click', askQuestion);
+    for (const button of providerButtons) {
+      button.addEventListener('click', () => selectProvider(button.dataset.provider));
+    }
     questionInput.addEventListener('keydown', event => {
       if ((event.metaKey || event.ctrlKey) && event.key === 'Enter') askQuestion();
     });
@@ -1311,12 +1530,16 @@ HTML = r"""<!doctype html>
       initGl();
       const [response] = await Promise.all([fetch('/graph.json'), loadPointCloud()]);
       state.graph = await response.json();
+      state.provider = state.graph?.qa?.default_provider || state.provider;
       state.objects = (state.graph.objects || []).slice().sort((a, b) => Number(a.object_id) - Number(b.object_id));
       state.rooms = (state.graph.rooms || []).slice().sort((a, b) => Number(a.room_id) - Number(b.room_id));
       state.selectedId = state.objects.length ? state.objects[0].object_id : null;
       computeBounds();
       uploadRoomBoxes();
-      document.getElementById('graphMeta').textContent = `${state.objects.length} objects | ${(state.graph.rooms || []).length} rooms | ${state.graph.world_frame || 'world'}`;
+      document.getElementById('graphMeta').textContent = state.graph.live
+        ? `LIVE ${state.graph.service} | waiting for the first question`
+        : `${state.objects.length} objects | ${(state.graph.rooms || []).length} rooms | ${state.graph.world_frame || 'world'}`;
+      updateProviderControls();
       renderObjectList();
       renderTraceGroups();
       render();
@@ -1381,16 +1604,50 @@ class Handler(BaseHTTPRequestHandler):
         if parsed.path != "/ask":
             self.send_error(404, "not found")
             return
-        length = int(self.headers.get("Content-Length", "0") or "0")
+        acquired = False
         try:
+            length = int(self.headers.get("Content-Length", "0") or "0")
+            if length <= 0 or length > 1_048_576:
+                raise ValueError("request body must be between 1 byte and 1 MiB")
             payload = json.loads(self.rfile.read(length).decode("utf-8"))
+            if not isinstance(payload, dict):
+                raise ValueError("request body must be a JSON object")
             query = str(payload.get("query") or "").strip()
             if not query:
                 raise ValueError("query must not be empty")
+            provider = str(
+                payload.get("provider") or self.server.default_provider  # type: ignore[attr-defined]
+            ).strip().lower()
+            agents = self.server.agents  # type: ignore[attr-defined]
+            if provider not in agents:
+                provider_status = self.server.provider_status  # type: ignore[attr-defined]
+                known = provider_status.get(provider)
+                if known is not None:
+                    self._send_json(
+                        {"error": str(known.get("error") or f"{provider} is unavailable")},
+                        status=503,
+                    )
+                else:
+                    self._send_json(
+                        {"error": f"unknown model provider: {provider}"},
+                        status=400,
+                    )
+                return
+            acquired = self.server.qa_lock.acquire(blocking=False)  # type: ignore[attr-defined]
+            if not acquired:
+                self._send_json(
+                    {"error": "another scene QA request is still running"},
+                    status=409,
+                )
+                return
             self.server.progress_log.add(  # type: ignore[attr-defined]
-                {"phase": "request_start", "message": "Question received."}
+                {
+                    "phase": "request_start",
+                    "message": f"Question received by {provider}.",
+                    "provider": provider,
+                }
             )
-            response = self.server.agent.answer_query(query)  # type: ignore[attr-defined]
+            response = agents[provider].answer_query(query)
             highlight_groups = highlight_groups_from_history(response.history)
             body = {
                 "reasoning": response.reasoning,
@@ -1398,9 +1655,15 @@ class Handler(BaseHTTPRequestHandler):
                 "raw_text": response.raw_text,
                 "history": response.history,
                 "highlight_groups": highlight_groups,
+                "provider": provider,
+                "model": response.history.get("model"),
             }
             self.server.progress_log.add(  # type: ignore[attr-defined]
-                {"phase": "request_done", "message": "Answer ready."}
+                {
+                    "phase": "request_done",
+                    "message": f"{provider} answer ready.",
+                    "provider": provider,
+                }
             )
             self._send_json(body)
         except Exception as exc:
@@ -1408,6 +1671,9 @@ class Handler(BaseHTTPRequestHandler):
                 {"phase": "request_error", "message": f"{type(exc).__name__}: {exc}"}
             )
             self._send_json({"error": f"{type(exc).__name__}: {exc}"}, status=500)
+        finally:
+            if acquired:
+                self.server.qa_lock.release()  # type: ignore[attr-defined]
 
     def _send_json(self, body: dict[str, Any], status: int = 200) -> None:
         self._send_bytes(
@@ -1430,72 +1696,160 @@ class Handler(BaseHTTPRequestHandler):
 def main() -> int:
     args = parse_args()
     qa_config = apply_cli_overrides(load_qa_config(args.qa_config), args)
-    json_path = qa_config.resolved_graph_json()
-    if not json_path.exists():
-        print(f"DSG JSON does not exist: {json_path}", file=sys.stderr)
-        return 2
-    pipeline_params = load_pipeline_params(as_path(args.config))
-
-    graph = GraphStore.load(json_path)
+    offline = args.offline_json is not None
+    transport: RosQuerySceneTransport | None = None
     point_cloud = empty_point_cloud()
-    point_path: Path | None = None
-    if not args.no_points:
-        point_path = (
-            as_path(args.points)
-            if args.points is not None
-            else resolve_points_from_config(pipeline_params) or find_auto_point_cloud(json_path)
-        )
-        if point_path is not None:
-            print(f"Loading point cloud: {point_path}")
-            point_cloud = load_point_cloud(
-                point_path,
-                max_points=args.max_points,
-                surface_threshold_m=args.surface_threshold_m,
-                min_weight=args.min_tsdf_weight,
+    if offline:
+        json_path = qa_config.resolved_graph_json()
+        if not json_path.exists():
+            print(f"DSG JSON does not exist: {json_path}", file=sys.stderr)
+            return 2
+        pipeline_params = load_pipeline_params(as_path(args.config))
+        graph = GraphStore.load(json_path)
+        point_path: Path | None = None
+        if not args.no_points:
+            point_path = (
+                as_path(args.points)
+                if args.points is not None
+                else resolve_points_from_config(pipeline_params)
+                or find_auto_point_cloud(json_path)
             )
-        else:
-            print("No point cloud found; pass --points to show RGB points.")
-    if point_cloud.count:
-        print(f"Point cloud: {point_cloud.count} points from {point_cloud.source}")
+            if point_path is not None:
+                print(f"Loading point cloud: {point_path}")
+                point_cloud = load_point_cloud(
+                    point_path,
+                    max_points=args.max_points,
+                    surface_threshold_m=args.surface_threshold_m,
+                    min_weight=args.min_tsdf_weight,
+                )
+            else:
+                print("No point cloud found; pass --points to show RGB points.")
+        if point_cloud.count:
+            print(f"Point cloud: {point_cloud.count} points from {point_cloud.source}")
 
-    search_index = ObjectSearchIndex(
-        graph,
-        model_path=qa_config.resolved_embedding_model(),
-        backend=qa_config.embedding_backend,
-        device=qa_config.device,
-    )
-    registry = create_default_tool_registry(graph, search_index, qa_config)
+        search_index = ObjectSearchIndex(
+            graph,
+            model_path=qa_config.resolved_embedding_model(),
+            backend=qa_config.embedding_backend,
+            device=qa_config.device,
+        )
+        def registry_factory():
+            return create_default_tool_registry(graph, search_index, qa_config)
+
+        graph_data = graph_payload(graph)
+        snapshot_paths = graph.snapshot_paths
+        source_label = f"Loaded DSG: {json_path}"
+    else:
+        graph = None
+        transport = RosQuerySceneTransport(
+            service_name=args.service,
+            timeout_sec=args.service_timeout_sec,
+        )
+        def registry_factory():
+            live_client = LiveSceneQueryClient(
+                transport,
+                session_ttl_ms=args.session_ttl_ms,
+            )
+            return create_live_tool_registry(live_client, qa_config)
+
+        graph_data = live_graph_payload(args.service)
+        snapshot_paths = {}
+        source_label = f"Live QueryScene service: {args.service}"
+
     progress_log = ProgressLog()
-    agent = GeminiSceneQaAgent(
-        graph,
-        registry,
-        qa_config,
-        api_key=args.api_key,
-        progress_callback=progress_log.add,
-    )
+    agents: dict[str, Any] = {}
+    provider_status: dict[str, dict[str, Any]] = {
+        "gemini": {
+            "label": "Gemini",
+            "model": qa_config.gemini_model,
+            "available": False,
+        },
+        "doubao": {
+            "label": "Doubao",
+            "model": qa_config.doubao_model,
+            "available": False,
+        },
+    }
+    provider_builders = {
+        "gemini": lambda: GeminiSceneQaAgent(
+            graph,
+            registry_factory(),
+            qa_config,
+            api_key=args.api_key,
+            progress_callback=progress_log.add,
+        ),
+        "doubao": lambda: DoubaoSceneQaAgent(
+            graph,
+            registry_factory(),
+            qa_config,
+            api_key=args.doubao_api_key,
+            progress_callback=progress_log.add,
+        ),
+    }
+    for provider, builder in provider_builders.items():
+        try:
+            agents[provider] = builder()
+            provider_status[provider]["available"] = True
+        except Exception as exc:
+            provider_status[provider]["error"] = f"{type(exc).__name__}: {exc}"
+            print(
+                f"Scene QA provider {provider} unavailable: {type(exc).__name__}: {exc}",
+                file=sys.stderr,
+            )
+    if not agents:
+        if transport is not None:
+            transport.close()
+        print("No Scene QA model provider is available.", file=sys.stderr)
+        return 2
+    default_provider = args.default_provider
+    if default_provider not in agents:
+        default_provider = next(iter(agents))
+        print(
+            f"Requested default provider is unavailable; using {default_provider}.",
+            file=sys.stderr,
+        )
+    graph_data["qa"] = {
+        "default_provider": default_provider,
+        "providers": provider_status,
+    }
 
-    server = ThreadingHTTPServer((args.host, args.port), Handler)
-    server.graph_json = json.dumps(graph_payload(graph), ensure_ascii=False, separators=(",", ":")).encode("utf-8")  # type: ignore[attr-defined]
-    server.snapshot_paths = graph.snapshot_paths  # type: ignore[attr-defined]
-    server.points_meta_json = json.dumps(points_meta(point_cloud), separators=(",", ":")).encode("utf-8")  # type: ignore[attr-defined]
-    server.points_bytes = point_cloud.points.astype("<f4", copy=False).tobytes()  # type: ignore[attr-defined]
-    server.colors_bytes = point_cloud.colors.astype("u1", copy=False).tobytes()  # type: ignore[attr-defined]
-    server.point_size = repr(float(args.point_size))  # type: ignore[attr-defined]
-    server.progress_log = progress_log  # type: ignore[attr-defined]
-    server.agent = agent  # type: ignore[attr-defined]
-
-    url = f"http://{args.host}:{server.server_port}/"
-    print(f"Roomie Scene QA viewer: {url}")
-    print(f"Loaded DSG: {json_path}")
-    print(f"QA model: {qa_config.gemini_model}")
-    if not args.no_browser:
-        webbrowser.open(url)
+    server: ThreadingHTTPServer | None = None
     try:
+        server = ThreadingHTTPServer((args.host, args.port), Handler)
+        server.daemon_threads = True
+        server.graph_json = json.dumps(graph_data, ensure_ascii=False, separators=(",", ":")).encode("utf-8")  # type: ignore[attr-defined]
+        server.snapshot_paths = snapshot_paths  # type: ignore[attr-defined]
+        server.points_meta_json = json.dumps(points_meta(point_cloud), separators=(",", ":")).encode("utf-8")  # type: ignore[attr-defined]
+        server.points_bytes = point_cloud.points.astype("<f4", copy=False).tobytes()  # type: ignore[attr-defined]
+        server.colors_bytes = point_cloud.colors.astype("u1", copy=False).tobytes()  # type: ignore[attr-defined]
+        server.point_size = repr(float(args.point_size))  # type: ignore[attr-defined]
+        server.progress_log = progress_log  # type: ignore[attr-defined]
+        server.qa_lock = threading.Lock()  # type: ignore[attr-defined]
+        server.agents = agents  # type: ignore[attr-defined]
+        server.provider_status = provider_status  # type: ignore[attr-defined]
+        server.default_provider = default_provider  # type: ignore[attr-defined]
+
+        browser_host = "127.0.0.1" if args.host in {"0.0.0.0", "::"} else args.host
+        url = f"http://{browser_host}:{server.server_port}/"
+        print(f"Roomie Scene QA viewer: {url}")
+        print(source_label)
+        print(
+            "QA providers: "
+            + ", ".join(
+                f"{name}={provider_status[name]['model']}"
+                for name in agents
+            )
+        )
+        if args.browser == "auto" and not args.no_browser:
+            webbrowser.open(url)
         server.serve_forever()
     except KeyboardInterrupt:
         print()
     finally:
-        server.server_close()
+        if server is not None:
+            server.server_close()
+        if transport is not None:
+            transport.close()
     return 0
 
 

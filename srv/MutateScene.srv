@@ -1,0 +1,5 @@
+string request_json
+---
+bool success
+string response_json
+string error

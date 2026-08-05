@@ -140,6 +140,18 @@ def generate_launch_description():
                             enable_boxer,
                             value_type=bool,
                         ),
+                        "artifacts.snapshot_enabled": ParameterValue(
+                            enable_boxer,
+                            value_type=bool,
+                        ),
+                        "artifacts.dam_enabled": ParameterValue(
+                            enable_boxer,
+                            value_type=bool,
+                        ),
+                        "artifacts.embedding_enabled": ParameterValue(
+                            enable_boxer,
+                            value_type=bool,
+                        ),
                         "persistence.save_scene_graph": ParameterValue(
                             enable_boxer,
                             value_type=bool,

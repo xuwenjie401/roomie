@@ -1,8 +1,10 @@
 #pragma once
 
 #include <chrono>
+#include <atomic>
 #include <cstdint>
 #include <deque>
+#include <mutex>
 #include <optional>
 #include <string>
 #include <unordered_map>
@@ -21,18 +23,29 @@ namespace roomie {
 class DetectionBridgeThread : public WorkerThread {
  public:
   DetectionBridgeThread(rclcpp::Node& node,
-                        ThreadSafeQueue<DetectionFrame>& detection_queue,
+                        ThreadSafeQueue<FrameBundlePtr>& detection_queue,
                         ThreadSafeQueue<InferenceResponse>& response_queue,
                         MapProjector& map_projector,
                         InferenceBackend& inference_backend,
                         PipelineConfig config);
 
+  // MapThread invokes this observer after publishing an immutable exact
+  // commit. The callback never performs projection or waits.
+  void onMapCommit(const MapCommit& commit);
+  void cancelPendingCandidate(const FrameBundlePtr& frame,
+                              const std::string& reason);
+  bool perceptionBusy() const;
+
  protected:
   void run() override;
+  void onStopRequested() override;
 
  private:
   struct PendingDebugFrame {
     ImageBuffer image;
+    FrameProvenance provenance;
+    std::chrono::steady_clock::time_point ingest_time;
+    std::chrono::steady_clock::time_point due_time;
     std::chrono::steady_clock::time_point sent_time;
     Eigen::Isometry3f T_world_camera = Eigen::Isometry3f::Identity();
     double projection_ms = 0.0;
@@ -54,12 +67,31 @@ class DetectionBridgeThread : public WorkerThread {
     double frustum_filter_ms = 0.0;
     double projection_loop_ms = 0.0;
     double projection_zbuffer_ms = 0.0;
+    double map_commit_wait_ms = 0.0;
+    double map_commit_latency_ms = 0.0;
+    double projection_compute_ms = 0.0;
     bool surface_cache_ready = false;
     bool view_filtered = false;
   };
 
-  bool readyForNextRequest();
-  InferenceRequest makeRequest(const DetectionFrame& frame, PatchDepth patch_depth) const;
+  struct PendingMapCommit {
+    MapCommit commit;
+    std::chrono::steady_clock::time_point received_at =
+        std::chrono::steady_clock::time_point::min();
+  };
+
+  void admitNextCandidate();
+  void pollActiveCandidate();
+  void processReadyCandidate(FrameBundlePtr frame,
+                             const MapCommit* commit,
+                             double map_commit_wait_ms,
+                             double map_commit_latency_ms);
+  void finishActiveCandidate(const std::string& reason);
+  std::optional<PendingMapCommit> takeMapCommit(const FrameBundle& frame);
+  void pruneMapCommitsLocked(std::chrono::steady_clock::time_point now);
+  void discardUnstartedCandidatesForShutdown();
+  RequestId allocateRequestId();
+  InferenceRequest makeRequest(const FrameBundle& frame, PatchDepth patch_depth);
   void forwardBackendResponses();
   void stashDebugFrame(const InferenceRequest& request,
                        double projection_ms,
@@ -70,7 +102,7 @@ class DetectionBridgeThread : public WorkerThread {
   void publishRawDetectionMarkers(const InferenceResponse& response);
   void maybeLogStatus();
 
-  ThreadSafeQueue<DetectionFrame>& detection_queue_;
+  ThreadSafeQueue<FrameBundlePtr>& detection_queue_;
   ThreadSafeQueue<InferenceResponse>& response_queue_;
   MapProjector& map_projector_;
   InferenceBackend& inference_backend_;
@@ -78,8 +110,25 @@ class DetectionBridgeThread : public WorkerThread {
   rclcpp::Logger logger_;
   rclcpp::Publisher<sensor_msgs::msg::Image>::SharedPtr detection_debug_pub_;
   rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr raw_detection_pub_;
-  std::unordered_map<std::string, PendingDebugFrame> pending_debug_frames_;
-  std::deque<std::string> pending_debug_order_;
+  std::unordered_map<RequestId, PendingDebugFrame> pending_debug_frames_;
+  std::deque<RequestId> pending_debug_order_;
+  mutable std::mutex join_mutex_;
+  std::unordered_map<FrameKey, PendingMapCommit, FrameKeyHash>
+      pending_map_commits_;
+  std::deque<FrameKey> pending_map_commit_order_;
+  std::unordered_map<FrameKey, std::string, FrameKeyHash>
+      cancelled_join_keys_;
+  std::deque<FrameKey> cancelled_join_order_;
+  FrameBundlePtr active_frame_;
+  std::chrono::steady_clock::time_point active_join_started_ =
+      std::chrono::steady_clock::time_point::min();
+  RequestId active_request_id_ = 0;
+  std::atomic_bool perception_busy_{false};
+  bool shutdown_candidates_discarded_ = false;
+  RequestId next_request_id_ = 1;
+  FrameId last_frame_id_ = 0;
+  RequestId last_request_id_ = 0;
+  RequestId last_response_request_id_ = 0;
   std::chrono::steady_clock::time_point last_request_time_;
   std::chrono::steady_clock::time_point last_status_log_time_;
   std::uint64_t frames_seen_ = 0;
@@ -90,6 +139,9 @@ class DetectionBridgeThread : public WorkerThread {
   std::uint64_t requests_sent_ = 0;
   std::uint64_t responses_seen_ = 0;
   std::uint64_t response_errors_ = 0;
+  std::uint64_t map_join_deadlines_ = 0;
+  std::uint64_t map_join_failures_ = 0;
+  std::uint64_t shutdown_candidates_cancelled_ = 0;
   std::uint64_t last_logged_frames_seen_ = 0;
   std::uint64_t last_logged_skipped_rate_ = 0;
   std::uint64_t last_logged_requests_sent_ = 0;
@@ -104,6 +156,10 @@ class DetectionBridgeThread : public WorkerThread {
   double total_frustum_filter_ms_ = 0.0;
   double total_projection_loop_ms_ = 0.0;
   double total_projection_zbuffer_ms_ = 0.0;
+  double total_map_commit_wait_ms_ = 0.0;
+  double total_projection_compute_ms_ = 0.0;
+  double total_response_queue_dwell_ms_ = 0.0;
+  double total_ingest_to_forward_ms_ = 0.0;
   double total_resize_ms_ = 0.0;
   double total_roundtrip_ms_ = 0.0;
   double total_backend_ipc_ms_ = 0.0;

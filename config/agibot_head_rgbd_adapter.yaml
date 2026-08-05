@@ -15,7 +15,6 @@ roomie_agibot_head_rgbd_adapter:
     depth_min_m: 0.1
     depth_max_m: 6.0
     sync_tolerance_sec: 0.002
-    sync_queue_size: 60
     publish_zero_robot_mask: true
 
     # genie_bag_player already publishes the calibrated transforms on

@@ -1,10 +1,14 @@
-# Roomie 架构方案讨论稿：对 `roomie_arch_opus.md` 与 `roomie_arch_sol.md` 的求同存异
+# Roomie 架构讨论收敛记录
 
-## 0. 讨论结论
+> 状态：讨论已收敛，可以开始实现。
+>
+> 本文保留 `roomie_arch_opus.md` 与 `roomie_arch_sol.md` 的比较、裁决理由和待实验项。具体类型、PR 顺序、验收门槛以 [`roomie_arch_coding_plan.md`](roomie_arch_coding_plan.md) 为唯一执行依据；若旧方案中的建议与 coding plan 冲突，以 coding plan 为准。
+
+## 0. 最终结论
 
 两份方案在目标上高度一致，约八成内容可以直接合并。共同判断是：Roomie 的主要矛盾不是少几个线程或参数没有调好，而是缺少**版本化状态、局部失效、明确的调度语义和可恢复的异步制品链**。
 
-建议把双方方案合并为下面这条主线：
+双方方案合并为下面这条主线：
 
 1. `MapActor` 成为 nvblox 唯一写者，主动产出带 revision 的 immutable `SurfaceSnapshot` 和 `MapDelta`，publisher 不再驱动 surface cache 更新。
 2. perception response 先变成带完整 provenance 的 `ObservationEvent`；`SceneReducer` 是 track/object/relation current state 的唯一提交者。
@@ -14,16 +18,16 @@
 6. objects、rooms、relations、descriptions 只有一个 canonical state；JSON 是兼容导出，不再是三份人工同步的事实数据库。
 7. agent tool 从 live query gateway 读取，并在一次回答中 pin 同一个 scene/index revision。
 
-双方真正需要讨论的不是上述方向，而是以下实现选择：
+以下架构契约已经拍板，不再作为实现期间的开放问题：
 
-- 写路径采用“任意 event subscriber 回调”还是“typed command + 单写者 reducer”。
-- 短期拆多把 mutex，还是尽快建立单写者并发布 immutable snapshot。
-- geometry 是否应该反向 refine OBB，以及使用什么证据和安全门限。
-- Python 推理应多 in-flight、batch，还是继续单 in-flight 但做 deadline admission。
-- shared memory、SQLite 热路径、ROI-only snapshot 等优化是否已有数据支持。
-- DAM 的失效依赖是否包含每次 `obb_revision`，还是只依赖真正改变视觉证据的 appearance revision。
+1. 写路径采用 **typed command + 单写者 `SceneReducer`**；event 只负责 committed notification。直接实现目标态，不建设长期存在的拆锁双写过渡架构。
+2. 在线 perception 使用精确、immutable、**已经包含当前 FrameBundle** 的 surface snapshot。`freeze_tsdf_map=true` 是显式例外，必须写入 provenance。
+3. current scene 以内存 revision 为准；SQLite 是异步 durable sidecar。允许异常重启丢失少量未持久化 revision，并公开 live/durable 两个 watermark。
+4. perception 正常运行目标为 p99 10 s；已有场景少量对象的 snapshot/description/embedding 目标为 p95 约 10 s；新场景大量对象 burst 的语义制品目标为 p95 120 s。
+5. DAM 默认依赖 identity、appearance、snapshot set 和模型/schema，不因普通 raw `obb_revision` 变化重算。
+6. 初版保持单 in-flight + deadline admission。OBB refine、multi-in-flight、shared memory、ROI-only 和最终 Top-K/编码参数保留为有验收门槛的实验项。
 
-本文建议：**状态写入采用 reducer，事件用于通知；先补 provenance/metrics，再做 map/surface 局部化；OBB refine、multi-in-flight、shared memory 等保留为有验收门槛的实验项。**
+因此已经没有阻止编码启动的产品或架构决策；剩余不确定性只影响优化幅度和实验 feature flag，不改变主干接口。
 
 ## 1. 双方已达成的共识
 
@@ -83,31 +87,26 @@
 - 给 agent query 引入 `SceneReadToken(scene_revision, semantic_index_generation)`，保证多轮 tool call 的读一致性。
 - 给出 SQLite WAL、checkpoint manifest、JSON 兼容导出和故障注入测试方案。
 
-## 3. 建议采用的合并架构
+## 3. 最终合并架构
 
 ```mermaid
 flowchart TB
-  FB[FrameAssembler / FrameBundle] --> MA[MapActor]
-  FB --> AD[Realtime Admission]
-  MA --> SS[Immutable SurfaceSnapshot]
-  MA --> MD[MapDelta]
-  SS --> AD
-  AD --> PW[Perception Worker]
-  PW --> OE[ObservationEvent]
-  OE --> SR[SceneReducer - only state writer]
-  MD --> GS[Keyed Geometry Scheduler]
-  SR -->|ObbChanged| GS
+  FB[FrameAssembler / FrameBundle] --> AD[Frame / Perception Admission]
+  AD --> MA[MapActor - only map writer]
+  MA -->|MapCommitted + pinned SurfaceSnapshot| PS[PerceptionScheduler]
+  PS --> PW[Perception Worker]
+  PW -->|InferenceResult command| SR[SceneReducer - only scene writer]
+  MA -->|MapDelta| GS[Keyed Geometry Scheduler]
+  SR -->|ObbChanged / ObjectLifecycle| GS
   GS --> GW[Geometry Worker Pool]
-  GW -->|versioned result| SR
+  GW -->|GeometryResult command| SR
   SR --> MVCC[SceneSnapshot / MVCC]
-  SR --> OUT[Durable Artifact Outbox]
-  OUT --> SW[Snapshot materializer]
-  OUT --> DAM[DAM worker]
-  OUT --> EMB[Embedding worker]
-  DAM -->|artifact result| SR
-  EMB --> IDX[Versioned semantic index]
+  SR --> PA[PersistenceActor]
+  PA --> DB[(SQLite WAL + Durable Outbox)]
+  DB --> AW[Snapshot / DAM / Embedding Workers]
+  AW -->|ArtifactResult command| SR
   MVCC --> QG[Scene Query Gateway]
-  IDX --> QG
+  DB --> QG
   QG --> TOOL[Local Agent Tools]
 ```
 
@@ -117,11 +116,13 @@ flowchart TB
 - **Committed Event**：reducer 成功提交 revision 后发布，供 publisher、geometry scheduler、artifact orchestrator 等订阅。
 - **Task Result**：worker 返回的候选结果，必须再次作为 command 进入 reducer 做 dependency 校验。
 
-不建议让 event subscriber 任意回调并直接修改 `WorldState`。否则 event bus 会把现在的隐式线程耦合换成隐式回调耦合，也无法定义并发结果的提交顺序。
+禁止 event subscriber 任意回调并直接修改 `WorldState`。否则 event bus 会把现在的隐式线程耦合换成隐式回调耦合，也无法定义并发结果的提交顺序。
 
 `WorldState` 和 `SceneSnapshot` 可以视为同一个逻辑概念：前者强调完整世界模型，后者强调某个可读取 revision。物理实现不应每次 deep-copy 全图，而应按 geometry/semantic/annotation/artifact 分片，用 immutable component + structural sharing/block COW。
 
-## 4. 存在分歧的设计点
+在线因果屏障是拓扑的一部分：一个被 admission 为 perception candidate 的 `FrameBundle F`，只有在 MapActor 完成 F 的 depth/color integration 并发布与 F 对应的 pinned `SurfaceSnapshot S(F)` 后才能进入 PerceptionScheduler。不能用“当时最新 surface”代替精确的 frame-specific snapshot。
+
+## 4. 曾有分歧及最终裁决
 
 ### 4.1 Event bus 与 SceneReducer
 
@@ -129,7 +130,7 @@ flowchart TB
 
 **Sol 倾向**：typed task/command 进入单写者 reducer，成功提交后再发布 immutable snapshot/event。
 
-**建议**：采用 Sol 的写入约束，保留 Opus 的事件驱动读侧。二者不是二选一：
+**裁决**：采用 Sol 的写入约束，保留 Opus 的事件驱动读侧。二者不是二选一：
 
 - event bus 负责唤醒和 fan-out，不负责决定 current state。
 - reducer 负责顺序、字段 ownership、alias 解析和 stale-result CAS。
@@ -143,13 +144,13 @@ flowchart TB
 
 **Sol 建议**：重计算全部移出 reducer；track/object current state 仍由单写者维护，对外发布 immutable snapshot。
 
-**建议**：目标态选单写者，不把 track 和 graph 变成两个可独立写的锁域。track promotion、merge、object node 和 relation patch 本来就是一个事务；简单拆锁会引入：
+**裁决**：直接实现单写者，不把 track 和 graph 变成两个可独立写的锁域。track promotion、merge、object node 和 relation patch 本来就是一个事务；简单拆锁会引入：
 
 - track 已更新但 graph 尚未同步的可见窗口；
 - snapshot reader 需要获取两把锁或接受混合版本；
 - merge 与 geometry result 的锁顺序/对象生命周期竞态。
 
-短期过渡可以这样做：锁内复制待评估对象的最小 immutable input，放锁后计算，最后重新加锁校验 `obb_revision/map_version` 后提交。建立 reducer 后再删除这段双检逻辑。
+不采用“先拆锁、稳定后再上 reducer”的交付路线。实现可以在 feature branch 内分步搭骨架，但 PR-06/07 必须作为同一切换里程碑完成：reducer 成为唯一写者时，geometry 已经在 worker 中异步计算并通过 dependency token/CAS 回交，不能把重计算临时塞回 reducer。
 
 ### 4.3 Spatial index 采用反向 block map 还是 R-tree
 
@@ -157,7 +158,7 @@ flowchart TB
 
 **Sol 建议**：object expanded AABB R-tree，加 object 的 surface dependency blocks。
 
-**建议**：先用 object AABB spatial index 查询 dirty block 覆盖对象；geometry 计算完成后再记录精确 dependency blocks。原因是双向表在 OBB 每次变化时需要删除旧 block membership、插入新 membership，容易产生维护错误。对象量较小时，R-tree 或 block-AABB query 已足够。
+**初始实现裁决**：先用 object AABB spatial index 查询 dirty block 覆盖对象；geometry 计算完成后再记录精确 dependency blocks。原因是双向表在 OBB 每次变化时需要删除旧 block membership、插入新 membership，容易产生维护错误。对象量较小时，R-tree 或 block-AABB query 已足够。
 
 如果 benchmark 表明 R-tree 查询或依赖判断仍是瓶颈，再增加 `objects_by_block_` 作为可重建 cache，而不是 authoritative state。duplicate merge 也只在空间相交候选中运行。
 
@@ -167,7 +168,7 @@ flowchart TB
 
 **Sol 建议**：第一阶段保留现有 geometry score/verdict，只先解决局部化、版本和调度。
 
-**建议**：认可这是值得做的研究方向，但不进入第一轮默认写路径。PCA 面临以下风险：
+**裁决**：认可这是值得做的研究方向，但不进入第一轮默认写路径。PCA 面临以下风险：
 
 - TSDF surface 可能只覆盖当前可见面，主方向偏向视角而非真实物体方向；
 - 对称物体存在 90°/180° yaw 歧义；
@@ -183,7 +184,7 @@ flowchart TB
 
 **Sol 建议**：deadline + latest-per-camera admission；是否 shared memory/multi-in-flight 先测量。
 
-**建议**：不要把“多 in-flight”当成天然更高 GPU 利用率。当前 Python 进程是同步 read → process → write；仅允许 C++ 多发请求不会产生并行，反而会在 pipe 或 worker 内积压旧帧。要得到重叠收益，至少需要：
+**裁决**：第一版保持单 in-flight，加入 10 s deadline admission 和显式 supersede。不要把“多 in-flight”当成天然更高 GPU 利用率。当前 Python 进程是同步 read → process → write；仅允许 C++ 多发请求不会产生并行，反而会在 pipe 或 worker 内积压旧帧。后续若要得到重叠收益，至少需要：
 
 - 显式 `request_id`，不能只依赖 `time_ns + camera_id`；
 - worker 内部 reader、preprocess、GPU dispatch、writer 分离，或真正 batch；
@@ -191,13 +192,13 @@ flowchart TB
 - deadline/supersede，避免 GPU 计算已经失去实时价值的帧；
 - 显存和 latency benchmark，确认 batch throughput 没有破坏 tail latency。
 
-`max_inference_fps` 仍可作为算力/热设计预算，不能只用 in-flight 上限替代。最终 admission 条件建议同时考虑 `max_fps budget + in_flight + oldest age + camera pose novelty + GPU lease`。
+`max_inference_fps` 仍作为算力/热设计预算，不能只用 in-flight 上限替代。初版 admission 同时考虑 `max_fps budget + in_flight + oldest age + camera pose novelty + GPU lease`。
 
 ### 4.6 Shared memory 是否立即做
 
 Opus 指出 pipe 传 960×960 图像有明显拷贝，方向正确；但“每帧约 2.7 MB”低估了 request：RGB 本身约 2.76 MB，若 mask 为 mono8，还需约 0.92 MB，另有 patch depth 和协议字段，主体约 3.69 MB。
 
-这仍不等于 shared memory 必须先做。pipe 序列化、内核拷贝、resize、OWL、BoxerNet 各自占比需要 profile。建议先加入 `serialize_ms/write_ms/read_ms/worker_queue_ms`；若 IPC 占 end-to-end p95 的显著比例，再引入 memfd/POSIX shm handle。shared memory 同时需要 ownership、超时回收和 worker crash GC，不能只改 wire payload。
+**裁决**：shared memory 不进入第一轮实现。先加入 `serialize_ms/write_ms/read_ms/worker_queue_ms`；若 IPC 占 end-to-end p95 的显著比例，再独立引入 memfd/POSIX shm handle。shared memory 同时需要 ownership、超时回收和 worker crash GC，不能只改 wire payload。
 
 ### 4.7 Snapshot 存 ROI 还是共享完整帧
 
@@ -205,19 +206,19 @@ Opus 指出 pipe 传 960×960 图像有明显拷贝，方向正确；但“每�
 
 **Sol 建议**：content-addressed asset，candidate 可引用 frame ring，入选后 materialize crop/mask 并保留坐标变换。
 
-**建议**：资产模型先支持二者，不预先强制 ROI-only：
+**初始实现裁决**：不采用 ROI-only。先保存 content-addressed、去重的 lossless full-frame asset，并让对象 snapshot 保存 bbox/mask/crop transform 引用；Top-K 初始默认值为 3 且可配置。理由是：
 
 - 同一帧有多个对象时，一张去重 full-frame + 多个 ROI ref 可能比多个 crop 更省空间；
 - DAM bbox fallback、关系判断和 agent visual inspection 有时需要少量上下文；
 - OCR/细纹理可能不适合有损 JPEG；PNG 对照片又可能过大。
 
-应通过实际 snapshot corpus 比较 full-frame dedup、PNG crop、JPEG/WebP crop 的总字节、DAM 质量和 decode latency。无论选择哪种编码，都必须保存 crop transform、mask source 和 source frame hash。
+后续通过实际 snapshot corpus 比较 full-frame dedup、PNG crop、JPEG/WebP crop 的总字节、DAM 质量和 decode latency，再决定是否改变物化格式。无论选择哪种编码，都必须保存 crop transform、mask source 和 source frame hash。
 
 ### 4.8 DAM 的依赖是否包含 `obb_revision`
 
 Opus 的 `DescriptionRecord` 包含 `obb_revision`，并提出 snapshot hash 变化就重算 description。Sol 将 DAM 主要绑定到 identity/appearance revision。
 
-**建议**：默认不把每次 raw `obb_revision` 放进 DAM 失效键。DAM 描述的是视觉外观；对象 OBB 发生小幅融合变化，如果 snapshot/mask/crop 没变，不应重跑大模型。只有当 DAM prompt 确实消费 3D 尺寸/姿态，或 geometry 改变了 snapshot mask/crop 时，才把**量化后的 geometry signature**加入 dependency。
+**裁决**：默认不把每次 raw `obb_revision` 放进 DAM 失效键。DAM 描述的是视觉外观；对象 OBB 发生小幅融合变化，如果 snapshot/mask/crop 没变，不应重跑大模型。只有当 DAM prompt 确实消费 3D 尺寸/姿态，或 geometry 改变了 snapshot mask/crop 时，才把**量化后的 geometry signature**加入 dependency。
 
 同理，primary snapshot 在语义等价视图之间切换也不应立即触发 DAM。应对 `snapshot_set_hash` 做质量迟滞与 debounce，并允许旧 description 作为 stale fallback。
 
@@ -225,31 +226,29 @@ Opus 的 `DescriptionRecord` 包含 `obb_revision`，并提出 snapshot hash 变
 
 Opus 只要求统一 WorldState；Sol 进一步建议 SQLite WAL 保存 scene history、artifacts 和 outbox。
 
-**建议**：durable task/outbox、artifact metadata、alias/tombstone 和 checkpoint manifest 明确使用 SQLite。每一帧 map revision 不写 SQLite；map 本体仍由 nvblox checkpoint 管理。
+**裁决**：SQLite 是异步 durable sidecar，不是 scene hot path 的同步提交门槛。
 
-对象 scene commit 是否同步 write-through SQLite，需要真实 bag 下测试 transaction p95：
+- Reducer 提交后立即发布 live immutable scene revision；PersistenceActor 按 revision 顺序批量写 SQLite WAL。
+- 对外同时公开 `latest_scene_revision` 与 `durable_scene_revision`。异常重启允许丢失二者之间少量、尚未持久化的 revision，不声称 live revision 已经 durable。
+- 初始默认 `flush_period_ms=1000`、soft undurable window 32 revisions、hard window 64 revisions；达到 hard limit 时暂停新的 perception admission 并形成可靠反压，防止丢失窗口无界增长。
+- durable task/outbox、artifact metadata、alias/tombstone 和 checkpoint manifest 使用 SQLite；只有对应 scene revision 已 durable 的 artifact task 才能被 lease。
+- 每一帧 map revision 不写 SQLite；map voxel/layer 仍由 nvblox checkpoint 管理，SQLite 只保存与 checkpoint 对齐的 manifest。
 
-- 若 5～10 Hz 小 transaction 满足 scene commit SLO，可把 SQLite 作为 canonical metadata store。
-- 若 fsync/锁竞争产生长尾，reducer 先发布 in-memory revision，由 persistence actor 批量落盘，并公开 `latest_scene_revision` 与 `durable_scene_revision` 两个 watermark。
-
-不能一边异步落盘，一边仍声称每个已发布 revision 都在掉电后必然恢复；持久性语义必须写清楚。
+SQLite transaction benchmark 仍用于调优 batch、WAL checkpoint 和 flush period，但不再决定 canonical/sidecar 的架构身份。
 
 ### 4.10 实施顺序
 
 Opus 倾向先做 dirty blocks/增量 cache，再做 observability 和 WorldState；Sol 倾向先补全因果字段/metrics，再修 map ownership 和 reducer。
 
-**建议采用混合顺序**：
+**裁决**：实施顺序已经固化到 [`roomie_arch_coding_plan.md`](roomie_arch_coding_plan.md)，本节不再维护另一套可漂移的 PR 清单。其阶段依赖为：
 
-1. **Baseline**：frame/request id、map/surface provenance、queue drop/age、lock wait 和 IPC 分段 timing。
-2. **解除优先级倒置**：publisher 只读 cache；surface refresh 的 ownership 移到 MapThread/MapActor。
-3. **增量 surface spike**：验证当前 nvblox 版本的 dirty-block 获取、TSDF/color dirty 集合、load/reset/full-rebuild fallback。
-4. **Reducer + geometry locality**：先把重计算移出锁，再加 CAS、spatial invalidation、alias/tombstone。
-5. **Perception scheduler benchmark**：比较 single latest、double-buffer、micro-batch、多 in-flight，再决定 IPC/shared memory。
-6. **SnapshotBank + AssetStore**：在线候选、Top-K、生命周期。
-7. **Durable DAM/embedding + live query**：outbox、结构化 artifact、index generation、SceneReadToken。
-8. **OBB refine shadow experiment**：独立验收后决定是否进入融合写路径。
+1. Gate A：provenance、IPC v2、channel policy 与 baseline。
+2. Gate B：MapActor surface ownership、dirty-block incremental snapshot、精确 include-current barrier。
+3. Gate C：单写者 reducer、异步局部 geometry、SQLite durability watermark。
+4. Gate D：在线 SnapshotBank、durable DAM、异步 embedding。
+5. Gate E：live query/tools、canonical rooms/relations 和 schema v3。
 
-这个顺序保留 Opus 的“先拿局部性能收益”，又避免在没有 provenance 和基线指标时改完却无法判断收益或回归。
+OBB refine、multi-in-flight、shared memory 等不属于这条主干依赖链，只能在 baseline 后作为独立 shadow/feature-flag 实验。
 
 ## 5. 需要修正或收窄的事实表述
 
@@ -295,61 +294,63 @@ snapshot remake 的确依赖 frozen workflow，DAM 和 room UI 也都是独立�
 
 `time_ns + camera_id` 当前可用于 debug frame lookup，但不应作为新协议的唯一关联键。重复时间戳、重放、重试、同帧多模型任务和 map epoch 切换都可能冲突，应增加显式 `request_id/task_id`。
 
-## 6. 当前仍拿不准、需要证据的点
+## 6. 已关闭的验证项与剩余实验
 
-| 决策点 | 当前把握 | 为什么尚不能定 | 建议证据/实验 | 通过条件 |
-| --- | --- | --- | --- | --- |
-| 从当前 nvblox `Mapper` 获取 dirty blocks | 中 | integrator 内部已有 updated blocks 和 tracker，但 `integrateDepth()` 公共接口返回 `void`，`getBlocksToUpdate()` 是 protected | 做最小 API spike：公开专用 tracker 或包装 Mapper；验证 depth/color/load/reset | 不消费其他 mesh/stream tracker 状态，dirty set 无漏块 |
-| incremental surface cache 的真实收益 | 高方向、中幅度 | 小场景或高运动时 dirty blocks 可能占全图较大比例；color update 也要处理 | bag replay 对比 full scan 与 dirty rebuild 的 p50/p95、block ratio | surface lag 和 map lock hold 显著下降，无点/颜色遗漏 |
-| detection 应使用“含当前帧”还是“当前帧之前”的 map | 低 | 当前异步行为不确定，Boxer 输入分布可能依赖其中一种 | 固定 causal policy 做 A/B，比较 3D detection/track 稳定性 | 明确写入模型契约，结果优于或不劣于当前 baseline |
-| PCA/局部 surface refine OBB | 低 | 部分可见面、背景污染、对称性和 TSDF 噪声会偏置 | shadow 输出，按类别与后续近距检测/人工 GT 对比 | center/extent/yaw 总体改善，坏例率低于门限 |
-| N in-flight 是否优于 latest-only/micro-batch | 低 | 当前 worker 同步；GPU 模型、显存和 tail latency未知 | profile CPU/GPU timeline，比较 1/2/N in-flight 与 batch | throughput 提升且 p95、stale-frame 比例、显存可接受 |
-| shared memory 的优先级 | 中低 | payload 大，但模型计算可能完全主导总延迟 | 增加 serialize/write/read timing，再做 memfd prototype | IPC 占比达到预设阈值且 prototype 有稳定收益 |
-| patch-depth 能否可靠评估 snapshot occlusion | 低 | 60×60 map projection 粗、可能陈旧，也没有实例 mask/expected object depth | 对有人工遮挡标签的 snapshot 计算相关性 | 对遮挡排序有稳定增益，不误伤细小物体 |
-| Top-K 的 K、视角阈值和编码格式 | 低 | 取决于 DAM 多视图收益、场景大小和磁盘预算 | K=1/3/5 的描述质量、检索指标、总存储实验 | 找到质量收益拐点并满足 asset budget |
-| SQLite 同步 scene commit | 中 | scene 更新频率不高，但磁盘/fsync 环境和历史写放大未知 | 真机 bag + WAL/synchronous 配置 benchmark | reducer commit p95/p99 满足 SLO；否则采用 durable watermark |
-| DAM 是否稳定输出结构化 JSON | 中低 | DAM 当前接口只返回文本，schema adherence 未验证 | 多类别、多视角、bbox/mask 条件下测试 parse/repair rate | schema success、事实正确率和延迟达到门限 |
-| 单 GPU 上 Boxer/DAM/embedding 的调度 | 低 | 模型驻留显存、切换开销、抢占粒度未知 | 记录模型显存、load time、单任务 latency 和并发 OOM | 找到不会破坏 perception deadline 的后台窗口策略 |
-| visibility-aware aging 的遮挡判断 | 中低 | 视锥判断容易，真实 occlusion/free-space 判断较难 | 先只做 in-frustum + scheduler-skipped 保护，再增量加 z-buffer | 降低误 inactive，且不会让消失对象长期 active |
+### 6.1 已关闭，不再阻塞接口设计
 
-其中前三项最应优先验证：dirty-block 接口、causal map policy 和 baseline profile 会直接影响后续接口设计。
+- **dirty-block 公共 API 已确认存在。** 本地 nvblox 的 `ProjectiveTsdfIntegrator::integrateFrame(..., updated_blocks)` 与 `ProjectiveAppearanceIntegrator<ColorLayer>::integrateFrame(..., updated_blocks)` 都可直接返回更新块；`Mapper` 也公开 TSDF/color integrator 与 layer 的非 const accessor。不需要访问 protected `getBlocksToUpdate()`，也不消费 `BlocksToUpdateTracker`。
+- **direct integrator 的风险是 wrapper side effect，不是 dirty set 可得性。** 实现必须复用同一 CUDA stream、补齐 layer `updateGpuHash()`，并用回归测试确认 depth preprocessing、last posed depth 和内部 tracker 等当前未依赖的行为没有造成回归。
+- **causal map policy 已确定。** 在线 detection 使用精确“含当前帧”snapshot；frozen map 是带 provenance 的显式例外，不再做 previous-frame A/B 来决定架构契约。
+- **持久性身份已确定。** SQLite 是异步 sidecar；性能测试只调参数，不再决定是否同步 canonical。
 
-## 7. 建议向 Opus 方案继续追问的问题
+### 6.2 仍需数据决定，但不阻塞主干实现
 
-1. `WorldStateStore::commit(delta)` 是否保证所有写入严格串行？subscriber 能否提交嵌套 delta，若能，如何避免重入和事件顺序歧义？
-2. “不可变 WorldState”准备使用全量复制、persistent data structure，还是 component-level COW？对象 history、snapshot refs 和 surface blocks 如何避免复制放大？
-3. 计划通过当前 nvblox 哪个公共 API 取得专用 dirty-block 集合？如何同时覆盖 TSDF 和 color 更新，又不消费 mesh/layer streamer 的 tracker 状态？
-4. `tracks_mutex_` 与 `graph_mutex_` 分拆后，怎样保证 promotion/merge/graph snapshot 的原子一致性和固定锁顺序？
-5. 多 in-flight 的 worker 内部并行模型是什么：线程、async pipeline、CUDA streams 还是 micro-batch？预期优化的是 throughput 还是单帧 latency？
-6. PCA OBB refine 如何排除桌面/墙面等 support geometry，如何处理对称物体和部分表面？是否接受只按少数 label 开启？
-7. 为什么 DAM dependency 必须包含每次 `obb_revision`？如果 snapshot 像素、mask 和 prompt 没变，期望从 OBB 变化中获得什么描述信息？
-8. ROI-only snapshot 是否会损失 DAM/agent 消歧所需上下文？是否考虑 full-frame content dedup + ROI/mask refs？
-9. event bus “消除轮询”是性能目标还是代码简化目标？现有 `waitPopFor` 已由 CV 唤醒，预期可量化收益是什么？
+| 实验项 | 为什么仍需实验 | 默认行为 | 改变默认的通过条件 |
+| --- | --- | --- | --- |
+| incremental surface cache 的真实收益 | 高运动或小地图时 dirty blocks 可能接近全图 | 实现 dirty-block COW，并保留 full fallback | 与 full rebuild 等价，且 surface lag/map lock hold 明显下降 |
+| R-tree 与 `objects_by_block_` | 对象数、OBB 更新率和 dirty block 密度决定维护成本 | AABB spatial index + result dependency blocks | 反向 block cache 在真实 bag 上稳定降低总 CPU，且一致性测试通过 |
+| PCA/局部 surface refine OBB | 部分可见面、背景污染、对称性会偏置 | 仅 shadow 输出，不写回 | 分类别 center/extent/yaw 改善且坏例率低于门限 |
+| N in-flight 或 micro-batch | 当前 worker 同步，显存和 tail latency 未知 | 单 in-flight + deadline admission | throughput 提升且 perception p99、stale ratio、显存均达标 |
+| shared memory | 模型计算可能远大于 IPC 拷贝 | pipe IPC + 分段 timing | IPC 占 p95 达到预设阈值，prototype 有稳定净收益且 crash GC 完整 |
+| patch-depth occlusion 评分 | 60×60 投影粗，缺少稳定实例深度证据 | 不作为 snapshot hard gate | 人工遮挡集上排序稳定增益，且不误伤细小物体 |
+| Top-K、视角阈值和编码 | 取决于 DAM 收益、磁盘和 decode 成本 | `K=3` 可配置；去重 lossless full-frame + ROI refs | corpus 上找到质量/容量拐点并满足 asset budget |
+| DAM 结构化 schema | 当前接口只返回文本 | structured parse + repair + unstructured fallback | schema success、事实正确率和延迟达到设定门限 |
+| 单 GPU 模型调度 | 驻留显存、切换成本和抢占粒度未知 | perception 最高优先级；artifact quiet-window/lease | 不破坏 perception 10 s SLO，并满足 interactive/bulk 制品目标 |
+| visibility-aware aging | 视锥容易，真实遮挡/free-space 较难 | 先做 in-frustum 与 scheduler-skipped 保护 | 降低误 inactive，且不会让消失对象长期 active |
 
-## 8. 可以立即形成的联合决策记录
+这些实验必须建立在统一 provenance 与真实 bag baseline 上，以独立 feature flag/shadow output 进行；实验失败不应迫使 reducer、revision 或 outbox 接口返工。
 
-以下内容证据已经足够，建议直接写成 ADR，不再反复讨论：
+## 7. 原开放问题的关闭答案
 
-1. **ADR：Scene current state 只有一个写入者。** 所有 worker 返回 candidate result，由 reducer 校验后提交。
-2. **ADR：每个派生产物携带最小 dependency token。** map reset 使用 epoch；object merge 使用 alias/tombstone。
-3. **ADR：publisher 不触发 map cache rebuild。** map/surface freshness 由 MapActor 自己负责并显式度量。
-4. **ADR：inference result 不允许静默 drop。** 传感器帧可以按 policy supersede，但必须有 reason/metric。
-5. **ADR：geometry 不在 scene-state 临界区做全图扫描。** 计算 pin immutable input，提交时 CAS。
-6. **ADR：snapshot 在线化并支持多证据。** 具体 K 和编码由实验决定。
-7. **ADR：DAM/embedding 不在实时路径和 agent tool call 中执行重计算。** 使用 durable outbox 和预计算索引。
-8. **ADR：JSON 是兼容导出。** rooms、relations、description 只在 canonical scene state 中维护一份。
-9. **ADR：一次 agent answer pin scene 与 semantic-index generation。** tool response 返回 freshness/provenance。
+1. 所有 current-state 写入由 `SceneReducer` 严格串行提交；subscriber 不允许嵌套写 current state，只能发新 command。
+2. immutable scene 使用 component-level COW/structural sharing；surface 使用 block COW，不做每 revision 全图 deep copy。
+3. dirty blocks 直接从 TSDF/color integrator 的 `updated_blocks` 出参取得，不读取 Mapper 的共享 tracker。
+4. 不建立 `tracks_mutex_` 与 `graph_mutex_` 两个 authoritative 写域；promotion/merge/object/relation 在 reducer 内作为一个 revision 提交。
+5. 初版不实现多 in-flight；未来并行形态由 CPU/GPU timeline 和 tail-latency benchmark 决定。
+6. OBB refine 只做 shadow、按类别验收；未经数据证明不进入默认融合写路径。
+7. DAM dependency 默认不含 raw `obb_revision`，只在 prompt 真正消费 3D 几何时加入量化 geometry signature。
+8. snapshot 初版保留去重 full-frame 上下文与 ROI/mask refs，不采用不可逆的 ROI-only 设计。
+9. event bus 的主要目标是明确 command/event/result 语义和减少隐式定时耦合，不把消除 CV timeout wakeup 作为核心性能收益。
 
-## 9. 最小联合落地闭环
+## 8. 生效中的联合 ADR
 
-第一轮实现不应同时引入所有服务。双方方案合并后的最小闭环建议为：
+1. **ADR-001：MapActor 是 map/surface 唯一写者。** publisher 只读 immutable snapshot，不触发 cache rebuild。
+2. **ADR-002：SceneReducer 是 current scene 唯一写者。** 所有 worker 只返回 candidate result。
+3. **ADR-003：在线 perception 使用含当前帧的精确 surface。** frame-specific snapshot 必须 immutable；frozen mode 显式标注例外。
+4. **ADR-004：所有派生产物携带 provenance 与最小 dependency token。** map reset 使用 epoch，merge/delete 使用 alias/tombstone，提交使用 CAS。
+5. **ADR-005：channel policy 按业务语义区分。** inference result 不静默丢失；输入 supersede、backpressure 和 drop 都有 reason/metric。
+6. **ADR-006：geometry 不在 scene-state 临界区做全图扫描。** `MapDelta + ObbChanged` 局部调度，worker pin immutable input。
+7. **ADR-007：snapshot 在线化并支持多证据。** 初始 Top-K 为 3 且可配置，资产 content-addressed 并带证据来源。
+8. **ADR-008：SQLite 是异步 durable sidecar。** 公开 live/durable watermark，允许 bounded undurable window，map 本体归 nvblox checkpoint。
+9. **ADR-009：DAM/embedding 是 durable 派生任务。** 不在实时路径或首次 tool call 中重算，晚到结果经 reducer 校验。
+10. **ADR-010：canonical scene 只有一份。** objects、rooms、relations、descriptions 由 scene state 管理，JSON 只是兼容导入导出。
+11. **ADR-011：一次 agent answer pin 一致读版本。** query 使用 scene revision 与 semantic-index generation，并返回 freshness/provenance。
+12. **ADR-012：调度服从已确认 SLO。** perception p99 10 s；少量更新制品 p95 约 10 s；新对象 burst 制品 p95 120 s。artifact 逾期记录 violation，不因到期本身丢弃。
 
-1. 增加 `frame_id/request_id/map_epoch/map_revision/surface_revision`，并让 Python response 原样返回。
-2. 给全部 channel 增加 queue age、drop/supersede/backpressure 结果；将 inference result channel 改为可靠交付。
-3. 把 surface refresh 从 publisher 移到 MapThread，先发布 immutable full snapshot；随后完成 dirty-block incremental spike。
-4. geometry evaluator 接收 pinned object input + pinned surface，退出 `InstanceMapThread::mutex_`；结果按 `object_id/obb_revision/surface_revision` 校验提交。
-5. MapDelta 只调度受影响对象，duplicate merge 只检查空间邻域。
+## 9. 实现交接
 
-完成这个闭环后，再根据 profile 决定 inference multi-in-flight/shared memory，并并行建设 SnapshotBank。DAM、embedding、SceneQueryGateway 应建立在同一套 revision/task 契约上，而不是各自再造一套后台队列。
+本讨论记录不再维护独立的“最小闭环”或替代实施顺序。实现者应直接执行 [`roomie_arch_coding_plan.md`](roomie_arch_coding_plan.md) 中的 PR-01～PR-13 和 Gate A～E；所有 PR 共享同一套 ID、revision、command、dependency token、outbox 与 freshness 契约。
+
+当前没有需要用户继续拍板的阻塞项。若实现中出现会改变模型输入分布、外部数据契约或允许丢失窗口的新问题，再新增 ADR 并请求决策；性能参数和内部文件拆分由实现者依据基准自主决定。
 
 最终共识可以概括为一句话：**Opus 提出的“局部化和性能关键路径”与 Sol 提出的“版本化提交和持久异步任务”不是竞争方案；前者决定系统算得动，后者保证系统算晚了、算重了或进程重启后仍然算得对。**

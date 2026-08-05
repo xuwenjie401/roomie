@@ -4,11 +4,13 @@
 #include <array>
 #include <cctype>
 #include <chrono>
+#include <cmath>
 #include <cstdint>
 #include <ctime>
 #include <fstream>
 #include <iomanip>
 #include <map>
+#include <set>
 #include <sstream>
 #include <utility>
 
@@ -17,7 +19,7 @@
 namespace roomie {
 namespace {
 
-constexpr int kRoomieObjectGraphFormatVersion = 2;
+constexpr int kRoomieObjectGraphFormatVersion = 3;
 constexpr const char* kRoomieObjectGraphFormat = "roomie_object_graph";
 constexpr const char* kRoomieManualSceneGraphFormat = "roomie_manual_scene_graph";
 
@@ -94,6 +96,10 @@ json bboxToJson(const std::array<float, 4>& value) {
   return json::array({value[0], value[1], value[2], value[3]});
 }
 
+json vector2fToJson(const std::array<float, 2>& value) {
+  return json::array({value[0], value[1]});
+}
+
 Eigen::Vector3f vector3fFromJson(const json& value) {
   Eigen::Vector3f result = Eigen::Vector3f::Zero();
   if (!value.is_array()) {
@@ -122,6 +128,18 @@ std::array<float, 4> bboxFromJson(const json& value) {
     return result;
   }
   for (int i = 0; i < 4 && i < static_cast<int>(value.size()); ++i) {
+    result[static_cast<std::size_t>(i)] =
+        value.at(static_cast<std::size_t>(i)).get<float>();
+  }
+  return result;
+}
+
+std::array<float, 2> vector2fFromJson(const json& value) {
+  std::array<float, 2> result = {0.0f, 0.0f};
+  if (!value.is_array()) {
+    return result;
+  }
+  for (int i = 0; i < 2 && i < static_cast<int>(value.size()); ++i) {
     result[static_cast<std::size_t>(i)] =
         value.at(static_cast<std::size_t>(i)).get<float>();
   }
@@ -243,10 +261,42 @@ std::map<int, float> semanticWeightsFromJson(const json& value) {
 json snapshotRefToJson(const ObjectSnapshotRef& snapshot) {
   json value;
   value["image_index"] = snapshot.image_index;
+  value["source_frame_asset_id"] = snapshot.source_frame_asset_id;
+  value["evidence_hash"] = snapshot.evidence_hash;
   value["bbox_xyxy"] = bboxToJson(snapshot.bbox_xyxy);
+  value["crop_xywh"] = bboxToJson(snapshot.crop_xywh);
+  value["crop_output_scale"] = snapshot.crop_output_scale;
+  value["mask_source"] = snapshot.mask_source;
+  value["mask_ref"] = snapshot.mask_ref;
   value["quality"] = snapshot.quality;
+  value["quality_components"] = snapshot.quality_components;
+  value["viewpoint"] = json{{"azimuth_rad", snapshot.viewpoint_azimuth_rad},
+                             {"elevation_rad", snapshot.viewpoint_elevation_rad},
+                             {"scale", snapshot.viewpoint_scale}};
   value["time_ns"] = snapshot.time_ns;
   value["camera_id"] = snapshot.camera_id;
+  value["provenance"] =
+      json{{"run_id", json{{"high", snapshot.provenance.run_id.high},
+                             {"low", snapshot.provenance.run_id.low}}},
+           {"frame_id", snapshot.provenance.frame_id},
+           {"request_id", snapshot.provenance.request_id},
+           {"sensor_time_ns", snapshot.provenance.sensor_time_ns},
+           {"map_mode", static_cast<int>(snapshot.provenance.map_mode)},
+           {"includes_current_frame",
+            snapshot.provenance.includes_current_frame},
+           {"causality_verified", snapshot.provenance.causality_verified},
+           {"map",
+            json{{"epoch_high", snapshot.provenance.map.map_epoch.high},
+                 {"epoch_low", snapshot.provenance.map.map_epoch.low},
+                 {"revision", snapshot.provenance.map.map_revision},
+                 {"integrated_through_ns",
+                  snapshot.provenance.map.integrated_through_ns}}},
+           {"surface",
+            json{{"epoch_high", snapshot.provenance.surface.map_epoch.high},
+                 {"epoch_low", snapshot.provenance.surface.map_epoch.low},
+                 {"revision", snapshot.provenance.surface.surface_revision},
+                 {"source_map_revision",
+                  snapshot.provenance.surface.source_map_revision}}}};
   return value;
 }
 
@@ -256,10 +306,64 @@ ObjectSnapshotRef snapshotRefFromJson(const json& value) {
     return snapshot;
   }
   snapshot.image_index = value.value("image_index", -1);
+  snapshot.source_frame_asset_id =
+      value.value("source_frame_asset_id", std::string());
+  snapshot.evidence_hash = value.value("evidence_hash", std::string());
   snapshot.bbox_xyxy = bboxFromJson(value.value("bbox_xyxy", json::array()));
+  snapshot.crop_xywh = bboxFromJson(value.value("crop_xywh", json::array()));
+  snapshot.crop_output_scale = value.value(
+      "crop_output_scale", std::array<float, 2>{1.0f, 1.0f});
+  snapshot.mask_source =
+      value.value("mask_source", std::string("bbox_fallback"));
+  snapshot.mask_ref = value.value("mask_ref", std::string());
   snapshot.quality = value.value("quality", 0.0f);
+  snapshot.quality_components = value.value(
+      "quality_components", std::map<std::string, float>{});
+  const json viewpoint = value.value("viewpoint", json::object());
+  snapshot.viewpoint_azimuth_rad =
+      viewpoint.value("azimuth_rad", 0.0f);
+  snapshot.viewpoint_elevation_rad =
+      viewpoint.value("elevation_rad", 0.0f);
+  snapshot.viewpoint_scale = viewpoint.value("scale", 1.0f);
   snapshot.time_ns = value.value("time_ns", TimeNanoseconds{0});
   snapshot.camera_id = value.value("camera_id", std::string());
+  const json provenance = value.value("provenance", json::object());
+  const json run_id = provenance.value("run_id", json::object());
+  snapshot.provenance.run_id.high =
+      run_id.value("high", std::uint64_t{0});
+  snapshot.provenance.run_id.low =
+      run_id.value("low", std::uint64_t{0});
+  snapshot.provenance.frame_id =
+      provenance.value("frame_id", FrameId{0});
+  snapshot.provenance.request_id =
+      provenance.value("request_id", RequestId{0});
+  snapshot.provenance.sensor_time_ns =
+      provenance.value("sensor_time_ns", TimeNanoseconds{0});
+  snapshot.provenance.map_mode =
+      provenance.value("map_mode", 0) == 1 ? MapMode::kFrozen
+                                            : MapMode::kOnline;
+  snapshot.provenance.includes_current_frame =
+      provenance.value("includes_current_frame", false);
+  snapshot.provenance.causality_verified =
+      provenance.value("causality_verified", false);
+  const json map = provenance.value("map", json::object());
+  snapshot.provenance.map.map_epoch.high =
+      map.value("epoch_high", std::uint64_t{0});
+  snapshot.provenance.map.map_epoch.low =
+      map.value("epoch_low", std::uint64_t{0});
+  snapshot.provenance.map.map_revision =
+      map.value("revision", std::uint64_t{0});
+  snapshot.provenance.map.integrated_through_ns =
+      map.value("integrated_through_ns", TimeNanoseconds{0});
+  const json surface = provenance.value("surface", json::object());
+  snapshot.provenance.surface.map_epoch.high =
+      surface.value("epoch_high", std::uint64_t{0});
+  snapshot.provenance.surface.map_epoch.low =
+      surface.value("epoch_low", std::uint64_t{0});
+  snapshot.provenance.surface.surface_revision =
+      surface.value("revision", std::uint64_t{0});
+  snapshot.provenance.surface.source_map_revision =
+      surface.value("source_map_revision", std::uint64_t{0});
   return snapshot;
 }
 
@@ -414,13 +518,102 @@ ObjectNode objectNodeFromJson(const json& value) {
   return object;
 }
 
+json roomNodeToJson(const RoomNode& room) {
+  json value;
+  value["room_id"] = room.room_id;
+  value["revision"] = room.revision;
+  value["label"] = room.label;
+  value["color"] = room.color;
+  value["center_world"] = vector3fToJson(room.center_world);
+  value["size_m"] = vector3fToJson(room.size_m);
+  if (room.has_xy_bounds) {
+    value["min_xy"] = vector2fToJson(room.min_xy);
+    value["max_xy"] = vector2fToJson(room.max_xy);
+  }
+  value["height_m"] = room.height_m;
+  if (!room.attributes.empty()) {
+    value["attributes"] = room.attributes;
+  }
+  return value;
+}
+
+RoomNode roomNodeFromJson(const json& value) {
+  RoomNode room;
+  room.room_id = value.value("room_id", value.value("id", -1));
+  room.revision = value.value("revision", std::uint64_t{0});
+  room.label = value.value("label", value.value("name", std::string()));
+  room.color = value.value("color", std::string());
+  room.center_world =
+      vector3fFromJson(value.value("center_world", json::array()));
+  room.size_m = vector3fFromJson(value.value("size_m", json::array()));
+  if (value.contains("min_xy") && value.contains("max_xy") &&
+      value.at("min_xy").is_array() && value.at("max_xy").is_array() &&
+      value.at("min_xy").size() >= 2 && value.at("max_xy").size() >= 2) {
+    room.min_xy = vector2fFromJson(value.at("min_xy"));
+    room.max_xy = vector2fFromJson(value.at("max_xy"));
+    room.has_xy_bounds = true;
+  } else if (room.size_m.x() > 0.0f && room.size_m.y() > 0.0f) {
+    room.min_xy = {room.center_world.x() - 0.5f * room.size_m.x(),
+                   room.center_world.y() - 0.5f * room.size_m.y()};
+    room.max_xy = {room.center_world.x() + 0.5f * room.size_m.x(),
+                   room.center_world.y() + 0.5f * room.size_m.y()};
+    room.has_xy_bounds = true;
+  }
+  room.height_m = value.value("height_m", room.size_m.z());
+  if (value.contains("attributes") && value.at("attributes").is_object()) {
+    for (auto it = value.at("attributes").begin();
+         it != value.at("attributes").end(); ++it) {
+      if (it.value().is_string()) {
+        room.attributes[it.key()] = it.value().get<std::string>();
+      }
+    }
+  }
+  return room;
+}
+
+const char* entityTypeToString(SceneEntityType type) {
+  return type == SceneEntityType::kRoom ? "room" : "object";
+}
+
+SceneEntityType entityTypeFromString(const std::string& value) {
+  return lowercase(value) == "room" ? SceneEntityType::kRoom
+                                     : SceneEntityType::kObject;
+}
+
+json entityRefToJson(SceneEntityRef ref) {
+  return json{{"type", entityTypeToString(ref.type)}, {"id", ref.id}};
+}
+
+SceneEntityRef entityRefFromJson(const json& value,
+                                 SceneEntityType default_type,
+                                 int default_id) {
+  if (!value.is_object()) {
+    return SceneEntityRef{default_type, default_id};
+  }
+  const std::string type = value.value("type", std::string());
+  return SceneEntityRef{
+      type.empty() ? default_type : entityTypeFromString(type),
+      value.value("id", default_id)};
+}
+
 json relationToJson(const ObjectRelation& relation) {
   json value;
-  value["source_object_id"] = relation.source_object_id;
-  value["target_object_id"] = relation.target_object_id;
+  const SceneEntityRef source = relationSource(relation);
+  const SceneEntityRef target = relationTarget(relation);
+  value["source"] = entityRefToJson(source);
+  value["target"] = entityRefToJson(target);
+  // Object-only legacy readers can continue consuming v3 relations.
+  if (source.type == SceneEntityType::kObject) {
+    value["source_object_id"] = source.id;
+  }
+  if (target.type == SceneEntityType::kObject) {
+    value["target_object_id"] = target.id;
+  }
   value["relation_type"] = relation.relation_type;
   value["confidence"] = relation.confidence;
   value["description"] = relation.description;
+  value["revision"] = relation.revision;
+  value["derived"] = relation.derived;
   return value;
 }
 
@@ -428,9 +621,21 @@ ObjectRelation relationFromJson(const json& value) {
   ObjectRelation relation;
   relation.source_object_id = value.value("source_object_id", -1);
   relation.target_object_id = value.value("target_object_id", -1);
+  const SceneEntityRef source = entityRefFromJson(
+      value.value("source", json::object()), SceneEntityType::kObject,
+      relation.source_object_id);
+  const SceneEntityRef target = entityRefFromJson(
+      value.value("target", json::object()), SceneEntityType::kObject,
+      relation.target_object_id);
+  setRelationEndpoints(&relation, source, target);
   relation.relation_type = value.value("relation_type", std::string());
   relation.confidence = value.value("confidence", 0.0f);
   relation.description = value.value("description", std::string());
+  relation.revision = value.value("revision", std::uint64_t{0});
+  relation.derived = value.value(
+      "derived", relation.relation_type == "room_contains_object" &&
+                     source.type == SceneEntityType::kRoom &&
+                     target.type == SceneEntityType::kObject);
   return relation;
 }
 
@@ -447,6 +652,10 @@ json objectGraphToJson(const ObjectGraphSnapshot& snapshot,
   for (const ObjectNode& object : snapshot.objects) {
     root["objects"].push_back(objectNodeToJson(object));
   }
+  root["rooms"] = json::array();
+  for (const RoomNode& room : snapshot.rooms) {
+    root["rooms"].push_back(roomNodeToJson(room));
+  }
   root["relations"] = json::array();
   for (const ObjectRelation& relation : snapshot.relations) {
     root["relations"].push_back(relationToJson(relation));
@@ -455,33 +664,13 @@ json objectGraphToJson(const ObjectGraphSnapshot& snapshot,
   for (const ObjectSnapshotImage& image : snapshot.snapshot_images) {
     root["snapshot_images"].push_back(snapshotImageToJson(image));
   }
+  if (!snapshot.import_warnings.empty()) {
+    root["migration_warnings"] = snapshot.import_warnings;
+  }
   root["notes"] =
       "near_surface_voxels are cached map-local references for debugging; "
       "runtime geometry checks rebuild object-map coupling from the current map.";
   return root;
-}
-
-void updateTopLevelObjectSnapshots(json* root,
-                                   const ObjectGraphSnapshot& snapshot) {
-  if (root == nullptr || !root->contains("objects") || !root->at("objects").is_array()) {
-    return;
-  }
-  std::map<int, ObjectSnapshotRef> snapshot_by_object_id;
-  for (const ObjectNode& object : snapshot.objects) {
-    snapshot_by_object_id[object.object_id] = object.snapshot;
-  }
-  for (json& object_json : root->at("objects")) {
-    if (!object_json.is_object()) {
-      continue;
-    }
-    const int object_id = object_json.value("object_id", -1);
-    const auto it = snapshot_by_object_id.find(object_id);
-    if (it == snapshot_by_object_id.end() || !it->second.valid()) {
-      object_json.erase("snapshot");
-      continue;
-    }
-    object_json["snapshot"] = snapshotRefToJson(it->second);
-  }
 }
 
 json snapshotToJson(const ObjectGraphSnapshot& snapshot,
@@ -493,11 +682,36 @@ json snapshotToJson(const ObjectGraphSnapshot& snapshot,
   }
   try {
     json root = json::parse(snapshot.scene_graph_json);
-    root["object_graph"] = object_graph;
+    // Schema v3 has exactly one canonical object list. Preserve envelope-only
+    // metadata (map, root, source paths, etc.) but remove the legacy nested
+    // object graph before overwriting every canonical scene field.
+    root.erase("object_graph");
+    root["format"] = kRoomieManualSceneGraphFormat;
+    root["format_version"] = kRoomieObjectGraphFormatVersion;
     root["world_frame"] = world_frame;
     root["saved_time_ns"] = saved_time_ns;
-    root["snapshot_images"] = object_graph.value("snapshot_images", json::array());
-    updateTopLevelObjectSnapshots(&root, snapshot);
+    root["next_object_id"] = snapshot.next_object_id;
+    root["objects"] = object_graph.at("objects");
+    root["rooms"] = object_graph.at("rooms");
+    root["relations"] = object_graph.at("relations");
+    root["snapshot_images"] = object_graph.at("snapshot_images");
+    if (object_graph.contains("migration_warnings")) {
+      root["migration_warnings"] = object_graph.at("migration_warnings");
+    } else {
+      root.erase("migration_warnings");
+    }
+    if (root.contains("root") && root.at("root").is_object()) {
+      json object_ids = json::array();
+      for (const ObjectNode& object : snapshot.objects) {
+        object_ids.push_back(object.object_id);
+      }
+      json room_ids = json::array();
+      for (const RoomNode& room : snapshot.rooms) {
+        room_ids.push_back(room.room_id);
+      }
+      root["root"]["object_ids"] = std::move(object_ids);
+      root["root"]["room_ids"] = std::move(room_ids);
+    }
     return root;
   } catch (const std::exception&) {
     return object_graph;
@@ -506,6 +720,7 @@ json snapshotToJson(const ObjectGraphSnapshot& snapshot,
 
 ObjectGraphSnapshot snapshotFromJson(const json& root) {
   ObjectGraphSnapshot snapshot;
+  snapshot.schema_version = root.value("format_version", 1);
   snapshot.next_object_id = root.value("next_object_id", 0);
 
   const json objects = root.value("objects", json::array());
@@ -513,6 +728,14 @@ ObjectGraphSnapshot snapshotFromJson(const json& root) {
     snapshot.objects.reserve(objects.size());
     for (const json& object_json : objects) {
       snapshot.objects.push_back(objectNodeFromJson(object_json));
+    }
+  }
+
+  const json rooms = root.value("rooms", json::array());
+  if (rooms.is_array()) {
+    snapshot.rooms.reserve(rooms.size());
+    for (const json& room_json : rooms) {
+      snapshot.rooms.push_back(roomNodeFromJson(room_json));
     }
   }
 
@@ -530,7 +753,145 @@ ObjectGraphSnapshot snapshotFromJson(const json& root) {
       snapshot.snapshot_images.push_back(snapshotImageFromJson(image_json));
     }
   }
+  snapshot.import_warnings =
+      root.value("migration_warnings", std::vector<std::string>());
   return snapshot;
+}
+
+bool indexObjectsById(const json& objects,
+                      std::map<int, const json*>* indexed,
+                      std::string* conflict) {
+  if (!objects.is_array()) {
+    if (conflict != nullptr) {
+      *conflict = "objects must be an array";
+    }
+    return false;
+  }
+  for (const json& object : objects) {
+    if (!object.is_object()) {
+      if (conflict != nullptr) {
+        *conflict = "objects contains a non-object entry";
+      }
+      return false;
+    }
+    const int object_id = object.value("object_id", -1);
+    if (object_id < 0 || !indexed->emplace(object_id, &object).second) {
+      if (conflict != nullptr) {
+        *conflict = "objects contains an invalid or duplicate object_id " +
+                    std::to_string(object_id);
+      }
+      return false;
+    }
+  }
+  return true;
+}
+
+bool compatibleDuplicateObjects(const json& top_objects,
+                                const json& nested_objects,
+                                std::string* conflict) {
+  std::map<int, const json*> top;
+  std::map<int, const json*> nested;
+  if (!indexObjectsById(top_objects, &top, conflict) ||
+      !indexObjectsById(nested_objects, &nested, conflict)) {
+    return false;
+  }
+  if (top.size() != nested.size()) {
+    if (conflict != nullptr) {
+      *conflict = "top-level and nested objects contain different id sets";
+    }
+    return false;
+  }
+  const auto is_legacy_relationship_field = [](const std::string& field) {
+    static const std::set<std::string> fields = {
+        "parent_room_ids", "parent_object_ids", "child_object_ids",
+        "room_id", "rooms"};
+    return fields.count(field) != 0;
+  };
+  for (const auto& [object_id, top_object] : top) {
+    const auto nested_it = nested.find(object_id);
+    if (nested_it == nested.end()) {
+      if (conflict != nullptr) {
+        *conflict = "top-level object " + std::to_string(object_id) +
+                    " is absent from nested object_graph";
+      }
+      return false;
+    }
+    for (auto field_it = top_object->begin(); field_it != top_object->end();
+         ++field_it) {
+      const std::string& field = field_it.key();
+      if (!is_legacy_relationship_field(field) &&
+          nested_it->second->contains(field) &&
+          field_it.value() != nested_it->second->at(field)) {
+        if (conflict != nullptr) {
+          *conflict = "object " + std::to_string(object_id) + " field '" +
+                      field + "' differs between top-level and nested lists";
+        }
+        return false;
+      }
+    }
+  }
+  return true;
+}
+
+json mergeCompatibleDuplicateObjects(const json& top_objects,
+                                     const json& nested_objects) {
+  std::map<int, const json*> top;
+  std::string ignored;
+  indexObjectsById(top_objects, &top, &ignored);
+  json merged = nested_objects;
+  static const std::set<std::string> kLegacyRelationshipFields = {
+      "parent_room_ids", "parent_object_ids", "child_object_ids",
+      "room_id", "rooms"};
+  for (json& object : merged) {
+    const auto top_it = top.find(object.value("object_id", -1));
+    if (top_it == top.end()) {
+      continue;
+    }
+    for (auto field_it = top_it->second->begin();
+         field_it != top_it->second->end(); ++field_it) {
+      if (!object.contains(field_it.key()) &&
+          kLegacyRelationshipFields.count(field_it.key()) == 0) {
+        object[field_it.key()] = field_it.value();
+      }
+    }
+  }
+  return merged;
+}
+
+bool validateCanonicalSnapshot(const ObjectGraphSnapshot& snapshot,
+                               std::string* error) {
+  std::set<int> object_ids;
+  for (const ObjectNode& object : snapshot.objects) {
+    if (object.object_id < 0 || !object_ids.insert(object.object_id).second) {
+      setError(error, "canonical objects contains an invalid or duplicate id");
+      return false;
+    }
+  }
+  std::set<int> room_ids;
+  for (const RoomNode& room : snapshot.rooms) {
+    if (room.room_id < 0 || !room_ids.insert(room.room_id).second) {
+      setError(error, "canonical rooms contains an invalid or duplicate id");
+      return false;
+    }
+  }
+  for (const ObjectRelation& relation : snapshot.relations) {
+    const SceneEntityRef source = relationSource(relation);
+    const SceneEntityRef target = relationTarget(relation);
+    if (!source.valid() || !target.valid() || relation.relation_type.empty()) {
+      setError(error, "canonical relations contains an invalid endpoint or type");
+      return false;
+    }
+    const auto exists = [&](SceneEntityRef endpoint) {
+      return endpoint.type == SceneEntityType::kRoom
+                 ? room_ids.count(endpoint.id) != 0
+                 : object_ids.count(endpoint.id) != 0;
+    };
+    if (!exists(source) || !exists(target)) {
+      setError(error, "canonical relation endpoint does not exist");
+      return false;
+    }
+  }
+  return true;
 }
 
 bool writeJsonAtomic(const json& value, const std::filesystem::path& path, std::string* error) {
@@ -623,6 +984,9 @@ bool saveObjectGraphSnapshotJsonAtomic(const ObjectGraphSnapshot& snapshot,
                                        TimeNanoseconds saved_time_ns,
                                        const std::filesystem::path& path,
                                        std::string* error) {
+  if (!validateCanonicalSnapshot(snapshot, error)) {
+    return false;
+  }
   return writeJsonAtomic(snapshotToJson(snapshot, world_frame, saved_time_ns), path, error);
 }
 
@@ -632,6 +996,9 @@ bool saveObjectGraphSnapshotJson(const ObjectGraphSnapshot& snapshot,
                                  const std::string& configured_path,
                                  ObjectGraphSavePaths* paths,
                                  std::string* error) {
+  if (!validateCanonicalSnapshot(snapshot, error)) {
+    return false;
+  }
   ObjectGraphSavePaths resolved;
   if (!resolveObjectGraphSavePaths(configured_path, saved_time_ns, &resolved, error)) {
     return false;
@@ -667,31 +1034,100 @@ bool loadObjectGraphSnapshotJson(const std::filesystem::path& path,
     }
     const json root = json::parse(stream);
     const std::string format = root.value("format", std::string());
-    const json* object_graph_root = &root;
+    json canonical_root = root;
+    bool manual_envelope = false;
     if (format == kRoomieManualSceneGraphFormat) {
-      if (!root.contains("object_graph") || !root.at("object_graph").is_object()) {
-        setError(error, "manual scene graph does not contain object_graph");
+      manual_envelope = true;
+      const int envelope_version = root.value("format_version", 1);
+      if (envelope_version > kRoomieObjectGraphFormatVersion) {
+        setError(error, "unsupported manual scene graph version: " +
+                            std::to_string(envelope_version));
         return false;
       }
-      object_graph_root = &root.at("object_graph");
+      const bool has_nested =
+          root.contains("object_graph") && root.at("object_graph").is_object();
+      const bool has_top_objects =
+          root.contains("objects") && root.at("objects").is_array();
+      if (!has_nested && !has_top_objects) {
+        setError(error,
+                 "manual scene graph contains neither canonical objects nor "
+                 "a legacy object_graph");
+        return false;
+      }
+      if (envelope_version >= 3 && has_nested) {
+        setError(error,
+                 "schema v3 manual scene graph must not contain a nested "
+                 "object_graph; objects have a single canonical top-level list");
+        return false;
+      }
+      if (has_nested) {
+        canonical_root = root.at("object_graph");
+        const std::string nested_format =
+            canonical_root.value("format", std::string());
+        if (!nested_format.empty() &&
+            nested_format != kRoomieObjectGraphFormat) {
+          setError(error, "unsupported embedded object graph format: " +
+                              nested_format);
+          return false;
+        }
+        const int nested_version = canonical_root.value("format_version", 1);
+        if (nested_version > kRoomieObjectGraphFormatVersion) {
+          setError(error, "unsupported embedded DSG JSON version: " +
+                              std::to_string(nested_version));
+          return false;
+        }
+        if (has_top_objects) {
+          std::string conflict;
+          if (!compatibleDuplicateObjects(root.at("objects"),
+                                          canonical_root.value(
+                                              "objects", json::array()),
+                                          &conflict)) {
+            setError(error,
+                     "manual scene graph object conflict: " + conflict);
+            return false;
+          }
+          canonical_root["objects"] = mergeCompatibleDuplicateObjects(
+              root.at("objects"), canonical_root.at("objects"));
+          canonical_root["migration_warnings"].push_back(
+              "legacy manual envelope contained duplicate compatible object "
+              "lists; nested object_graph objects were selected");
+        }
+        // Legacy manual envelopes own rooms and cross-layer relations at the
+        // top level. Overlay them onto the selected object graph once.
+        for (const char* field : {"rooms", "relations", "snapshot_images"}) {
+          if (root.contains(field)) {
+            canonical_root[field] = root.at(field);
+          }
+        }
+        if (root.contains("next_object_id")) {
+          canonical_root["next_object_id"] = root.at("next_object_id");
+        }
+      }
     } else if (!format.empty() && format != kRoomieObjectGraphFormat) {
       setError(error, "unsupported DSG JSON format: " + format);
       return false;
     }
 
     const std::string object_graph_format =
-        object_graph_root->value("format", std::string());
+        canonical_root.value("format", std::string());
     if (!object_graph_format.empty() && object_graph_format != kRoomieObjectGraphFormat) {
-      setError(error, "unsupported embedded object graph format: " + object_graph_format);
-      return false;
+      // A schema-v3 manual envelope is itself the canonical graph root.
+      if (!(manual_envelope &&
+            object_graph_format == kRoomieManualSceneGraphFormat)) {
+        setError(error, "unsupported embedded object graph format: " + object_graph_format);
+        return false;
+      }
     }
-    const int version = object_graph_root->value("format_version", 0);
+    const int version = canonical_root.value("format_version", 1);
     if (version > kRoomieObjectGraphFormatVersion) {
       setError(error, "unsupported DSG JSON version: " + std::to_string(version));
       return false;
     }
-    *snapshot = snapshotFromJson(*object_graph_root);
-    if (format == kRoomieManualSceneGraphFormat) {
+    *snapshot = snapshotFromJson(canonical_root);
+    if (!validateCanonicalSnapshot(*snapshot, error)) {
+      return false;
+    }
+    if (manual_envelope) {
       snapshot->has_scene_graph_envelope = true;
       snapshot->scene_graph_json = root.dump();
     }
@@ -708,7 +1144,7 @@ bool loadObjectGraphSnapshotJson(const std::filesystem::path& path,
           (uri_path.is_absolute() ? uri_path : base_dir / uri_path).string();
     }
     if (world_frame != nullptr) {
-      *world_frame = object_graph_root->value(
+      *world_frame = canonical_root.value(
           "world_frame",
           root.value("world_frame", std::string()));
     }

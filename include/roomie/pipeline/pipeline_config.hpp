@@ -6,6 +6,8 @@
 
 #include <rclcpp/rclcpp.hpp>
 
+#include "roomie/pipeline/types.hpp"
+
 namespace roomie {
 
 struct PipelineConfig {
@@ -55,6 +57,7 @@ struct PipelineConfig {
   int patch_depth_zbuffer_min_cells_per_patch = 1;
   bool detection_enabled = true;
   double max_inference_fps = 10.0;
+  int perception_deadline_ms = 10000;
   bool python_backend_enabled = true;
   std::string python_executable = "/home/lindenbot/miniconda3/envs/jarvis/bin/python";
   std::string python_worker_script =
@@ -101,34 +104,26 @@ struct PipelineConfig {
   float instance_fusion_prior_mass_cap = 6.0f;
   int instance_high_quality_min_count = 3;
   float instance_high_quality_min_mass = 1.8f;
-  double instance_geometry_check_period_sec = 2.0;
-  double instance_geometry_recent_window_sec = 5.0;
   float instance_geometry_shell_thickness_m = 0.08f;
   int instance_geometry_empty_inside_points = 6;
   int instance_geometry_min_unique_voxels = 12;
   float instance_geometry_confirm_score = 0.62f;
   float instance_geometry_suppress_score = 0.35f;
-  float instance_geometry_recover_score = 0.55f;
-  int instance_geometry_failures_before_suppress = 2;
-  int instance_geometry_inactive_delete_bad_count = 3;
-  float instance_geometry_empty_small_object_max_volume_m3 = 0.025f;
-  float instance_geometry_empty_small_object_max_extent_m = 0.65f;
-  float instance_geometry_reevaluate_center_delta_m = 0.12f;
-  float instance_geometry_reevaluate_size_ratio = 0.20f;
-  float instance_geometry_reevaluate_yaw_delta_deg = 15.0f;
   float instance_confirmed_geometry_edge_freeze_weight = 0.999f;
   float instance_confirmed_geometry_large_min_volume_m3 = 0.35f;
   float instance_confirmed_geometry_far_center_shift_ratio = 0.08f;
   float instance_confirmed_geometry_far_center_shift_min_m = 0.04f;
   float instance_confirmed_geometry_center_shift_min_extent_m = 0.25f;
+  // Retained diagnostic evidence is recent-only; all-time promotion/support
+  // aggregates remain independent scalar counters.
+  std::size_t instance_observation_history_capacity = 256;
   std::size_t input_queue_size = 30;
-  std::size_t output_queue_size = 2;
-  std::size_t sync_queue_size = 30;
   std::size_t pending_frame_limit = 120;
   std::size_t mapping_queue_size = 30;
   std::size_t detection_queue_size = 8;
   std::size_t inference_request_queue_size = 2;
   std::size_t inference_response_queue_size = 8;
+  int shutdown_drain_timeout_ms = 5000;
 
   double max_image_stamp_delta_sec = 0.002;
   double tf_buffer_duration_sec = 5.0;
@@ -140,11 +135,77 @@ struct PipelineConfig {
 
   bool load_map = true;
   std::string map_load_path;
+  // coordinated: a durable scene may only be restored with its published map
+  // manifest. seed: the configured map is an explicit new base and all
+  // durable scene-derived state is discarded before startup.
+  std::string map_load_mode = "coordinated";
   bool freeze_tsdf_map = false;
   bool save_map = false;
   std::string map_save_path;
   bool load_scene_graph = false;
   std::string scene_graph_load_path;
+  bool scene_store_enabled = true;
+  std::string scene_store_path = "/tmp/roomie_scene.sqlite3";
+  int scene_store_flush_period_ms = 1000;
+  std::size_t scene_store_flush_batch_size = 16;
+  std::size_t scene_store_queue_size = 64;
+  SceneRevision scene_store_soft_lag_revisions = 32;
+  SceneRevision scene_store_hard_lag_revisions = 64;
+  int scene_store_terminal_failure_timeout_ms = 5000;
+  bool online_snapshot_enabled = true;
+  std::string asset_store_root = "/tmp/roomie_assets";
+  std::size_t snapshot_top_k = 3;
+  std::size_t snapshot_queue_size = 32;
+  std::size_t snapshot_control_queue_size = 64;
+  float snapshot_minimum_quality = 0.02f;
+  float snapshot_azimuth_bucket_degrees = 45.0f;
+  float snapshot_elevation_bucket_degrees = 30.0f;
+  float snapshot_scale_bucket_ratio = 1.41421356f;
+  float snapshot_diversity_min_quality_ratio = 0.65f;
+  double asset_gc_grace_period_sec = 300.0;
+  int asset_gc_period_ms = 60000;
+  bool dam_artifacts_enabled = true;
+  std::string dam_model_id = "nvidia-dam-3b-official-v1";
+  // Optional expected canonical hash. Empty computes it from all resident DAM
+  // execution parameters; a non-empty mismatch is a startup error.
+  std::string dam_prompt_hash;
+  std::string dam_output_schema_version = "roomie.dam.v1";
+  std::string dam_python_executable =
+      "/home/lindenbot/RealityLab/.venvs/roomie-dam/bin/python";
+  std::string dam_worker_script =
+      "/home/lindenbot/RealityLab/jarvis/src/roomie/scripts/roomie_python_dam_worker.py";
+  std::string dam_source = "/home/lindenbot/RealityLab/describe-anything";
+  std::string dam_model_path = "/home/lindenbot/hugging_face/DAM-3B";
+  std::string dam_conversation_mode = "v1";
+  std::string dam_prompt_mode = "full+focal_crop";
+  std::string dam_query =
+      "<image>\nDescribe only the visible object inside the masked region in detail. "
+      "Include its color, material, shape, parts, pose, and distinctive visual "
+      "details. Do not describe unrelated background.";
+  int dam_max_new_tokens = 256;
+  double dam_temperature = 0.2;
+  double dam_top_p = 0.9;
+  double dam_bbox_pad_px = 2.0;
+  int dam_startup_timeout_ms = 120000;
+  int dam_request_timeout_ms = 120000;
+  int dam_shutdown_timeout_ms = 500;
+  int artifact_new_object_window_ms = 10000;
+  std::size_t artifact_new_object_interactive_limit = 5;
+  bool embedding_artifacts_enabled = true;
+  std::string embedding_model_id = "sentence-t5-large.local.v1";
+  std::size_t embedding_dimension = 768;
+  std::string embedding_python_executable =
+      "/home/lindenbot/miniconda3/envs/jarvis/bin/python";
+  std::string embedding_worker_script =
+      "/home/lindenbot/RealityLab/jarvis/src/roomie/scripts/roomie_sentence_transformer_worker.py";
+  std::string embedding_model_path =
+      "/home/lindenbot/hugging_face/sentence_t5_large";
+  std::string embedding_device = "cpu";
+  std::size_t embedding_batch_size = 16;
+  std::size_t embedding_record_history_capacity = 1024;
+  int embedding_startup_timeout_ms = 120000;
+  int embedding_request_timeout_ms = 120000;
+  int embedding_shutdown_timeout_ms = 500;
   bool freeze_instances = false;
   bool save_scene_graph = true;
   std::string scene_graph_save_path;

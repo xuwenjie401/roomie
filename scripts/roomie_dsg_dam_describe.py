@@ -1,5 +1,11 @@
 #!/usr/bin/env python3
-"""Replace Roomie DSG object descriptions with DAM-generated descriptions."""
+"""DEPRECATED compatibility-only DAM JSON copier.
+
+This script writes an offline JSON copy and never updates Roomie's live
+authoritative scene. Runtime descriptions are produced by the durable DAM
+worker and committed through SceneReducer; human edits use
+``/roomie/mutate_scene``.
+"""
 
 from __future__ import annotations
 
@@ -25,13 +31,17 @@ from roomie_dsg_viewer import (
 )
 
 
-DEFAULT_DAAAM_SRC = Path("/home/agxi/RealityLab/memory_ws/src/daaam/src")
+DEFAULT_DAM_SRC = Path("/home/lindenbot/RealityLab/describe-anything")
 LOCAL_DAM_MODEL = Path("/home/lindenbot/hugging_face/DAM-3B")
 DEFAULT_QUERY = (
-    "Describe only the visible object inside the masked region in detail. "
+    "<image>\nDescribe only the visible object inside the masked region in detail. "
     "Include its color, material, shape, parts, pose, and distinctive visual "
     "details. Do not describe unrelated background."
 )
+PROMPT_MODES = {
+    "focal_prompt": "full+focal_crop",
+    "full+focal_crop": "full+focal_crop",
+}
 
 
 def default_model_path() -> str:
@@ -110,10 +120,11 @@ def parse_args() -> argparse.Namespace:
         help="checkpoint output after this many object updates",
     )
     parser.add_argument(
-        "--daaam-src",
+        "--dam-src",
+        dest="dam_src",
         type=Path,
-        default=DEFAULT_DAAAM_SRC,
-        help="source path added to PYTHONPATH before importing daaam",
+        default=DEFAULT_DAM_SRC,
+        help="official NVlabs/describe-anything checkout added to PYTHONPATH",
     )
     parser.add_argument(
         "--dry-run",
@@ -282,9 +293,17 @@ def atomic_write_json(path: Path, root: dict[str, Any]) -> None:
 
 
 def prepare_dam_agent(args: argparse.Namespace):
-    daaam_src = as_path(args.daaam_src)
-    if daaam_src is not None and daaam_src.exists():
-        sys.path.insert(0, str(daaam_src))
+    dam_src = as_path(args.dam_src)
+    if dam_src is not None:
+        if not dam_src.is_dir():
+            raise FileNotFoundError(f"official DAM source directory not found: {dam_src}")
+        sys.path.insert(0, str(dam_src))
+
+    prompt_mode = PROMPT_MODES.get(args.prompt_mode)
+    if prompt_mode is None:
+        raise ValueError(f"unsupported official DAM prompt mode: {args.prompt_mode}")
+    if "<image>" not in args.query:
+        raise ValueError("official DAM query must contain the <image> token")
 
     model_path = Path(args.model_path).expanduser()
     if model_path.exists():
@@ -293,7 +312,7 @@ def prepare_dam_agent(args: argparse.Namespace):
         args.model_path = str(model_path.resolve())
 
     import torch
-    from daaam.query_manager.dam import DAMAgentPanoptic
+    from dam import DescribeAnythingModel, disable_torch_init
 
     print(
         "Torch CUDA: "
@@ -302,10 +321,11 @@ def prepare_dam_agent(args: argparse.Namespace):
         f"cuda={torch.version.cuda}"
     )
     print(f"DAM model path: {args.model_path}")
-    return DAMAgentPanoptic(
+    disable_torch_init()
+    return DescribeAnythingModel(
         model_path=args.model_path,
         conv_mode=args.conv_mode,
-        prompt_mode=args.prompt_mode,
+        prompt_mode=prompt_mode,
     )
 
 
@@ -352,12 +372,14 @@ def describe_object(agent: Any,
     mask = make_bbox_mask(image.size, bbox_xyxy, args.bbox_pad_px)
     if mask is None:
         raise ValueError("invalid or empty bbox mask")
-    description = agent.query_single(
-        image=image,
-        mask=mask,
-        query=args.query,
+    description = agent.get_description(
+        image,
+        mask,
+        args.query,
+        streaming=False,
         temperature=args.temperature,
         top_p=args.top_p,
+        num_beams=1,
         max_new_tokens=args.max_new_tokens,
     )
     return str(description or "").strip()
@@ -365,6 +387,11 @@ def describe_object(agent: Any,
 
 def main() -> int:
     args = parse_args()
+    print(
+        "DEPRECATED compatibility-only path: output JSON is not live "
+        "authoritative scene state.",
+        file=sys.stderr,
+    )
     json_path, config_path = resolve_input_path(args)
     output_path = choose_output_path(json_path, args.output, args.force_output)
 

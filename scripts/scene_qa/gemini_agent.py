@@ -53,12 +53,44 @@ class QaResponse:
     history: dict[str, Any]
 
 
+class _CompatValue:
+    """Small google.genai.types-shaped value used by injected fake clients."""
+
+    def __init__(self, **kwargs: Any):
+        for key, value in kwargs.items():
+            setattr(self, key, value)
+
+
+class _CompatPart(_CompatValue):
+    @classmethod
+    def from_text(cls, *, text: str) -> "_CompatPart":
+        return cls(text=text)
+
+    @classmethod
+    def from_function_response(
+        cls, *, name: str, response: dict[str, Any]
+    ) -> "_CompatPart":
+        return cls(name=name, response=response)
+
+    @classmethod
+    def from_bytes(cls, *, data: bytes, mime_type: str) -> "_CompatPart":
+        return cls(data=data, mime_type=mime_type)
+
+
+class _CompatTypes:
+    Part = _CompatPart
+    Content = _CompatValue
+    FunctionDeclaration = _CompatValue
+    Tool = _CompatValue
+    GenerateContentConfig = _CompatValue
+
+
 class GeminiSceneQaAgent:
     """Manual Gemini function-calling loop with auditable local tool execution."""
 
     def __init__(
         self,
-        graph: GraphStore,
+        graph: GraphStore | None,
         registry: ToolRegistry,
         config: SceneQaConfig,
         *,
@@ -70,10 +102,13 @@ class GeminiSceneQaAgent:
             from google import genai
             from google.genai import types
         except ImportError as exc:
-            raise RuntimeError(
-                "google-genai is required. Activate the jarvis conda environment "
-                "or install google-genai."
-            ) from exc
+            if client is None:
+                raise RuntimeError(
+                    "google-genai is required. Activate the jarvis conda environment "
+                    "or install google-genai."
+                ) from exc
+            genai = None
+            types = _CompatTypes
 
         self.graph = graph
         self.registry = registry
@@ -82,13 +117,28 @@ class GeminiSceneQaAgent:
         self._progress_callback = progress_callback
         if client is None:
             sanitize_proxy_environment()
-        self._client = client or genai.Client(
-            api_key=api_key
-            or os.environ.get("GEMINI_API_KEY")
-            or os.environ.get("GOOGLE_API_KEY")
-        )
+        if client is not None:
+            self._client = client
+        else:
+            assert genai is not None
+            self._client = genai.Client(
+                api_key=api_key
+                or os.environ.get("GEMINI_API_KEY")
+                or os.environ.get("GOOGLE_API_KEY")
+            )
 
     def answer_query(self, query: str) -> QaResponse:
+        session = self.registry.begin_answer()
+        try:
+            return self._answer_query_in_session(query, session)
+        finally:
+            self.registry.end_answer()
+
+    def _answer_query_in_session(
+        self,
+        query: str,
+        session: dict[str, Any] | None,
+    ) -> QaResponse:
         types = self._types
         contents = [
             types.Content(
@@ -98,11 +148,14 @@ class GeminiSceneQaAgent:
         ]
         history: dict[str, Any] = {
             "query": query,
-            "graph_json": str(self.graph.json_path),
+            "graph_json": str(self.graph.json_path) if self.graph is not None else None,
+            "source": "offline_json" if self.graph is not None else "live_query_service",
             "model": self.config.gemini_model,
             "tools": self.registry.list_tools(),
             "iterations": [],
         }
+        if session is not None:
+            history["read_session"] = session
 
         for iteration in range(1, self.config.max_iterations + 1):
             self._emit_progress(

@@ -10,12 +10,14 @@
 #include <limits>
 #include <map>
 #include <memory>
+#include <future>
 #include <optional>
 #include <set>
 #include <sstream>
 #include <tuple>
 #include <utility>
 
+#include "roomie/dsg/observation_history.hpp"
 #include "roomie/utils/run_logger.hpp"
 
 namespace roomie {
@@ -32,21 +34,6 @@ double elapsedMs(std::chrono::steady_clock::time_point start,
 struct Aabb {
   Eigen::Vector3f min = Eigen::Vector3f::Zero();
   Eigen::Vector3f max = Eigen::Vector3f::Zero();
-};
-
-struct GeometryEvaluation {
-  float score = 0.0f;
-  float shell_ratio = 0.0f;
-  float extent_score = 0.0f;
-  float leak_ratio = 1.0f;
-  float cavity_ratio = 0.0f;
-  int in_box_points = 0;
-  int shell_points = 0;
-  int cavity_points = 0;
-  int expanded_points = 0;
-  int unique_voxels = 0;
-  std::vector<VoxelRef, Eigen::aligned_allocator<VoxelRef>> voxel_refs;
-  std::string reason;
 };
 
 template <typename T>
@@ -68,8 +55,68 @@ float rawDetectionConfidence(const RawDetection& detection) {
   return clamp01(0.5f * (detection.score_2d + detection.score_3d));
 }
 
-TimeNanoseconds secondsToNanoseconds(double seconds) {
-  return static_cast<TimeNanoseconds>(seconds * 1000000000.0);
+MergeObjectsMutation durableMergeMutation(
+    const SceneSnapshot& before,
+    SceneObjectId retired_object_id,
+    SceneObjectId canonical_object_id,
+    std::size_t top_k) {
+  MergeObjectsMutation mutation;
+  mutation.retired_object_id = retired_object_id;
+  mutation.canonical_object_id = canonical_object_id;
+  const SceneObjectPtr retired = before.findExactObject(retired_object_id);
+  const SceneObjectPtr canonical = before.findExactObject(canonical_object_id);
+  if (!retired || !canonical || !retired->artifact || !canonical->artifact ||
+      top_k == 0U) {
+    return mutation;
+  }
+
+  std::map<std::string, ObjectSnapshotRef> unique;
+  const auto collect = [&unique](const std::vector<ObjectSnapshotRef>& refs) {
+    for (const ObjectSnapshotRef& reference : refs) {
+      if (reference.evidence_hash.empty() ||
+          reference.source_frame_asset_id.empty()) {
+        return false;
+      }
+      auto [it, inserted] =
+          unique.emplace(reference.evidence_hash, reference);
+      if (!inserted && reference.quality > it->second.quality) {
+        it->second = reference;
+      }
+    }
+    return true;
+  };
+  if (!collect(canonical->artifact->snapshots) ||
+      !collect(retired->artifact->snapshots) || unique.empty()) {
+    return mutation;
+  }
+
+  std::vector<ObjectSnapshotRef> merged;
+  merged.reserve(unique.size());
+  for (auto& [hash, reference] : unique) {
+    (void)hash;
+    merged.push_back(std::move(reference));
+  }
+  std::sort(merged.begin(), merged.end(),
+            [](const ObjectSnapshotRef& lhs,
+               const ObjectSnapshotRef& rhs) {
+              const float lhs_quality =
+                  std::isfinite(lhs.quality) ? lhs.quality : -1.0f;
+              const float rhs_quality =
+                  std::isfinite(rhs.quality) ? rhs.quality : -1.0f;
+              if (std::abs(lhs_quality - rhs_quality) > kEpsilon) {
+                return lhs_quality > rhs_quality;
+              }
+              return lhs.evidence_hash < rhs.evidence_hash;
+            });
+  if (merged.size() > top_k) {
+    merged.resize(top_k);
+  }
+  mutation.merged_snapshot_set_hash =
+      snapshotSetHashForReferences(merged);
+  if (!mutation.merged_snapshot_set_hash.empty()) {
+    mutation.merged_snapshots = std::move(merged);
+  }
+  return mutation;
 }
 
 float normalizeYaw(float yaw) {
@@ -411,117 +458,147 @@ float observationBboxQuality(const InferenceResponse& response,
   return std::max(kEpsilon, confidence * edge_weight * distance_weight);
 }
 
-GeometryEvaluation evaluateGeometryAgainstSurface(
-    const InstanceTrack& track,
-    const GeometrySurfaceCache& surface_cache,
-    float shell_thickness_m,
-    int min_unique_voxels) {
-  GeometryEvaluation evaluation;
-  if ((track.size_m.array() <= 0.0f).any() || surface_cache.surface_points.empty()) {
-    evaluation.reason = "no_surface_points";
-    return evaluation;
+std::pair<float, float> snapshotPatchBlurAndExposure(
+    const ImageBuffer& image, const std::array<float, 4>& bbox) {
+  if (image.empty() || image.channels <= 0) {
+    return {1.0f, 1.0f};
   }
-
-  const Eigen::Vector3f half = 0.5f * track.size_m;
-  const float min_half = std::max(kEpsilon, half.minCoeff());
-  const float shell = std::min(std::max(shell_thickness_m, 0.0f), 0.85f * min_half);
-  const Eigen::Vector3f inner_half =
-      (half.array() - shell).max(0.0f).matrix();
-  const Eigen::Vector3f expanded_half =
-      (half.array() + std::max(shell, 0.02f)).matrix();
-  const Aabb expanded_world_aabb =
-      yawAabb(track.center_world, 2.0f * expanded_half, track.yaw_rad);
-  const float c = std::cos(-track.yaw_rad);
-  const float s = std::sin(-track.yaw_rad);
-
-  Eigen::Vector3f local_min =
-      Eigen::Vector3f::Constant(std::numeric_limits<float>::infinity());
-  Eigen::Vector3f local_max =
-      Eigen::Vector3f::Constant(-std::numeric_limits<float>::infinity());
-  std::set<std::tuple<int, int, int, int, int, int>> unique_voxels;
-
-  for (const MapSurfacePoint& surface_point : surface_cache.surface_points) {
-    const Eigen::Vector3f& point_world = surface_point.position_world;
-    if (!point_world.allFinite()) {
-      continue;
+  const int x0 = std::clamp(
+      static_cast<int>(std::floor(std::min(bbox[0], bbox[2]))),
+      0, image.width - 1);
+  const int y0 = std::clamp(
+      static_cast<int>(std::floor(std::min(bbox[1], bbox[3]))),
+      0, image.height - 1);
+  const int x1 = std::clamp(
+      static_cast<int>(std::ceil(std::max(bbox[0], bbox[2]))),
+      x0 + 1, image.width);
+  const int y1 = std::clamp(
+      static_cast<int>(std::ceil(std::max(bbox[1], bbox[3]))),
+      y0 + 1, image.height);
+  const std::size_t pixel_stride = static_cast<std::size_t>(image.channels);
+  const std::size_t row_stride =
+      static_cast<std::size_t>(image.width) * pixel_stride;
+  if (image.data.size() <
+      static_cast<std::size_t>(image.height) * row_stride) {
+    return {1.0f, 1.0f};
+  }
+  const int sample_step = std::max(
+      1, static_cast<int>(std::sqrt(
+             static_cast<double>((x1 - x0) * (y1 - y0)) / 4096.0)));
+  double luminance_sum = 0.0;
+  double gradient_sum = 0.0;
+  std::size_t samples = 0;
+  std::size_t gradient_samples = 0;
+  const auto luminance = [&image, pixel_stride, row_stride](int x, int y) {
+    const std::size_t offset = static_cast<std::size_t>(y) * row_stride +
+                               static_cast<std::size_t>(x) * pixel_stride;
+    if (image.channels == 1) {
+      return static_cast<float>(image.data[offset]);
     }
-    if ((point_world.array() < expanded_world_aabb.min.array()).any() ||
-        (point_world.array() > expanded_world_aabb.max.array()).any()) {
-      continue;
-    }
-    const Eigen::Vector3f delta = point_world - track.center_world;
-    const Eigen::Vector3f local(c * delta.x() - s * delta.y(),
-                                s * delta.x() + c * delta.y(),
-                                delta.z());
-    const Eigen::Vector3f abs_local = local.cwiseAbs();
-    const bool inside_expanded = (abs_local.array() <= expanded_half.array()).all();
-    if (!inside_expanded) {
-      continue;
-    }
-    ++evaluation.expanded_points;
-    const bool inside_box = (abs_local.array() <= half.array()).all();
-    if (!inside_box) {
-      continue;
-    }
-    ++evaluation.in_box_points;
-    if (surface_point.has_voxel_ref) {
-      const auto key = std::make_tuple(surface_point.voxel_ref.block_index.x(),
-                                       surface_point.voxel_ref.block_index.y(),
-                                       surface_point.voxel_ref.block_index.z(),
-                                       surface_point.voxel_ref.voxel_index.x(),
-                                       surface_point.voxel_ref.voxel_index.y(),
-                                       surface_point.voxel_ref.voxel_index.z());
-      const auto [unused_it, inserted] = unique_voxels.insert(key);
-      (void)unused_it;
-      if (inserted) {
-        evaluation.voxel_refs.push_back(surface_point.voxel_ref);
+    // rgb8 and bgr8 use the same coefficients after swapping red/blue only
+    // up to a small quality heuristic error; no color fact is derived here.
+    return 0.299f * static_cast<float>(image.data[offset]) +
+           0.587f * static_cast<float>(image.data[offset + 1]) +
+           0.114f * static_cast<float>(image.data[offset + 2]);
+  };
+  for (int y = y0; y < y1; y += sample_step) {
+    for (int x = x0; x < x1; x += sample_step) {
+      const float value = luminance(x, y);
+      luminance_sum += value;
+      ++samples;
+      if (x + sample_step < x1) {
+        gradient_sum += std::abs(value - luminance(x + sample_step, y));
+        ++gradient_samples;
+      }
+      if (y + sample_step < y1) {
+        gradient_sum += std::abs(value - luminance(x, y + sample_step));
+        ++gradient_samples;
       }
     }
-    local_min = local_min.cwiseMin(local);
-    local_max = local_max.cwiseMax(local);
-    const bool inside_cavity = (abs_local.array() < inner_half.array()).all();
-    if (!inside_cavity) {
-      ++evaluation.shell_points;
-    } else {
-      ++evaluation.cavity_points;
-    }
   }
-  evaluation.unique_voxels =
-      unique_voxels.empty() ? evaluation.in_box_points
-                            : static_cast<int>(unique_voxels.size());
+  if (samples == 0) {
+    return {1.0f, 1.0f};
+  }
+  const float mean = static_cast<float>(luminance_sum / samples);
+  const float exposure = clamp01(
+      1.0f - std::abs(mean - 127.5f) / 127.5f);
+  const float blur =
+      gradient_samples == 0
+          ? 0.5f
+          : clamp01(static_cast<float>(gradient_sum / gradient_samples) /
+                    24.0f);
+  return {blur, exposure};
+}
 
-  if (evaluation.in_box_points <= 0) {
-    evaluation.reason = "empty_box";
-    return evaluation;
+SnapshotCandidate makeOnlineSnapshotCandidate(
+    const InferenceResponse& response,
+    const InstanceObservation& observation,
+    std::shared_ptr<const ImageBuffer> full_frame) {
+  SnapshotCandidate candidate;
+  candidate.full_frame = std::move(full_frame);
+  candidate.bbox_xyxy = observation.detection.box_xyxy;
+  candidate.mask_source = SnapshotMaskSource::kBboxFallback;
+  candidate.time_ns = observation.time_ns;
+  candidate.camera_id = observation.camera_id;
+  candidate.provenance = response.provenance;
+  candidate.quality.confidence = observation.confidence;
+  candidate.quality.edge_completeness = edgeCompletenessWeight(
+      observation.detection,
+      candidate.full_frame ? candidate.full_frame->width : 0);
+  float unused_distance = 0.0f;
+  candidate.quality.distance = distanceQualityWeight(
+      response, observation.detection, &unused_distance);
+
+  if (candidate.full_frame && !candidate.full_frame->empty()) {
+    const float width = static_cast<float>(candidate.full_frame->width);
+    const float height = static_cast<float>(candidate.full_frame->height);
+    const float x0 = std::clamp(
+        std::min(candidate.bbox_xyxy[0], candidate.bbox_xyxy[2]), 0.0f,
+        width);
+    const float x1 = std::clamp(
+        std::max(candidate.bbox_xyxy[0], candidate.bbox_xyxy[2]), 0.0f,
+        width);
+    const float y0 = std::clamp(
+        std::min(candidate.bbox_xyxy[1], candidate.bbox_xyxy[3]), 0.0f,
+        height);
+    const float y1 = std::clamp(
+        std::max(candidate.bbox_xyxy[1], candidate.bbox_xyxy[3]), 0.0f,
+        height);
+    const float area_ratio = std::max(
+        kEpsilon, (x1 - x0) * (y1 - y0) / std::max(1.0f, width * height));
+    const float dx = (0.5f * (x0 + x1) - 0.5f * width) /
+                     std::max(1.0f, 0.5f * width);
+    const float dy = (0.5f * (y0 + y1) - 0.5f * height) /
+                     std::max(1.0f, 0.5f * height);
+    candidate.quality.position =
+        clamp01(1.0f - 0.5f * std::sqrt(dx * dx + dy * dy));
+    candidate.quality.size = clamp01(std::sqrt(area_ratio) / 0.35f);
+    const float unclipped_width = std::max(
+        kEpsilon, std::abs(candidate.bbox_xyxy[2] - candidate.bbox_xyxy[0]));
+    const float unclipped_height = std::max(
+        kEpsilon, std::abs(candidate.bbox_xyxy[3] - candidate.bbox_xyxy[1]));
+    candidate.quality.truncation = clamp01(
+        (x1 - x0) * (y1 - y0) /
+        (unclipped_width * unclipped_height));
+    const auto [blur, exposure] = snapshotPatchBlurAndExposure(
+        *candidate.full_frame, candidate.bbox_xyxy);
+    candidate.quality.blur = blur;
+    candidate.quality.exposure = exposure;
+    candidate.viewpoint.scale = area_ratio;
   }
 
-  evaluation.shell_ratio =
-      static_cast<float>(evaluation.shell_points) /
-      static_cast<float>(evaluation.in_box_points);
-  evaluation.cavity_ratio =
-      static_cast<float>(evaluation.cavity_points) /
-      static_cast<float>(evaluation.in_box_points);
-  const Eigen::Vector3f occupied_extent =
-      (local_max - local_min).cwiseMax(Eigen::Vector3f::Zero());
-  const Eigen::Vector3f extent_ratio =
-      occupied_extent.cwiseQuotient(track.size_m.cwiseMax(Eigen::Vector3f::Constant(kEpsilon)));
-  const float mean_extent_ratio =
-      clamp01((extent_ratio.x() + extent_ratio.y() + extent_ratio.z()) / 3.0f);
-  evaluation.extent_score = clamp01((mean_extent_ratio - 0.35f) / 0.55f);
-  evaluation.leak_ratio =
-      evaluation.expanded_points > 0
-          ? static_cast<float>(evaluation.expanded_points - evaluation.in_box_points) /
-                static_cast<float>(evaluation.expanded_points)
-          : 1.0f;
-  const float density_score =
-      clamp01(static_cast<float>(evaluation.unique_voxels) /
-              static_cast<float>(std::max(1, min_unique_voxels) * 3));
-  evaluation.score =
-      clamp01(0.35f * evaluation.shell_ratio + 0.30f * evaluation.extent_score +
-              0.25f * density_score + 0.10f * (1.0f - evaluation.leak_ratio) -
-              0.10f * evaluation.cavity_ratio);
-  evaluation.reason = "evaluated";
-  return evaluation;
+  if (response.has_camera_pose) {
+    const Eigen::Vector3f camera_object =
+        response.T_world_camera.inverse() * observation.detection.center_world;
+    candidate.viewpoint.azimuth_rad =
+        std::atan2(camera_object.x(), camera_object.z());
+    candidate.viewpoint.elevation_rad =
+        std::atan2(-camera_object.y(),
+                   std::hypot(camera_object.x(), camera_object.z()));
+  }
+  candidate.viewpoint.scale =
+      std::max(candidate.viewpoint.scale, kEpsilon);
+  return candidate;
 }
 
 void appendUniqueVoxelRefs(
@@ -842,35 +919,6 @@ bool isLargeFurnitureLabel(const std::string& label) {
                    "television set"});
 }
 
-bool isSmallObjectLabel(const std::string& label) {
-  const std::string normalized = lowercase(label);
-  const auto in_group = [&normalized](std::initializer_list<const char*> group) {
-    return std::find(group.begin(), group.end(), normalized) != group.end();
-  };
-  return in_group({"apple",
-                   "banana",
-                   "orange",
-                   "fruit",
-                   "can",
-                   "tin can",
-                   "soda can",
-                   "cup",
-                   "mug",
-                   "bottle",
-                   "book",
-                   "booklet",
-                   "notebook",
-                   "remote",
-                   "remote control",
-                   "cell phone",
-                   "phone",
-                   "mouse",
-                   "keyboard",
-                   "pencil box",
-                   "bowl",
-                   "plate"});
-}
-
 bool isLargeFurnitureTrack(const InstanceTrack& track,
                            const InstanceObservation& observation,
                            const PipelineConfig& config) {
@@ -881,19 +929,6 @@ bool isLargeFurnitureTrack(const InstanceTrack& track,
   }
   return sizeVolume(track.size_m) >=
          config.instance_confirmed_geometry_large_min_volume_m3;
-}
-
-bool shouldIgnoreGeometryEmptyForSmallObject(const InstanceTrack& track,
-                                             const PipelineConfig& config) {
-  const float track_volume = sizeVolume(track.size_m);
-  const float max_extent = track.size_m.cwiseMax(Eigen::Vector3f::Zero()).maxCoeff();
-  const bool small_by_size =
-      config.instance_geometry_empty_small_object_max_volume_m3 > 0.0f &&
-      config.instance_geometry_empty_small_object_max_extent_m > 0.0f &&
-      track_volume > 0.0f &&
-      track_volume <= config.instance_geometry_empty_small_object_max_volume_m3 &&
-      max_extent <= config.instance_geometry_empty_small_object_max_extent_m;
-  return small_by_size || isSmallObjectLabel(track.label);
 }
 
 bool isFarObservationForConfirmedGeometry(const InstanceObservation& observation,
@@ -1011,30 +1046,13 @@ void recordObservationQuality(InstanceTrack* track,
   sample.camera_distance_m = observation.camera_distance_m;
   sample.high_quality = high_quality;
   track->observation_quality_history.push_back(sample);
+  retainRecentObservationQuality(
+      &track->observation_quality_history,
+      config.instance_observation_history_capacity);
   if (high_quality) {
     ++track->high_quality_observation_count;
     track->high_quality_observation_mass += observation.bbox_quality;
   }
-}
-
-std::pair<int, float> recentHighQualityStats(const InstanceTrack& track,
-                                             TimeNanoseconds now_ns,
-                                             double recent_window_sec) {
-  const TimeNanoseconds recent_window_ns = secondsToNanoseconds(recent_window_sec);
-  int count = 0;
-  float mass = 0.0f;
-  for (const ObservationQualitySample& sample : track.observation_quality_history) {
-    if (!sample.high_quality) {
-      continue;
-    }
-    if (recent_window_ns > 0 && now_ns > 0 && sample.time_ns > 0 &&
-        now_ns - sample.time_ns > recent_window_ns) {
-      continue;
-    }
-    ++count;
-    mass += sample.quality;
-  }
-  return {count, mass};
 }
 
 bool hasPromotionQuality(const InstanceTrack& track, const PipelineConfig& config) {
@@ -1085,54 +1103,6 @@ std::size_t countPromotionQualityBlocked(
     }
   }
   return count;
-}
-
-bool geometryObbChangedEnough(const InstanceTrack& track, const PipelineConfig& config) {
-  if (track.geometry_evaluation_obb_revision == 0) {
-    return true;
-  }
-  if ((track.geometry_evaluated_size_m.array() <= 0.0f).any()) {
-    return true;
-  }
-  if ((track.center_world - track.geometry_evaluated_center_world).norm() >=
-      config.instance_geometry_reevaluate_center_delta_m) {
-    return true;
-  }
-  for (int axis = 0; axis < 3; ++axis) {
-    const float denom = std::max(kEpsilon, track.geometry_evaluated_size_m[axis]);
-    if (std::abs(track.size_m[axis] - track.geometry_evaluated_size_m[axis]) / denom >=
-        config.instance_geometry_reevaluate_size_ratio) {
-      return true;
-    }
-  }
-  const float yaw_delta_deg =
-      angularDistancePiSymmetric(track.yaw_rad, track.geometry_evaluated_yaw_rad) *
-      180.0f / kPi;
-  return yaw_delta_deg >= config.instance_geometry_reevaluate_yaw_delta_deg;
-}
-
-bool shouldEvaluateTrackGeometry(const InstanceTrack& track,
-                                 const GeometrySurfaceCache& surface_cache,
-                                 TimeNanoseconds now_ns,
-                                 const PipelineConfig& config) {
-  if (track.object_id < 0 || !surface_cache.has_map) {
-    return false;
-  }
-  const bool changed_enough = geometryObbChangedEnough(track, config);
-  const bool already_confirmed =
-      track.geometry_status == InstanceGeometryStatus::kGood && !changed_enough &&
-      track.geometry_evaluation_map_version == surface_cache.map_version;
-  if (already_confirmed) {
-    return false;
-  }
-  if (track.state == InstanceTrackState::kInactive) {
-    return changed_enough || track.geometry_status == InstanceGeometryStatus::kUnchecked;
-  }
-  const auto [recent_count, recent_mass] =
-      recentHighQualityStats(track, now_ns, config.instance_geometry_recent_window_sec);
-  return recent_count >= config.instance_high_quality_min_count ||
-         recent_mass >= config.instance_high_quality_min_mass ||
-         track.geometry_status == InstanceGeometryStatus::kUnchecked;
 }
 
 bool geometryConfirmed(const InstanceTrack& track, const PipelineConfig& config) {
@@ -1224,6 +1194,56 @@ ObjectSnapshotRemakerConfig snapshotRemakerConfigFromPipeline(
   return remaker_config;
 }
 
+std::shared_ptr<const SceneState> boundedObservationHistoryState(
+    const SceneState& source,
+    std::size_t capacity) {
+  auto bounded = std::make_shared<SceneState>(source);
+  if (source.objects) {
+    SceneObjectTable objects = *source.objects;
+    bool objects_changed = false;
+    for (auto& [object_id, object] : objects) {
+      (void)object_id;
+      if (!object || !object->semantic ||
+          object->semantic->observation_timestamps_ns.size() <= capacity) {
+        continue;
+      }
+      auto semantic =
+          std::make_shared<SemanticComponent>(*object->semantic);
+      retainRecentObservationTimestamps(
+          &semantic->observation_timestamps_ns, capacity);
+      auto replacement = std::make_shared<SceneObject>(*object);
+      replacement->semantic = std::move(semantic);
+      object = std::move(replacement);
+      objects_changed = true;
+    }
+    if (objects_changed) {
+      bounded->objects =
+          std::make_shared<const SceneObjectTable>(std::move(objects));
+    }
+  }
+  if (source.tracks) {
+    SceneTrackTable tracks = *source.tracks;
+    bool tracks_changed = false;
+    for (auto& [track_id, track] : tracks) {
+      (void)track_id;
+      if (!track ||
+          (track->observation_timestamps_ns.size() <= capacity &&
+           track->observation_quality_history.size() <= capacity)) {
+        continue;
+      }
+      auto replacement = std::make_shared<InstanceTrack>(*track);
+      retainRecentObservationHistory(replacement.get(), capacity);
+      track = std::move(replacement);
+      tracks_changed = true;
+    }
+    if (tracks_changed) {
+      bounded->tracks =
+          std::make_shared<const SceneTrackTable>(std::move(tracks));
+    }
+  }
+  return bounded;
+}
+
 }  // namespace
 
 InstanceMapThread::InstanceMapThread(ThreadSafeQueue<InferenceResponse>& response_queue,
@@ -1231,34 +1251,252 @@ InstanceMapThread::InstanceMapThread(ThreadSafeQueue<InferenceResponse>& respons
                                      PipelineConfig config)
     : WorkerThread("instance_map_thread"),
       response_queue_(response_queue),
+      scene_command_queue_(
+          std::max<std::size_t>(64U, config.pending_frame_limit),
+          ChannelPolicy::kReliableBlocking),
       map_projector_(map_projector),
       config_(std::move(config)),
-      snapshot_remaker_(snapshotRemakerConfigFromPipeline(config_)) {}
+      snapshot_remaker_(snapshotRemakerConfigFromPipeline(config_)),
+      published_scene_state_(reducer_.snapshot().statePtr()),
+      pending_snapshot_controls_(config_.snapshot_control_queue_size) {}
 
 bool InstanceMapThread::enqueueDetections(InferenceResponse response) {
-  return response_queue_.pushDropOldest(std::move(response));
+  return response_queue_.push(std::move(response)).accepted();
 }
 
 std::vector<InstanceRecord, Eigen::aligned_allocator<InstanceRecord>>
 InstanceMapThread::snapshotInstances() const {
-  std::lock_guard<std::mutex> lock(mutex_);
-  return object_graph_.snapshotInstanceRecords(/*publishable_only=*/false);
+  ObjectGraph graph;
+  graph.loadSnapshot(sceneSnapshot().materializeObjectGraph());
+  return graph.snapshotInstanceRecords(/*publishable_only=*/false);
 }
 
 std::vector<InstanceRecord, Eigen::aligned_allocator<InstanceRecord>>
 InstanceMapThread::snapshotTrackedInstances() const {
-  std::lock_guard<std::mutex> lock(mutex_);
   std::vector<InstanceRecord, Eigen::aligned_allocator<InstanceRecord>> records;
-  records.reserve(tracks_.size());
-  for (const InstanceTrack& track : tracks_) {
-    records.push_back(recordFromTrack(track));
+  const SceneSnapshot snapshot = sceneSnapshot();
+  records.reserve(snapshot.tracks().size());
+  for (const auto& [track_id, track] : snapshot.tracks()) {
+    (void)track_id;
+    if (track) {
+      records.push_back(recordFromTrack(*track));
+    }
   }
   return records;
 }
 
 ObjectGraphSnapshot InstanceMapThread::snapshotObjectGraph() const {
-  std::lock_guard<std::mutex> lock(mutex_);
-  return object_graph_.snapshot();
+  return sceneSnapshot().materializeObjectGraph();
+}
+
+SceneSnapshot InstanceMapThread::sceneSnapshot() const {
+  return SceneSnapshot(std::atomic_load(&published_scene_state_));
+}
+
+bool InstanceMapThread::enqueueSceneCommand(
+    SceneCommand command, SceneCommandCompletion completion) {
+  const PushResult<QueuedSceneCommand> result =
+      scene_command_queue_.push(
+          QueuedSceneCommand{std::move(command), std::move(completion)});
+  if (!result.accepted()) {
+    RunLogger::logGlobal(
+        "scene_reducer",
+        "scene command rejected by queue outcome=" +
+            std::to_string(static_cast<int>(result.outcome)));
+  }
+  return result.accepted();
+}
+
+std::optional<SceneApplyResult> InstanceMapThread::applySceneCommandAndWait(
+    SceneCommand command, std::chrono::milliseconds timeout) {
+  auto promise = std::make_shared<std::promise<SceneApplyResult>>();
+  std::future<SceneApplyResult> future = promise->get_future();
+  if (!enqueueSceneCommand(
+          std::move(command),
+          [promise](const SceneApplyResult& result) {
+            try {
+              promise->set_value(result);
+            } catch (const std::future_error&) {
+              // A timed-out caller may have already abandoned the future;
+              // reducer completion is still valid and needs no cancellation.
+            }
+          })) {
+    return std::nullopt;
+  }
+  if (timeout < std::chrono::milliseconds::zero()) {
+    timeout = std::chrono::milliseconds::zero();
+  }
+  if (future.wait_for(timeout) != std::future_status::ready) {
+    return std::nullopt;
+  }
+  return future.get();
+}
+
+void InstanceMapThread::setOnlineSnapshotWorker(
+    OnlineSnapshotWorker* worker) {
+  online_snapshot_worker_ = worker;
+}
+
+std::size_t InstanceMapThread::closeSnapshotControlsForShutdown() {
+  const std::size_t abandoned =
+      pending_snapshot_controls_.closeAndAbandon();
+  if (abandoned != 0) {
+    RunLogger::logGlobal(
+        "snapshot_control",
+        "abandoned controls after snapshot worker shutdown count=" +
+            std::to_string(abandoned));
+  }
+  drain_cv_.notify_all();
+  return abandoned;
+}
+
+bool InstanceMapThread::snapshotControlFaulted() const {
+  return snapshot_control_faulted_.load(std::memory_order_acquire);
+}
+
+bool InstanceMapThread::requestDurabilityAck(SceneRevision revision) {
+  SceneRevision current = pending_durable_ack_.load(std::memory_order_acquire);
+  while (current < revision &&
+         !pending_durable_ack_.compare_exchange_weak(
+             current, revision, std::memory_order_acq_rel,
+             std::memory_order_acquire)) {
+  }
+  drain_cv_.notify_all();
+  return true;
+}
+
+SnapshotControlPushOutcome InstanceMapThread::enqueueSnapshotControl(
+    SnapshotControl control) {
+  if (online_snapshot_worker_ == nullptr) {
+    return SnapshotControlPushOutcome::kRejectedNoWorker;
+  }
+  // Give the worker a chance to accept the current head before applying the
+  // local capacity limit to a distinct ownership transition.
+  (void)flushPendingSnapshotControls();
+  const SnapshotControlKind kind = control.kind;
+  const int first_id = control.first_id;
+  const int second_id = control.second_id;
+  const SceneRevision scene_revision = control.scene_revision;
+  const SnapshotControlPushOutcome outcome =
+      pending_snapshot_controls_.push(std::move(control));
+  if (outcome == SnapshotControlPushOutcome::kRejectedCapacity ||
+      outcome == SnapshotControlPushOutcome::kRejectedClosed) {
+    const SnapshotControlQueueStats stats = pending_snapshot_controls_.stats();
+    RunLogger::logGlobal(
+        "snapshot_control",
+        "control rejected outcome=" +
+            std::to_string(static_cast<int>(outcome)) + " kind=" +
+            std::to_string(static_cast<int>(kind)) + " first_id=" +
+            std::to_string(first_id) + " second_id=" +
+            std::to_string(second_id) + " scene_revision=" +
+            std::to_string(scene_revision) + " depth=" +
+            std::to_string(stats.depth) + " capacity=" +
+            std::to_string(stats.capacity) + " rejected_capacity=" +
+            std::to_string(stats.rejected_capacity) + " rejected_closed=" +
+            std::to_string(stats.rejected_closed));
+  }
+  if (outcome == SnapshotControlPushOutcome::kRejectedCapacity) {
+    const bool already_faulted =
+        snapshot_control_faulted_.exchange(true, std::memory_order_acq_rel);
+    if (!already_faulted) {
+      RunLogger::logGlobal(
+          "snapshot_control",
+          "terminal control-admission fault activated at scene_revision=" +
+              std::to_string(scene_revision) +
+              "; later persistent content will be rejected pre-reducer");
+    }
+  }
+  drain_cv_.notify_all();
+  if (flushPendingSnapshotControls()) {
+    drain_cv_.notify_all();
+  }
+  return outcome;
+}
+
+bool InstanceMapThread::flushPendingSnapshotControls() {
+  bool progressed = false;
+  while (online_snapshot_worker_ != nullptr) {
+    const std::optional<SnapshotControl> control =
+        pending_snapshot_controls_.front();
+    if (!control) {
+      break;
+    }
+    SnapshotWorkerEnqueueResult result;
+    switch (control->kind) {
+      case SnapshotControlKind::kPromote:
+        result = online_snapshot_worker_->tryEnqueuePromotion(
+            control->first_id, control->second_id, control->now_ns);
+        break;
+      case SnapshotControlKind::kMerge:
+        result = online_snapshot_worker_->tryEnqueueMerge(
+            control->first_id, control->second_id, control->now_ns);
+        break;
+      case SnapshotControlKind::kDropTentative:
+        result = online_snapshot_worker_->tryEnqueueDropTentative(
+            control->first_id, control->now_ns);
+        break;
+      case SnapshotControlKind::kEraseObject:
+        result = online_snapshot_worker_->tryEnqueueEraseObject(
+            control->first_id, control->now_ns);
+        break;
+    }
+    if (!result.accepted()) {
+      break;
+    }
+    (void)pending_snapshot_controls_.popFront();
+    progressed = true;
+  }
+  return progressed;
+}
+
+void InstanceMapThread::setSceneCommitSink(
+    std::function<bool(const SceneApplyResult&)> sink) {
+  scene_commit_sink_ = std::move(sink);
+}
+
+void InstanceMapThread::setSceneContentAdmission(
+    std::function<bool()> admission) {
+  scene_content_admission_ = std::move(admission);
+}
+
+void InstanceMapThread::setSceneCommitObserver(
+    std::function<void(const SceneApplyResult&)> observer) {
+  scene_commit_observer_ = std::move(observer);
+}
+
+bool InstanceMapThread::waitUntilIdle(std::chrono::milliseconds timeout) {
+  if (timeout < std::chrono::milliseconds::zero()) {
+    timeout = std::chrono::milliseconds::zero();
+  }
+  const auto deadline = std::chrono::steady_clock::now() + timeout;
+  const auto idle = [this]() {
+    return response_queue_.empty() && scene_command_queue_.empty() &&
+           pending_durable_ack_.load() == 0 &&
+           pending_snapshot_controls_.empty() && !processing_work_.load();
+  };
+  std::unique_lock<std::mutex> lock(drain_mutex_);
+  while (true) {
+    if (!idle() && !drain_cv_.wait_until(lock, deadline, idle)) {
+      return false;
+    }
+    // Require a stable idle window to close the dequeue-before-processing
+    // observation gap without putting a mutex around the channel itself.
+    const auto stable_until = std::min(
+        deadline,
+        std::chrono::steady_clock::now() + std::chrono::milliseconds(10));
+    if (!drain_cv_.wait_until(lock, stable_until, [&idle]() {
+          return !idle();
+        })) {
+      return idle();
+    }
+    if (std::chrono::steady_clock::now() >= deadline) {
+      return false;
+    }
+  }
+}
+
+SnapshotControlQueueStats InstanceMapThread::snapshotControlStats() const {
+  return pending_snapshot_controls_.stats();
 }
 
 bool InstanceMapThread::prepareSceneGraphForSave(
@@ -1272,11 +1510,8 @@ bool InstanceMapThread::prepareSceneGraphForSave(
     }
     return false;
   }
-  {
-    std::lock_guard<std::mutex> lock(mutex_);
-    *snapshot = object_graph_.snapshot();
-  }
-  if (!config_.snapshot_remake_enabled) {
+  *snapshot = sceneSnapshot().materializeObjectGraph();
+  if (!config_.snapshot_remake_enabled || online_snapshot_worker_ != nullptr) {
     if (error != nullptr) {
       error->clear();
     }
@@ -1290,9 +1525,37 @@ bool InstanceMapThread::prepareSceneGraphForSave(
 
 bool InstanceMapThread::loadObjectGraphSnapshot(const ObjectGraphSnapshot& snapshot,
                                                 std::string* error) {
+  return loadInitialSnapshot(snapshot, nullptr, error);
+}
+
+bool InstanceMapThread::loadSceneSnapshot(const SceneSnapshot& snapshot,
+                                          std::string* error) {
+  return loadInitialSnapshot(
+      snapshot.materializeObjectGraph(), &snapshot, error);
+}
+
+bool InstanceMapThread::loadInitialSnapshot(
+    const ObjectGraphSnapshot& snapshot,
+    const SceneSnapshot* restored_scene,
+    std::string* error) {
   std::lock_guard<std::mutex> lock(mutex_);
-  object_graph_.loadSnapshot(snapshot);
-  snapshot_remaker_.loadSnapshot(snapshot);
+  ObjectGraphSnapshot bounded_graph = snapshot;
+  for (ObjectNode& object : bounded_graph.objects) {
+    retainRecentObservationHistory(
+        &object, config_.instance_observation_history_capacity);
+  }
+  const std::shared_ptr<const SceneState> bounded_restored_state =
+      restored_scene != nullptr
+          ? boundedObservationHistoryState(
+                *restored_scene->statePtr(),
+                config_.instance_observation_history_capacity)
+          : nullptr;
+  const SceneSnapshot bounded_restored_scene(bounded_restored_state);
+  const SceneSnapshot* effective_restored_scene =
+      restored_scene != nullptr ? &bounded_restored_scene : nullptr;
+
+  object_graph_.loadSnapshot(bounded_graph);
+  snapshot_remaker_.loadSnapshot(bounded_graph);
   tracks_.clear();
 
   std::set<int> used_track_ids;
@@ -1306,7 +1569,7 @@ bool InstanceMapThread::loadObjectGraphSnapshot(const ObjectGraphSnapshot& snaps
     return track_id;
   };
 
-  for (const ObjectNode& object : snapshot.objects) {
+  for (const ObjectNode& object : bounded_graph.objects) {
     if (object.object_id < 0) {
       continue;
     }
@@ -1382,35 +1645,401 @@ bool InstanceMapThread::loadObjectGraphSnapshot(const ObjectGraphSnapshot& snaps
     tracks_.push_back(std::move(track));
   }
 
+  if (effective_restored_scene != nullptr &&
+      !effective_restored_scene->tracks().empty()) {
+    tracks_.clear();
+    used_track_ids.clear();
+    for (const auto& [track_id, track] : effective_restored_scene->tracks()) {
+      if (!track || track_id < 0) {
+        continue;
+      }
+      tracks_.push_back(*track);
+      used_track_ids.insert(track_id);
+    }
+  }
+
   next_track_id_ = 0;
   for (int track_id : used_track_ids) {
     next_track_id_ = std::max(next_track_id_, track_id + 1);
   }
   frame_index_ = 0;
-  last_geometry_maintenance_ns_ = 0;
+  LoadSceneCommand load_command;
+  if (effective_restored_scene != nullptr) {
+    load_command.restored_state = effective_restored_scene->statePtr();
+  }
+  load_command.graph = bounded_graph;
+  load_command.tracks = tracks_;
+  if (effective_restored_scene != nullptr) {
+    for (const auto& [retired_id, alias] :
+         effective_restored_scene->aliases()) {
+      (void)retired_id;
+      load_command.aliases.push_back(alias);
+    }
+    for (const auto& [object_id, tombstone] :
+         effective_restored_scene->tombstones()) {
+      (void)object_id;
+      load_command.tombstones.push_back(tombstone);
+    }
+    load_command.restored_revision = effective_restored_scene->revision();
+    load_command.durable_revision =
+        effective_restored_scene->durableRevision();
+    load_command.recent_observation_frames =
+        effective_restored_scene->statePtr()->recent_observation_frames;
+    load_command.observation_watermarks =
+        effective_restored_scene->statePtr()->observation_watermarks;
+    // A restored scene keeps object/revision watermarks but never inherits a
+    // previous process's map epoch. MapActor publishes the new epoch through
+    // AdvanceSurfaceCommand after startup.
+    load_command.latest_surface = SurfaceStamp{};
+  }
+  const SceneApplyResult load_result =
+      reducer_.apply(SceneCommand{std::move(load_command)});
+  if (!load_result.accepted()) {
+    if (error != nullptr) {
+      *error = load_result.reason;
+    }
+    return false;
+  }
+  publishReducerResult(load_result, /*persist_content_commit=*/true);
   if (error != nullptr) {
     error->clear();
   }
 
   RunLogger::logGlobal("instance_map",
                        "loaded object_graph objects=" +
-                           std::to_string(snapshot.objects.size()) +
+                           std::to_string(bounded_graph.objects.size()) +
                            " tracks=" + std::to_string(tracks_.size()) +
-                           " relations=" + std::to_string(snapshot.relations.size()));
+                           " relations=" +
+                           std::to_string(bounded_graph.relations.size()));
   return true;
 }
 
+void InstanceMapThread::refreshAssociationWorkingSet(
+    const SceneSnapshot& snapshot) {
+  std::lock_guard<std::mutex> lock(mutex_);
+  // Association remains an algorithmic working set, not a second current
+  // scene. Recreate it from the reducer's pinned immutable snapshot before
+  // every observation so a rejected command can never contaminate the next
+  // frame.
+  object_graph_.loadSnapshot(snapshot.materializeObjectGraph());
+  tracks_.clear();
+  tracks_.reserve(snapshot.tracks().size());
+  std::uint64_t highest_frame_index = frame_index_;
+  for (const auto& [track_id, track] : snapshot.tracks()) {
+    if (!track || track_id < 0) {
+      continue;
+    }
+    tracks_.push_back(*track);
+    next_track_id_ = std::max(next_track_id_, track_id + 1);
+    highest_frame_index =
+        std::max(highest_frame_index, track->last_seen_frame_index);
+  }
+  frame_index_ = highest_frame_index;
+  pending_reducer_merges_.clear();
+}
+
 void InstanceMapThread::run() {
-  while (!stopRequested()) {
+  while (!stopRequested() || !response_queue_.empty() ||
+         !scene_command_queue_.empty() ||
+         pending_durable_ack_.load(std::memory_order_acquire) != 0 ||
+         (!stopRequested() && !pending_snapshot_controls_.empty())) {
+    if (flushPendingSnapshotControls()) {
+      drain_cv_.notify_all();
+    }
+    if (applyPendingDurabilityAck()) {
+      drain_cv_.notify_all();
+    }
+    QueuedSceneCommand queued;
+    bool applied_command = false;
+    // Bound each command burst so a busy artifact/geometry producer cannot
+    // indefinitely starve the observation stream.
+    for (std::size_t i = 0; i < 16 && scene_command_queue_.tryPop(&queued);
+         ++i) {
+      processing_work_.store(true);
+      try {
+        const SceneApplyResult result =
+            applyQueuedSceneCommand(std::move(queued.command));
+        if (queued.completion) {
+          queued.completion(result);
+        }
+      } catch (const std::exception& error) {
+        RunLogger::logGlobal(
+            "scene_reducer",
+            "queued command actor exception: " + std::string(error.what()));
+      } catch (...) {
+        RunLogger::logGlobal(
+            "scene_reducer",
+            "queued command actor non-standard exception");
+      }
+      processing_work_.store(false);
+      drain_cv_.notify_all();
+      applied_command = true;
+    }
+
     InferenceResponse response;
-    if (!response_queue_.waitPopFor(&response, std::chrono::milliseconds(50))) {
+    const bool have_response =
+        applied_command
+            ? response_queue_.tryPop(&response)
+            : response_queue_.waitPopFor(&response,
+                                         std::chrono::milliseconds(20));
+    if (!have_response) {
       continue;
     }
     if (!response.ok) {
       continue;
     }
-    applyDetections(response);
+    if (!sceneContentAdmissionAllowed()) {
+      RunLogger::logGlobal(
+          "scene_persistence",
+          "observation_rejected_pre_reducer frame_id=" +
+              std::to_string(response.provenance.frame_id) +
+              " reason=" +
+              sceneContentAdmissionRejectionReason());
+      continue;
+    }
+    processing_work_.store(true);
+    try {
+      applyDetections(response);
+    } catch (const std::exception& error) {
+      RunLogger::logGlobal(
+          "instance_map",
+          "observation actor exception: " + std::string(error.what()));
+    } catch (...) {
+      RunLogger::logGlobal(
+          "instance_map",
+          "observation actor non-standard exception");
+    }
+    processing_work_.store(false);
+    drain_cv_.notify_all();
   }
+  const std::size_t abandoned = pending_snapshot_controls_.abandonAll();
+  if (abandoned != 0) {
+    const SnapshotControlQueueStats stats = pending_snapshot_controls_.stats();
+    RunLogger::logGlobal(
+        "snapshot_control",
+        "abandoned controls during bounded shutdown count=" +
+            std::to_string(abandoned) + " total_abandoned=" +
+            std::to_string(stats.abandoned_on_stop));
+  }
+  drain_cv_.notify_all();
+}
+
+bool InstanceMapThread::applyPendingDurabilityAck() {
+  const SceneRevision revision =
+      pending_durable_ack_.exchange(0, std::memory_order_acq_rel);
+  if (revision == 0) {
+    return false;
+  }
+  processing_work_.store(true);
+  try {
+    const SceneApplyResult result = applyQueuedSceneCommand(
+        SceneCommand{PersistedThroughCommand{revision}});
+    if (!result.accepted()) {
+      RunLogger::logGlobal(
+          "scene_persistence",
+          "durability watermark rejected revision=" +
+              std::to_string(revision) + " reason=" + result.reason);
+    }
+  } catch (const std::exception& error) {
+    RunLogger::logGlobal(
+        "scene_persistence",
+        "durability watermark actor exception revision=" +
+            std::to_string(revision) + " error=" + error.what());
+  } catch (...) {
+    RunLogger::logGlobal(
+        "scene_persistence",
+        "durability watermark actor non-standard exception revision=" +
+            std::to_string(revision));
+  }
+  processing_work_.store(false);
+  return true;
+}
+
+void InstanceMapThread::onStopRequested() {
+  scene_command_queue_.stop();
+}
+
+SceneApplyResult InstanceMapThread::applyQueuedSceneCommand(
+    SceneCommand command) {
+  const auto* geometry_command =
+      std::get_if<ApplyGeometryResultCommand>(&command);
+  const std::optional<ApplyGeometryResultCommand> geometry_update =
+      geometry_command
+          ? std::optional<ApplyGeometryResultCommand>(*geometry_command)
+          : std::nullopt;
+  const bool persist_content_commit =
+      !std::holds_alternative<PersistedThroughCommand>(command) &&
+      !std::holds_alternative<AdvanceSurfaceCommand>(command);
+  if (persist_content_commit && !sceneContentAdmissionAllowed()) {
+    const std::string reason = sceneContentAdmissionRejectionReason();
+    RunLogger::logGlobal("scene_persistence",
+                         "command_rejected_pre_reducer reason=" + reason);
+    return rejectForPersistenceAdmission(reason);
+  }
+  const SceneApplyResult result = reducer_.apply(command);
+  if (!result.accepted()) {
+    RunLogger::logGlobal("scene_reducer",
+                         "queued command rejected reason=" + result.reason);
+    return result;
+  }
+
+  // tracks_ is now only the association working set. Keep the geometry fields
+  // required by the unchanged association formulas in sync with the reducer's
+  // accepted CAS result; it is never published as current scene state.
+  if (geometry_update) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    for (InstanceTrack& track : tracks_) {
+      if (track.object_id != geometry_update->dependency.object.object_id ||
+          track.obb_revision !=
+              geometry_update->dependency.object.obb_revision) {
+        continue;
+      }
+      const GeometryEvaluationResult& evaluation = geometry_update->result;
+      track.geometry_status = evaluation.status;
+      track.geometry_score = evaluation.score;
+      track.geometry_shell_ratio = evaluation.shell_ratio;
+      track.geometry_extent_score = evaluation.extent_score;
+      track.geometry_leak_ratio = evaluation.leak_ratio;
+      track.geometry_cavity_ratio = evaluation.cavity_ratio;
+      track.geometry_in_box_points = evaluation.in_box_points;
+      track.geometry_shell_points = evaluation.shell_points;
+      track.geometry_unique_voxels = evaluation.unique_voxels;
+      track.geometry_expanded_points = evaluation.expanded_points;
+      track.geometry_bad_count = evaluation.bad_count;
+      track.last_geometry_check_ns = evaluation.checked_at_ns;
+      track.geometry_evaluation_obb_revision = track.obb_revision;
+      track.geometry_evaluation_map_version =
+          geometry_update->dependency.surface.source_map_revision;
+      track.geometry_evaluated_center_world =
+          evaluation.evaluated_center_world;
+      track.geometry_evaluated_size_m = evaluation.evaluated_size_m;
+      track.geometry_evaluated_yaw_rad = evaluation.evaluated_yaw_rad;
+      track.geometry_evaluation_reason = evaluation.reason;
+      updateObjectQualityScore(&track);
+      object_graph_.updateNodeFromTrack(track);
+      break;
+    }
+  }
+  publishReducerResult(result, persist_content_commit);
+  return result;
+}
+
+SceneApplyResult InstanceMapThread::rejectForPersistenceAdmission(
+    const std::string& reason) const {
+  SceneApplyResult result;
+  result.status = SceneApplyStatus::kRejected;
+  result.snapshot = reducer_.snapshot();
+  result.revision = result.snapshot.revision();
+  result.reason = reason;
+  return result;
+}
+
+bool InstanceMapThread::sceneContentAdmissionAllowed() const {
+  if (persistence_commit_failed_ || snapshotControlFaulted()) {
+    return false;
+  }
+  if (!scene_content_admission_) {
+    return true;
+  }
+  try {
+    return scene_content_admission_();
+  } catch (const std::exception& error) {
+    RunLogger::logGlobal(
+        "scene_persistence",
+        "content admission callback failed: " + std::string(error.what()));
+  } catch (...) {
+    RunLogger::logGlobal(
+        "scene_persistence",
+        "content admission callback failed with non-standard exception");
+  }
+  return false;
+}
+
+std::string InstanceMapThread::sceneContentAdmissionRejectionReason() const {
+  if (snapshotControlFaulted()) {
+    return "terminal snapshot control admission fault is active";
+  }
+  if (persistence_commit_failed_) {
+    return "scene persistence commit fuse is active";
+  }
+  return "scene persistence admission is closed";
+}
+
+void InstanceMapThread::publishReducerResult(
+    const SceneApplyResult& result,
+    bool persist_content_commit) {
+  std::atomic_store(&published_scene_state_, result.snapshot.statePtr());
+  if (scene_commit_observer_ && !result.events.empty()) {
+    try {
+      scene_commit_observer_(result);
+    } catch (const std::exception& error) {
+      RunLogger::logGlobal(
+          "scene_reducer",
+          "scene commit observer failed: " + std::string(error.what()));
+    } catch (...) {
+      RunLogger::logGlobal(
+          "scene_reducer",
+          "scene commit observer failed with non-standard exception");
+    }
+  }
+  if (persist_content_commit && result.committedRevision() &&
+      scene_commit_sink_) {
+    bool persisted = false;
+    std::string sink_error;
+    try {
+      persisted = scene_commit_sink_(result);
+    } catch (const std::exception& error) {
+      sink_error = error.what();
+    } catch (...) {
+      sink_error = "non-standard exception";
+    }
+    if (!persisted) {
+      persistence_commit_failed_ = true;
+      RunLogger::logGlobal(
+          "scene_persistence",
+          "failed to enqueue scene_revision=" +
+              std::to_string(result.revision) +
+              "; terminal content-commit fuse activated" +
+              (sink_error.empty() ? std::string{}
+                                  : "; error=" + sink_error));
+    }
+  }
+  if (online_snapshot_worker_ != nullptr && result.committedRevision()) {
+    for (const SceneEvent& event : result.events) {
+      if (const auto* merged = std::get_if<ObjectMerged>(&event)) {
+        enqueueSnapshotControl(SnapshotControl{
+            SnapshotControlKind::kMerge,
+            merged->retired_object_id,
+            merged->canonical_object_id,
+            0,
+            merged->revision});
+      } else if (const auto* tombstoned =
+                     std::get_if<ObjectTombstoned>(&event)) {
+        enqueueSnapshotControl(SnapshotControl{
+            SnapshotControlKind::kEraseObject,
+            tombstoned->object_id,
+            -1,
+            0,
+            tombstoned->revision});
+      }
+    }
+  }
+  const ChannelStats scene_command_stats = scene_command_queue_.stats();
+  const ChannelStats reducer_response_stats = response_queue_.stats();
+  RunLogger::logGlobal(
+      "scene_reducer",
+      "published scene_revision=" + std::to_string(result.revision) +
+          " durable_scene_revision=" +
+          std::to_string(result.snapshot.durableRevision()) +
+          " status=" + std::to_string(static_cast<int>(result.status)) +
+          " scene_command_queue_depth=" +
+          std::to_string(scene_command_stats.depth) +
+          " scene_command_queue_high_watermark=" +
+          std::to_string(scene_command_stats.high_watermark) +
+          " reducer_response_queue_depth=" +
+          std::to_string(reducer_response_stats.depth) +
+          " reducer_response_queue_high_watermark=" +
+          std::to_string(reducer_response_stats.high_watermark));
 }
 
 void InstanceMapThread::applyDetections(const InferenceResponse& response) {
@@ -1418,6 +2047,43 @@ void InstanceMapThread::applyDetections(const InferenceResponse& response) {
     applyFrozenInstanceSnapshotRemake(response);
     return;
   }
+
+  const SceneSnapshot association_base = sceneSnapshot();
+  if (response.provenance.run_id.valid() &&
+      response.provenance.frame_id != 0) {
+    const FrameKey key{response.provenance.run_id,
+                       response.provenance.frame_id};
+    if (std::find(
+            association_base.statePtr()->recent_observation_frames.begin(),
+            association_base.statePtr()->recent_observation_frames.end(),
+            key) !=
+        association_base.statePtr()->recent_observation_frames.end()) {
+      RunLogger::logGlobal(
+          "instance_map",
+          "ignored duplicate observation frame_id=" +
+              std::to_string(response.provenance.frame_id));
+      return;
+    }
+    const auto watermark = std::find_if(
+        association_base.statePtr()->observation_watermarks.begin(),
+        association_base.statePtr()->observation_watermarks.end(),
+        [&key](const ObservationRunWatermark& candidate) {
+          return candidate.run_id == key.run_id;
+        });
+    constexpr FrameId kObservationReplayWindow = 256;
+    if (watermark !=
+            association_base.statePtr()->observation_watermarks.end() &&
+        key.frame_id < watermark->highest_frame_id &&
+        watermark->highest_frame_id - key.frame_id >=
+            kObservationReplayWindow) {
+      RunLogger::logGlobal(
+          "instance_map",
+          "ignored out-of-window observation frame_id=" +
+              std::to_string(response.provenance.frame_id));
+      return;
+    }
+  }
+  refreshAssociationWorkingSet(association_base);
 
   const auto apply_start = std::chrono::steady_clock::now();
   std::vector<InstanceObservation, Eigen::aligned_allocator<InstanceObservation>> observations;
@@ -1433,8 +2099,6 @@ void InstanceMapThread::applyDetections(const InferenceResponse& response) {
   std::map<std::string, std::size_t> promotion_quality_blocked_by_label;
   std::map<std::string, std::size_t> geometry_update_suppressed_by_label;
   std::map<std::string, std::size_t> geometry_update_suppressed_by_reason;
-  std::map<std::string, std::size_t> geometry_deleted_empty_by_label;
-  std::map<std::string, std::size_t> geometry_empty_ignored_by_label;
   std::map<std::string, std::size_t> merged_small_duplicates_by_label;
   std::size_t rejected = 0;
   for (const RawDetection& detection : response.detections) {
@@ -1451,6 +2115,26 @@ void InstanceMapThread::applyDetections(const InferenceResponse& response) {
     }
   }
 
+  std::shared_ptr<const ImageBuffer> snapshot_frame;
+  std::vector<std::optional<SnapshotCandidate>> snapshot_candidates;
+  if (online_snapshot_worker_ != nullptr && !response.source_rgb_960.empty()) {
+    snapshot_frame =
+        std::make_shared<const ImageBuffer>(response.source_rgb_960);
+    snapshot_candidates.reserve(observations.size());
+    for (std::size_t observation_index = 0;
+         observation_index < observations.size(); ++observation_index) {
+      const InstanceObservation& observation = observations[observation_index];
+      snapshot_candidates.emplace_back(makeOnlineSnapshotCandidate(
+          response, observation, snapshot_frame));
+    }
+  }
+  struct SnapshotDispatch {
+    OnlineSnapshotCandidate input;
+    std::optional<std::pair<int, SceneObjectId>> promotion;
+  };
+  std::vector<SnapshotDispatch> snapshot_dispatches;
+  std::vector<int> expired_snapshot_tracks;
+
   std::size_t created = 0;
   std::size_t updated = 0;
   std::size_t objects_before = 0;
@@ -1462,13 +2146,7 @@ void InstanceMapThread::applyDetections(const InferenceResponse& response) {
   std::size_t duplicate_rejected = 0;
   std::size_t promotion_quality_blocked = 0;
   std::size_t geometry_update_suppressed = 0;
-  std::size_t geometry_checked = 0;
-  std::size_t geometry_suppressed = 0;
-  std::size_t geometry_recovered = 0;
-  std::size_t geometry_deleted_empty = 0;
-  std::size_t geometry_empty_ignored = 0;
   std::size_t published_objects_after = 0;
-  bool run_geometry = false;
   {
     std::lock_guard<std::mutex> lock(mutex_);
     ++frame_index_;
@@ -1476,7 +2154,9 @@ void InstanceMapThread::applyDetections(const InferenceResponse& response) {
     tracks_before = tracks_.size();
 
     std::vector<bool> track_matched(tracks_.size(), false);
-    for (const InstanceObservation& observation : observations) {
+    for (std::size_t observation_index = 0;
+         observation_index < observations.size(); ++observation_index) {
+      const InstanceObservation& observation = observations[observation_index];
       const std::string observation_label = diagnosticsLabel(observation.detection.label);
       if (shouldRejectAsDuplicateOfConfirmed(observation)) {
         ++duplicate_rejected;
@@ -1487,6 +2167,7 @@ void InstanceMapThread::applyDetections(const InferenceResponse& response) {
       const std::optional<std::size_t> track_index =
           findBestTrack(observation, track_matched);
       if (track_index) {
+        const bool was_tentative = tracks_[*track_index].object_id < 0;
         bool suppressed_geometry_update = false;
         std::string geometry_suppression_reason;
         const bool promoted =
@@ -1508,6 +2189,30 @@ void InstanceMapThread::applyDetections(const InferenceResponse& response) {
         if (promoted) {
           ++promoted_by_label[diagnosticsLabel(tracks_[*track_index].label)];
         }
+        if (observation_index < snapshot_candidates.size() &&
+            snapshot_candidates[observation_index]) {
+          const InstanceTrack& snapshot_track = tracks_[*track_index];
+          SnapshotDispatch dispatch;
+          dispatch.input.candidate =
+              std::move(*snapshot_candidates[observation_index]);
+          if (promoted && was_tentative) {
+            dispatch.input.owner =
+                SnapshotOwner{SnapshotOwnerKind::kTentativeTrack,
+                              snapshot_track.track_id};
+            dispatch.promotion =
+                std::make_pair(snapshot_track.track_id,
+                               snapshot_track.object_id);
+          } else if (snapshot_track.object_id >= 0) {
+            dispatch.input.owner =
+                SnapshotOwner{SnapshotOwnerKind::kObject,
+                              snapshot_track.object_id};
+          } else {
+            dispatch.input.owner =
+                SnapshotOwner{SnapshotOwnerKind::kTentativeTrack,
+                              snapshot_track.track_id};
+          }
+          snapshot_dispatches.push_back(std::move(dispatch));
+        }
         track_matched[*track_index] = true;
         ++updated;
       } else {
@@ -1516,23 +2221,39 @@ void InstanceMapThread::applyDetections(const InferenceResponse& response) {
         if (promoted) {
           ++promoted_by_label[observation_label];
         }
+        if (observation_index < snapshot_candidates.size() &&
+            snapshot_candidates[observation_index]) {
+          const InstanceTrack& snapshot_track = tracks_.back();
+          SnapshotDispatch dispatch;
+          dispatch.input.candidate =
+              std::move(*snapshot_candidates[observation_index]);
+          dispatch.input.owner =
+              SnapshotOwner{SnapshotOwnerKind::kTentativeTrack,
+                            snapshot_track.track_id};
+          if (promoted) {
+            dispatch.promotion =
+                std::make_pair(snapshot_track.track_id,
+                               snapshot_track.object_id);
+          }
+          snapshot_dispatches.push_back(std::move(dispatch));
+        }
         track_matched.push_back(true);
         ++created;
       }
     }
 
     ageUnmatchedTracks(track_matched, response.time_ns);
-    removed_tentative = removeExpiredTentativeTracks();
+    removed_tentative =
+        removeExpiredTentativeTracks(&expired_snapshot_tracks);
     merged_duplicates += mergeDuplicateStableTracks(&merged_small_duplicates_by_label);
     for (InstanceTrack& track : tracks_) {
       if (track.object_id >= 0) {
         object_graph_.updateNodeFromTrack(track);
       }
     }
-    if (shouldRunGeometryMaintenance(response.time_ns)) {
-      run_geometry = true;
-      last_geometry_maintenance_ns_ = response.time_ns;
-    }
+    // Surface scanning is owned by GeometryWorker. The association actor only
+    // emits OBB/object events through the reducer and never evaluates geometry
+    // synchronously.
     tracks_after = tracks_.size();
     objects_after = object_graph_.objectCount();
     promotion_quality_blocked =
@@ -1541,35 +2262,7 @@ void InstanceMapThread::applyDetections(const InferenceResponse& response) {
         object_graph_.snapshotInstanceRecords(/*publishable_only=*/false).size();
   }
 
-  if (run_geometry) {
-    const std::shared_ptr<const GeometrySurfaceCache> surface_cache =
-        map_projector_.geometrySurfaceCache();
-    std::lock_guard<std::mutex> lock(mutex_);
-    if (surface_cache) {
-      geometry_checked = applyGeometryMaintenance(*surface_cache,
-                                                  response.time_ns,
-                                                  &geometry_suppressed,
-                                                  &geometry_recovered,
-                                                  &geometry_deleted_empty,
-                                                  &geometry_deleted_empty_by_label,
-                                                  &geometry_empty_ignored,
-                                                  &geometry_empty_ignored_by_label);
-    }
-    merged_duplicates += mergeDuplicateStableTracks(&merged_small_duplicates_by_label);
-    for (InstanceTrack& track : tracks_) {
-      if (track.object_id >= 0) {
-        object_graph_.updateNodeFromTrack(track);
-      }
-    }
-    tracks_after = tracks_.size();
-    objects_after = object_graph_.objectCount();
-    promotion_quality_blocked =
-        countPromotionQualityBlocked(tracks_, config_, &promotion_quality_blocked_by_label);
-    published_objects_after =
-        object_graph_.snapshotInstanceRecords(/*publishable_only=*/false).size();
-  }
-
-  if (!response.detections.empty() || !observations.empty() || run_geometry) {
+  if (!response.detections.empty() || !observations.empty()) {
     const double apply_ms = elapsedMs(apply_start, std::chrono::steady_clock::now());
     std::ostringstream stream;
     stream << std::fixed << std::setprecision(2)
@@ -1585,11 +2278,6 @@ void InstanceMapThread::applyDetections(const InferenceResponse& response) {
            << " updated_tracks=" << updated
            << " removed_tentative=" << removed_tentative
            << " merged_duplicates=" << merged_duplicates
-           << " geometry_checked=" << geometry_checked
-           << " geometry_suppressed=" << geometry_suppressed
-           << " geometry_recovered=" << geometry_recovered
-           << " geometry_deleted_empty=" << geometry_deleted_empty
-           << " geometry_empty_ignored=" << geometry_empty_ignored
            << " tracks=" << tracks_before << "->" << tracks_after
            << " objects=" << objects_before << "->" << objects_after
            << " published_objects=" << published_objects_after
@@ -1613,19 +2301,147 @@ void InstanceMapThread::applyDetections(const InferenceResponse& response) {
            << formatLabelCounts(geometry_update_suppressed_by_label)
            << " geometry_update_suppressed_reason="
            << formatLabelCounts(geometry_update_suppressed_by_reason)
-           << " geometry_deleted_empty="
-           << formatLabelCounts(geometry_deleted_empty_by_label)
-           << " geometry_empty_ignored="
-           << formatLabelCounts(geometry_empty_ignored_by_label)
            << " merged_small_duplicates="
            << formatLabelCounts(merged_small_duplicates_by_label);
     RunLogger::logGlobal("instance_map_detail", detail.str());
   }
+  if (!commitReducerState(response, observations) ||
+      online_snapshot_worker_ == nullptr) {
+    return;
+  }
+  const SceneRevision control_revision = sceneSnapshot().revision();
+  for (SnapshotDispatch& dispatch : snapshot_dispatches) {
+    (void)online_snapshot_worker_->enqueueCandidate(
+        std::move(dispatch.input), response.time_ns);
+    if (dispatch.promotion) {
+      enqueueSnapshotControl(SnapshotControl{
+          SnapshotControlKind::kPromote,
+          dispatch.promotion->first,
+          dispatch.promotion->second,
+          response.time_ns,
+          control_revision});
+    }
+  }
+  for (int track_id : expired_snapshot_tracks) {
+    enqueueSnapshotControl(SnapshotControl{
+        SnapshotControlKind::kDropTentative,
+        track_id,
+        -1,
+        response.time_ns,
+        control_revision});
+  }
+}
+
+bool InstanceMapThread::commitReducerState(
+    const InferenceResponse& response,
+    const std::vector<InstanceObservation,
+                      Eigen::aligned_allocator<InstanceObservation>>& observations) {
+  std::vector<InstanceTrack, Eigen::aligned_allocator<InstanceTrack>> current_tracks;
+  std::vector<std::pair<int, int>> merges;
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    current_tracks.reserve(tracks_.size());
+    for (const InstanceTrack& track : tracks_) {
+      current_tracks.push_back(track);
+    }
+    merges = std::move(pending_reducer_merges_);
+    pending_reducer_merges_.clear();
+  }
+
+  const SceneSnapshot before = reducer_.snapshot();
+  std::map<int, int> current_object_by_track;
+  std::set<int> current_object_ids;
+  std::set<int> current_track_ids;
+  ApplyObservationBatchCommand command;
+  command.provenance = response.provenance;
+  command.observations = observations;
+  command.association_source = "scene_snapshot_association_v1";
+  command.associated_mutations.reserve(current_tracks.size() +
+                                       before.objects().size());
+  for (const InstanceTrack& track : current_tracks) {
+    if (track.track_id >= 0) {
+      current_track_ids.insert(track.track_id);
+    }
+    if (track.object_id >= 0) {
+      current_object_ids.insert(track.object_id);
+      current_object_by_track[track.track_id] = track.object_id;
+      UpsertTrackMutation upsert;
+      upsert.track = track;
+      upsert.object_id = track.object_id;
+      command.associated_mutations.emplace_back(std::move(upsert));
+    } else if (track.track_id >= 0) {
+      command.associated_mutations.emplace_back(
+          UpsertTentativeTrackMutation{track});
+    }
+  }
+  for (const auto& [track_id, track] : before.tracks()) {
+    (void)track;
+    if (current_track_ids.count(track_id) == 0) {
+      command.associated_mutations.emplace_back(
+          RemoveTrackMutation{track_id});
+    }
+  }
+
+  std::set<int> explicitly_merged_ids;
+  for (const auto& [retired_id, canonical_id] : merges) {
+    if (retired_id < 0 || canonical_id < 0 || retired_id == canonical_id) {
+      continue;
+    }
+    command.associated_mutations.emplace_back(durableMergeMutation(
+        before, retired_id, canonical_id, config_.snapshot_top_k));
+    explicitly_merged_ids.insert(retired_id);
+  }
+
+  for (const auto& [old_object_id, old_object] : before.objects()) {
+    if (current_object_ids.count(old_object_id) != 0 || !old_object ||
+        !old_object->identity ||
+        explicitly_merged_ids.count(old_object_id) != 0) {
+      continue;
+    }
+    std::optional<int> merged_into;
+    for (int source_track_id : old_object->identity->source_track_ids) {
+      const auto target = current_object_by_track.find(source_track_id);
+      if (target != current_object_by_track.end() &&
+          target->second != old_object_id) {
+        merged_into = target->second;
+        break;
+      }
+    }
+    if (merged_into) {
+      command.associated_mutations.emplace_back(durableMergeMutation(
+          before, old_object_id, *merged_into, config_.snapshot_top_k));
+    } else {
+      command.associated_mutations.emplace_back(
+          TombstoneObjectMutation{old_object_id,
+                                  "retired_by_association"});
+    }
+  }
+
+  const SceneApplyResult result =
+      reducer_.apply(SceneCommand{std::move(command)});
+  if (!result.accepted()) {
+    refreshAssociationWorkingSet(reducer_.snapshot());
+    RunLogger::logGlobal(
+        "scene_reducer",
+        "command_rejected frame_id=" +
+            std::to_string(response.provenance.frame_id) +
+            " reason=" + result.reason);
+    return false;
+  }
+  publishReducerResult(result, /*persist_content_commit=*/true);
+  RunLogger::logGlobal(
+      "scene_reducer",
+      "observation_commit frame_id=" +
+          std::to_string(response.provenance.frame_id) +
+          " objects=" + std::to_string(result.snapshot.objects().size()));
+  return true;
 }
 
 void InstanceMapThread::applyFrozenInstanceSnapshotRemake(
     const InferenceResponse& response) {
-  if (!config_.load_scene_graph || !config_.snapshot_remake_enabled) {
+  if (!config_.load_scene_graph ||
+      (!config_.snapshot_remake_enabled &&
+       online_snapshot_worker_ == nullptr)) {
     return;
   }
 
@@ -1653,9 +2469,17 @@ void InstanceMapThread::applyFrozenInstanceSnapshotRemake(
   }
 
   std::vector<ObjectSnapshotRemakeCandidate> candidates;
+  std::vector<OnlineSnapshotCandidate> online_candidates;
+  std::shared_ptr<const ImageBuffer> online_frame;
+  if (online_snapshot_worker_ != nullptr &&
+      !response.source_rgb_960.empty()) {
+    online_frame =
+        std::make_shared<const ImageBuffer>(response.source_rgb_960);
+  }
   {
     std::lock_guard<std::mutex> lock(mutex_);
     candidates.reserve(observations.size());
+    online_candidates.reserve(observations.size());
     for (const InstanceObservation& observation : observations) {
       const std::optional<std::size_t> track_index =
           findBestFrozenTrack(observation);
@@ -1670,17 +2494,44 @@ void InstanceMapThread::applyFrozenInstanceSnapshotRemake(
       candidate.time_ns = observation.time_ns;
       candidate.camera_id = observation.camera_id;
       candidates.push_back(std::move(candidate));
+      if (online_frame) {
+        OnlineSnapshotCandidate online;
+        online.owner =
+            SnapshotOwner{SnapshotOwnerKind::kObject, track.object_id};
+        online.candidate = makeOnlineSnapshotCandidate(
+            response, observation, online_frame);
+        online_candidates.push_back(std::move(online));
+      }
       ++matched_by_label[diagnosticsLabel(track.label)];
     }
   }
 
   std::string error;
-  const ObjectSnapshotRemakeFrameResult result =
-      snapshot_remaker_.submitFrame(response.source_rgb_960,
-                                    response.time_ns,
-                                    response.camera_id,
-                                    candidates,
-                                    &error);
+  ObjectSnapshotRemakeFrameResult result;
+  std::size_t online_accepted = 0;
+  if (online_snapshot_worker_ != nullptr) {
+    result.candidate_count = online_candidates.size();
+    for (OnlineSnapshotCandidate& candidate : online_candidates) {
+      const SnapshotWorkerEnqueueResult enqueued =
+          online_snapshot_worker_->enqueueCandidate(
+              std::move(candidate), response.time_ns);
+      if (enqueued.accepted()) {
+        ++online_accepted;
+      } else if (error.empty()) {
+        error = enqueued.reason;
+      }
+    }
+  } else {
+    // Deprecated compatibility path for installations that explicitly
+    // disable the online SnapshotBank. It only affects a later JSON export;
+    // the normal pipeline always routes frozen evidence through reducer-owned
+    // ApplySnapshotSetCommand above.
+    result = snapshot_remaker_.submitFrame(response.source_rgb_960,
+                                           response.time_ns,
+                                           response.camera_id,
+                                           candidates,
+                                           &error);
+  }
   const double apply_ms = elapsedMs(apply_start, std::chrono::steady_clock::now());
   std::ostringstream stream;
   stream << std::fixed << std::setprecision(2)
@@ -1691,6 +2542,9 @@ void InstanceMapThread::applyFrozenInstanceSnapshotRemake(
          << " rejected=" << rejected
          << " matched=" << candidates.size()
          << " candidate_count=" << result.candidate_count
+         << " online_snapshot_bank="
+         << (online_snapshot_worker_ != nullptr ? "true" : "false")
+         << " online_accepted=" << online_accepted
          << " saved_frame=" << (result.saved_frame ? "true" : "false")
          << " improved_objects=" << result.improved_objects
          << " first_snapshot_objects=" << result.first_snapshot_objects
@@ -1932,6 +2786,9 @@ bool InstanceMapThread::updateTrack(InstanceTrack* track,
   track->last_seen_ns = observation.time_ns;
   appendUnique(&track->source_cameras, observation.camera_id);
   appendUnique(&track->observation_timestamps_ns, observation.time_ns);
+  retainRecentObservationTimestamps(
+      &track->observation_timestamps_ns,
+      config_.instance_observation_history_capacity);
   if (!observation.near_surface_voxels.empty()) {
     track->near_surface_voxels = observation.near_surface_voxels;
   }
@@ -1972,15 +2829,21 @@ void InstanceMapThread::ageUnmatchedTracks(const std::vector<bool>& track_matche
   }
 }
 
-std::size_t InstanceMapThread::removeExpiredTentativeTracks() {
+std::size_t InstanceMapThread::removeExpiredTentativeTracks(
+    std::vector<int>* removed_track_ids) {
   const std::size_t before = tracks_.size();
   tracks_.erase(std::remove_if(tracks_.begin(),
                                tracks_.end(),
-                               [this](const InstanceTrack& track) {
-                                 return track.object_id < 0 &&
-                                        track.state == InstanceTrackState::kTentative &&
-                                        track.missed_count >=
-                                            config_.instance_tentative_max_missed;
+                               [this, removed_track_ids](const InstanceTrack& track) {
+                                 const bool expired =
+                                     track.object_id < 0 &&
+                                     track.state == InstanceTrackState::kTentative &&
+                                     track.missed_count >=
+                                         config_.instance_tentative_max_missed;
+                                 if (expired && removed_track_ids != nullptr) {
+                                   removed_track_ids->push_back(track.track_id);
+                                 }
+                                 return expired;
                                }),
                 tracks_.end());
   return before - tracks_.size();
@@ -2083,6 +2946,8 @@ std::size_t InstanceMapThread::mergeDuplicateStableTracks(
         winner.observation_quality_history.insert(winner.observation_quality_history.end(),
                                                   loser.observation_quality_history.begin(),
                                                   loser.observation_quality_history.end());
+        retainRecentObservationHistory(
+            &winner, config_.instance_observation_history_capacity);
         if (loser.snapshot.valid() &&
             (!winner.snapshot.valid() || loser.snapshot.quality >= winner.snapshot.quality)) {
           winner.snapshot = loser.snapshot;
@@ -2102,6 +2967,8 @@ std::size_t InstanceMapThread::mergeDuplicateStableTracks(
         }
 
         object_graph_.removeNode(loser_object_id);
+        pending_reducer_merges_.emplace_back(loser_object_id,
+                                             winner.object_id);
         tracks_.erase(tracks_.begin() + static_cast<std::ptrdiff_t>(loser_index));
         auto winner_it = std::find_if(tracks_.begin(),
                                       tracks_.end(),
@@ -2118,194 +2985,6 @@ std::size_t InstanceMapThread::mergeDuplicateStableTracks(
     }
   }
   return merged;
-}
-
-std::size_t InstanceMapThread::applyGeometryMaintenance(
-    const MapBackendSnapshot& map_snapshot,
-    TimeNanoseconds now_ns,
-    std::size_t* suppressed,
-    std::size_t* recovered,
-    std::size_t* deleted_empty,
-    std::map<std::string, std::size_t>* deleted_empty_by_label,
-    std::size_t* ignored_empty,
-    std::map<std::string, std::size_t>* ignored_empty_by_label) {
-  GeometrySurfaceCache surface_cache;
-  surface_cache.map_version = map_snapshot.map_version;
-  surface_cache.cache_rebuilds = map_snapshot.cache_rebuilds;
-  surface_cache.tsdf_blocks = map_snapshot.tsdf_blocks;
-  surface_cache.surface_voxels_scanned = map_snapshot.surface_voxels_scanned;
-  surface_cache.has_map = map_snapshot.has_map;
-  if (!map_snapshot.debug_surface_points.empty()) {
-    surface_cache.surface_points = map_snapshot.debug_surface_points;
-  } else {
-    surface_cache.surface_points.reserve(map_snapshot.surface_points_world.size());
-    for (const Eigen::Vector3f& point : map_snapshot.surface_points_world) {
-      MapSurfacePoint surface_point;
-      surface_point.position_world = point;
-      surface_point.weight = 1.0f;
-      surface_cache.surface_points.push_back(surface_point);
-    }
-  }
-  return applyGeometryMaintenance(surface_cache,
-                                  now_ns,
-                                  suppressed,
-                                  recovered,
-                                  deleted_empty,
-                                  deleted_empty_by_label,
-                                  ignored_empty,
-                                  ignored_empty_by_label);
-}
-
-std::size_t InstanceMapThread::applyGeometryMaintenance(
-    const GeometrySurfaceCache& surface_cache,
-    TimeNanoseconds now_ns,
-    std::size_t* suppressed,
-    std::size_t* recovered,
-    std::size_t* deleted_empty,
-    std::map<std::string, std::size_t>* deleted_empty_by_label,
-    std::size_t* ignored_empty,
-    std::map<std::string, std::size_t>* ignored_empty_by_label) {
-  if (suppressed != nullptr) {
-    *suppressed = 0;
-  }
-  if (recovered != nullptr) {
-    *recovered = 0;
-  }
-  if (deleted_empty != nullptr) {
-    *deleted_empty = 0;
-  }
-  if (deleted_empty_by_label != nullptr) {
-    deleted_empty_by_label->clear();
-  }
-  if (ignored_empty != nullptr) {
-    *ignored_empty = 0;
-  }
-  if (ignored_empty_by_label != nullptr) {
-    ignored_empty_by_label->clear();
-  }
-  if (!surface_cache.has_map || surface_cache.surface_points.empty()) {
-    return 0;
-  }
-
-  std::vector<int> object_ids_to_delete;
-  std::size_t checked = 0;
-  for (InstanceTrack& track : tracks_) {
-    if (track.object_id < 0) {
-      continue;
-    }
-    if (track.state == InstanceTrackState::kInactive && !track.publishable &&
-        track.geometry_bad_count >=
-            config_.instance_geometry_inactive_delete_bad_count) {
-      object_ids_to_delete.push_back(track.object_id);
-      continue;
-    }
-    if (!shouldEvaluateTrackGeometry(track, surface_cache, now_ns, config_)) {
-      continue;
-    }
-
-    const bool was_publishable = track.publishable;
-    const GeometryEvaluation evaluation =
-        evaluateGeometryAgainstSurface(track,
-                                       surface_cache,
-                                       config_.instance_geometry_shell_thickness_m,
-                                       config_.instance_geometry_min_unique_voxels);
-    ++checked;
-    track.geometry_score = evaluation.score;
-    track.geometry_shell_ratio = evaluation.shell_ratio;
-    track.geometry_extent_score = evaluation.extent_score;
-    track.geometry_leak_ratio = evaluation.leak_ratio;
-    track.geometry_cavity_ratio = evaluation.cavity_ratio;
-    track.geometry_in_box_points = evaluation.in_box_points;
-    track.geometry_shell_points = evaluation.shell_points;
-    track.geometry_unique_voxels = evaluation.unique_voxels;
-    track.geometry_expanded_points = evaluation.expanded_points;
-    if (!evaluation.voxel_refs.empty()) {
-      track.near_surface_voxels = evaluation.voxel_refs;
-    }
-    track.last_geometry_check_ns = now_ns;
-    track.geometry_evaluation_obb_revision = track.obb_revision;
-    track.geometry_evaluation_map_version = surface_cache.map_version;
-    track.geometry_evaluated_center_world = track.center_world;
-    track.geometry_evaluated_size_m = track.size_m;
-    track.geometry_evaluated_yaw_rad = track.yaw_rad;
-    track.geometry_evaluation_reason = evaluation.reason;
-
-    if (evaluation.in_box_points < config_.instance_geometry_empty_inside_points ||
-        evaluation.unique_voxels < config_.instance_geometry_min_unique_voxels) {
-      track.geometry_status = InstanceGeometryStatus::kEmpty;
-      if (shouldIgnoreGeometryEmptyForSmallObject(track, config_)) {
-        track.publishable = was_publishable;
-        if (ignored_empty != nullptr) {
-          ++(*ignored_empty);
-        }
-        if (ignored_empty_by_label != nullptr) {
-          ++(*ignored_empty_by_label)[diagnosticsLabel(track.label)];
-        }
-        updateObjectQualityScore(&track);
-        object_graph_.updateNodeFromTrack(track);
-        continue;
-      }
-      track.publishable = false;
-      object_ids_to_delete.push_back(track.object_id);
-      if (deleted_empty != nullptr) {
-        ++(*deleted_empty);
-      }
-      if (deleted_empty_by_label != nullptr) {
-        ++(*deleted_empty_by_label)[diagnosticsLabel(track.label)];
-      }
-      continue;
-    }
-
-    if (evaluation.score >= config_.instance_geometry_confirm_score) {
-      track.geometry_status = InstanceGeometryStatus::kGood;
-      track.geometry_bad_count = 0;
-      track.publishable = true;
-      if (!was_publishable && recovered != nullptr) {
-        ++(*recovered);
-      }
-    } else if (evaluation.score < config_.instance_geometry_suppress_score) {
-      track.geometry_status = InstanceGeometryStatus::kBad;
-      ++track.geometry_bad_count;
-      if (track.geometry_bad_count >=
-          config_.instance_geometry_failures_before_suppress) {
-        track.publishable = false;
-        if (was_publishable && suppressed != nullptr) {
-          ++(*suppressed);
-        }
-      }
-    } else {
-      track.geometry_status =
-          track.publishable ? InstanceGeometryStatus::kGood : InstanceGeometryStatus::kBad;
-    }
-    updateObjectQualityScore(&track);
-    object_graph_.updateNodeFromTrack(track);
-  }
-
-  for (int object_id : object_ids_to_delete) {
-    removeTrackAndObjectByObjectId(object_id);
-  }
-  return checked;
-}
-
-void InstanceMapThread::removeTrackAndObjectByObjectId(int object_id) {
-  object_graph_.removeNode(object_id);
-  tracks_.erase(std::remove_if(tracks_.begin(),
-                               tracks_.end(),
-                               [object_id](const InstanceTrack& track) {
-                                 return track.object_id == object_id;
-                               }),
-                tracks_.end());
-}
-
-bool InstanceMapThread::shouldRunGeometryMaintenance(TimeNanoseconds now_ns) const {
-  if (config_.instance_geometry_check_period_sec <= 0.0) {
-    return false;
-  }
-  if (last_geometry_maintenance_ns_ == 0) {
-    return true;
-  }
-  return now_ns - last_geometry_maintenance_ns_ >=
-         secondsToNanoseconds(config_.instance_geometry_check_period_sec);
 }
 
 bool InstanceMapThread::maybePromoteOrUpdateObject(InstanceTrack* track) {

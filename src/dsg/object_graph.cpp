@@ -41,9 +41,6 @@ void ObjectGraph::updateNodeFromTrack(const InstanceTrack& track) {
 
   node->semantic_id = track.semantic_id;
   node->label = track.label;
-  if (node->description.empty()) {
-    node->description = track.label;
-  }
   node->center_world = track.center_world;
   node->size_m = track.size_m;
   node->yaw_rad = track.yaw_rad;
@@ -77,7 +74,10 @@ void ObjectGraph::updateNodeFromTrack(const InstanceTrack& track) {
   node->geometry_evaluation_reason = track.geometry_evaluation_reason;
   appendUnique(&node->source_track_ids, track.track_id);
   appendUniqueVector(&node->source_cameras, track.source_cameras);
-  appendUniqueVector(&node->observation_timestamps_ns, track.observation_timestamps_ns);
+  // The track carries the configured recent-history window. Assigning it is
+  // important: unioning successive sliding windows would regrow the object
+  // history without bound.
+  node->observation_timestamps_ns = track.observation_timestamps_ns;
   if (track.snapshot.valid() &&
       (!node->snapshot.valid() || track.snapshot.quality >= node->snapshot.quality)) {
     node->snapshot = track.snapshot;
@@ -98,8 +98,10 @@ bool ObjectGraph::removeNode(int object_id) {
   relations_.erase(std::remove_if(relations_.begin(),
                                   relations_.end(),
                                   [object_id](const ObjectRelation& relation) {
-                                    return relation.source_object_id == object_id ||
-                                           relation.target_object_id == object_id;
+                                    const SceneEntityRef endpoint{
+                                        SceneEntityType::kObject, object_id};
+                                    return relationSource(relation) == endpoint ||
+                                           relationTarget(relation) == endpoint;
                                   }),
                    relations_.end());
   return objects_.size() != before;
@@ -107,8 +109,10 @@ bool ObjectGraph::removeNode(int object_id) {
 
 void ObjectGraph::loadSnapshot(const ObjectGraphSnapshot& snapshot) {
   objects_ = snapshot.objects;
+  rooms_ = snapshot.rooms;
   relations_ = snapshot.relations;
   snapshot_images_ = snapshot.snapshot_images;
+  import_warnings_ = snapshot.import_warnings;
   has_scene_graph_envelope_ = snapshot.has_scene_graph_envelope;
   scene_graph_json_ = snapshot.scene_graph_json;
   next_object_id_ = snapshot.next_object_id;
@@ -121,8 +125,10 @@ ObjectGraphSnapshot ObjectGraph::snapshot() const {
   ObjectGraphSnapshot snapshot;
   snapshot.next_object_id = next_object_id_;
   snapshot.objects = objects_;
+  snapshot.rooms = rooms_;
   snapshot.relations = relations_;
   snapshot.snapshot_images = snapshot_images_;
+  snapshot.import_warnings = import_warnings_;
   snapshot.has_scene_graph_envelope = has_scene_graph_envelope_;
   snapshot.scene_graph_json = scene_graph_json_;
   return snapshot;
@@ -164,7 +170,6 @@ ObjectNode ObjectGraph::nodeFromTrack(const InstanceTrack& track, int object_id)
   node.object_id = object_id;
   node.semantic_id = track.semantic_id;
   node.label = track.label;
-  node.description = track.label;
   node.center_world = track.center_world;
   node.size_m = track.size_m;
   node.yaw_rad = track.yaw_rad;

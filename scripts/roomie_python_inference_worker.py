@@ -3,20 +3,27 @@ from __future__ import annotations
 
 import argparse
 import os
+import signal
 import struct
 import sys
 import time
 import traceback
 
 
-REQUEST_MAGIC = b"RIEQ1"
-RESPONSE_MAGIC = b"RIRS1"
+REQUEST_MAGIC = b"RIEQ2"
+RESPONSE_MAGIC = b"RIRS2"
 PATCH_VALUES = 60 * 60
 MAX_MESSAGE_BYTES = 64 * 1024 * 1024
 
 
-_BINARY_STDOUT = os.fdopen(os.dup(sys.stdout.fileno()), "wb", buffering=0)
-sys.stdout = sys.stderr
+_BINARY_STDOUT = None
+
+
+def configure_binary_stdout() -> None:
+    global _BINARY_STDOUT
+    if _BINARY_STDOUT is None:
+        _BINARY_STDOUT = os.fdopen(os.dup(sys.stdout.fileno()), "wb", buffering=0)
+        sys.stdout = sys.stderr
 
 
 class ProtocolError(RuntimeError):
@@ -60,6 +67,53 @@ class RequestReader:
             "data": data,
         }
 
+    def read_provenance(self) -> dict:
+        provenance = {
+            "run_id": self.read_run_id(),
+            "frame_id": self.read_struct("Q"),
+            "request_id": self.read_struct("Q"),
+            "sensor_time_ns": self.read_struct("q"),
+            "map_mode": self.read_struct("B"),
+            "includes_current_frame": self.read_struct("B"),
+            "causality_verified": self.read_struct("B"),
+            "map": {
+                "map_epoch": self.read_run_id(),
+                "map_revision": self.read_struct("Q"),
+                "integrated_through_ns": self.read_struct("q"),
+            },
+            "surface": {
+                "map_epoch": self.read_run_id(),
+                "surface_revision": self.read_struct("Q"),
+                "source_map_revision": self.read_struct("Q"),
+            },
+        }
+        if provenance["map_mode"] not in (0, 1):
+            raise ProtocolError("request provenance has invalid map mode")
+        for name in ("includes_current_frame", "causality_verified"):
+            if provenance[name] not in (0, 1):
+                raise ProtocolError(f"request provenance has invalid {name}")
+            provenance[name] = bool(provenance[name])
+        return provenance
+
+    def read_run_id(self) -> dict:
+        return {
+            "high": self.read_struct("Q"),
+            "low": self.read_struct("Q"),
+        }
+
+    def read_pipeline_timing(self) -> dict:
+        return {
+            "serialize_ms": self.read_struct("d"),
+            "pipe_write_ms": self.read_struct("d"),
+            "pipe_read_ms": self.read_struct("d"),
+            "worker_queue_ms": self.read_struct("d"),
+            "response_forward_ms": self.read_struct("d"),
+        }
+
+    def require_end(self) -> None:
+        if self.offset != len(self.data):
+            raise ProtocolError("request body has trailing bytes")
+
 
 class ResponseWriter:
     def __init__(self):
@@ -74,8 +128,42 @@ class ResponseWriter:
         self.write_struct("I", len(data))
         self.body.extend(data)
 
-    def write_response(self, response: dict) -> None:
+    def write_run_id(self, run_id: dict) -> None:
+        self.write_struct("Q", int(run_id.get("high", 0)))
+        self.write_struct("Q", int(run_id.get("low", 0)))
+
+    def write_provenance(self, provenance: dict) -> None:
+        self.write_run_id(provenance.get("run_id", {}))
+        self.write_struct("Q", int(provenance.get("frame_id", 0)))
+        self.write_struct("Q", int(provenance.get("request_id", 0)))
+        self.write_struct("q", int(provenance.get("sensor_time_ns", 0)))
+        self.write_struct("B", int(provenance.get("map_mode", 0)))
+        self.write_struct(
+            "B", 1 if provenance.get("includes_current_frame", False) else 0
+        )
+        self.write_struct(
+            "B", 1 if provenance.get("causality_verified", False) else 0
+        )
+        map_stamp = provenance.get("map", {})
+        self.write_run_id(map_stamp.get("map_epoch", {}))
+        self.write_struct("Q", int(map_stamp.get("map_revision", 0)))
+        self.write_struct("q", int(map_stamp.get("integrated_through_ns", 0)))
+        surface_stamp = provenance.get("surface", {})
+        self.write_run_id(surface_stamp.get("map_epoch", {}))
+        self.write_struct("Q", int(surface_stamp.get("surface_revision", 0)))
+        self.write_struct("Q", int(surface_stamp.get("source_map_revision", 0)))
+
+    def write_pipeline_timing(self, timing: dict) -> None:
+        self.write_struct("d", float(timing.get("serialize_ms", 0.0)))
+        self.write_struct("d", float(timing.get("pipe_write_ms", 0.0)))
+        self.write_struct("d", float(timing.get("pipe_read_ms", 0.0)))
+        self.write_struct("d", float(timing.get("worker_queue_ms", 0.0)))
+        self.write_struct("d", float(timing.get("response_forward_ms", 0.0)))
+
+    def encode_response(self, response: dict) -> bytes:
         self.write_struct("q", int(response.get("time_ns", 0)))
+        self.write_provenance(response.get("provenance", {}))
+        self.write_pipeline_timing(response.get("pipeline_timing", {}))
         self.write_string(response.get("camera_id", ""))
         self.write_struct("B", 1 if response.get("ok", False) else 0)
         self.write_string(response.get("error", ""))
@@ -106,8 +194,14 @@ class ResponseWriter:
             self.write_struct("i", int(det["semantic_id"]))
             self.write_string(det["label"])
 
-        _BINARY_STDOUT.write(struct.pack("<I", len(self.body)))
-        _BINARY_STDOUT.write(self.body)
+        return bytes(self.body)
+
+    def write_response(self, response: dict) -> None:
+        body = self.encode_response(response)
+        if _BINARY_STDOUT is None:
+            raise RuntimeError("binary stdout is not configured")
+        _BINARY_STDOUT.write(struct.pack("<I", len(body)))
+        _BINARY_STDOUT.write(body)
 
 
 def read_exact(size: int) -> bytes | None:
@@ -135,12 +229,46 @@ def read_message() -> bytes | None:
     return body
 
 
+def empty_provenance() -> dict:
+    return {
+        "run_id": {"high": 0, "low": 0},
+        "frame_id": 0,
+        "request_id": 0,
+        "sensor_time_ns": 0,
+        "map_mode": 0,
+        "includes_current_frame": False,
+        "causality_verified": False,
+        "map": {
+            "map_epoch": {"high": 0, "low": 0},
+            "map_revision": 0,
+            "integrated_through_ns": 0,
+        },
+        "surface": {
+            "map_epoch": {"high": 0, "low": 0},
+            "surface_revision": 0,
+            "source_map_revision": 0,
+        },
+    }
+
+
+def empty_pipeline_timing() -> dict:
+    return {
+        "serialize_ms": 0.0,
+        "pipe_write_ms": 0.0,
+        "pipe_read_ms": 0.0,
+        "worker_queue_ms": 0.0,
+        "response_forward_ms": 0.0,
+    }
+
+
 def parse_request(body: bytes) -> dict:
     reader = RequestReader(body)
     if reader.read_bytes(len(REQUEST_MAGIC)) != REQUEST_MAGIC:
         raise ProtocolError("invalid request magic")
     request = {
         "time_ns": reader.read_struct("q"),
+        "provenance": reader.read_provenance(),
+        "pipeline_timing": reader.read_pipeline_timing(),
         "camera_id": reader.read_string(),
         "rgb": reader.read_image(),
         "mask": reader.read_image(),
@@ -158,12 +286,17 @@ def parse_request(body: bytes) -> dict:
     request["projected_points"] = reader.read_struct("i")
     request["map_version"] = reader.read_struct("Q")
     request["T_world_camera"] = reader.read_struct("16f")
+    reader.require_end()
     return request
 
 
 def empty_response(request: dict, ok: bool, error: str = "") -> dict:
     return {
         "time_ns": int(request.get("time_ns", 0)),
+        "provenance": request.get("provenance", empty_provenance()),
+        "pipeline_timing": dict(
+            request.get("pipeline_timing", empty_pipeline_timing())
+        ),
         "camera_id": request.get("camera_id", ""),
         "ok": ok,
         "error": error,
@@ -625,6 +758,11 @@ def parse_args() -> argparse.Namespace:
 
 
 def main() -> int:
+    # The owning C++ actor coordinates pipe closure and bounded shutdown. A
+    # launcher commonly sends SIGINT to the whole process group; do not let
+    # that interrupt a framed read and corrupt the protocol during teardown.
+    signal.signal(signal.SIGINT, signal.SIG_IGN)
+    configure_binary_stdout()
     args = parse_args()
     runtime = None
     init_error = ""
@@ -645,7 +783,12 @@ def main() -> int:
             else:
                 response = runtime.process(request)
         except Exception:
-            fallback = {"time_ns": 0, "camera_id": ""}
+            fallback = {
+                "time_ns": 0,
+                "provenance": empty_provenance(),
+                "pipeline_timing": empty_pipeline_timing(),
+                "camera_id": "",
+            }
             try:
                 fallback = parse_request(body)
             except Exception:
