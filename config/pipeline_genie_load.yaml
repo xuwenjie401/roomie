@@ -1,0 +1,188 @@
+roomie_pipeline_node:
+  ros__parameters:
+    # genie_bag_player currently preserves recorded header stamps but does not
+    # publish /clock, so Roomie must use wall time for its ROS timers.
+    use_sim_time: false
+
+    basic:
+      world_frame: map
+      mapping_camera_id: head_color
+      mapping_camera_frame: head_color
+
+    topics:
+      color_topic: /roomie/input/head_color/image_rect
+      depth_topic: /roomie/input/head_color/depth_registered
+      mask_topic: /roomie/input/head_color/robot_mask
+      camera_info_topic: /roomie/input/head_color/camera_info
+      tf_topic: /tf
+      tf_static_topic: /tf_static
+      tsdf_output_topic: /roomie/map_surface
+      detection_debug_image_topic: /roomie/detections_2d_image
+      raw_detections_topic: /roomie/raw_detections
+      object_markers_topic: /roomie/objects
+      instance_markers_topic: /roomie/instances
+
+    # Rectified head-color intrinsics. The RGB-D adapter preserves this K when
+    # rectifying color and registering depth into the color frame.
+    camera:
+      width: 640
+      height: 400
+      fx: 305.2087402344
+      fy: 305.0057678223
+      cx: 318.5672912598
+      cy: 204.0587768555
+
+    input_filter:
+      depth_min_m: 0.1
+      depth_max_m: 6.0
+      # The adapter publishes 32FC1 meters; Roomie only applies this scale to
+      # 16UC1 input.
+      depth_scale: 0.001
+      mask_robot_threshold: 0
+
+    tsdf:
+      map_backend: nvblox
+      voxel_size_m: 0.03
+      truncation_distance_vox: 8.0
+      max_weight: 20.0
+      max_integration_distance_m: 6.0
+      min_visualization_weight: 1.0
+      min_color_weight: 0.1
+      surface_visualization_distance_vox: 1.0
+      surface_cache_rebuild_period_sec: 1.0
+      # Coordinated-load mode. Resolve the immutable NVBlox checkpoint from
+      # persistence.scene_store_path and restore its aligned semantic scene.
+      # Keep map_load_path unset; the durable manifest owns the exact path.
+      load_map: false
+      map_load_mode: coordinated
+      freeze_tsdf_map: false
+      save_map: true
+      map_save_path: /home/lindenbot/Datasets/output/genie_live/nvblox/
+
+    # Mapping-only mode: do not start OWLv2/BoxerNet.
+    # roomie_agibot_head_mapping.launch.py overrides enabled and
+    # python_backend_enabled when enable_boxer:=true.
+    detection:
+      enabled: false
+      python_backend_enabled: false
+      max_inference_fps: 5.0
+      boxer_input_size: 960
+      min_patch_coverage_ratio: 0.05
+      patch_depth_max_m: 0.0
+      patch_depth_zbuffer_scale: 4
+      patch_depth_zbuffer_splat_radius_cells: 1
+      patch_depth_zbuffer_front_quantile: 0.25
+      patch_depth_zbuffer_min_cells_per_patch: 1
+      python_executable: /home/lindenbot/miniconda3/envs/jarvis/bin/python
+      python_worker_script: /home/lindenbot/RealityLab/jarvis/src/roomie/scripts/roomie_python_inference_worker.py
+      boxer_repo_path: /home/lindenbot/RealityLab/boxer
+      boxernet_ckpt_path: /home/lindenbot/hugging_face/boxer/boxernet_hw960in4x6d768-3e37cfc4.ckpt
+      inference_device: cuda
+      inference_precision: auto
+      text_prompts: [lvisplus]
+      owl_min_confidence: 0.25
+      owl_nms_iou_threshold: 0.5
+      boxernet_min_confidence: 0.35
+      robot_bbox_mask_overlap: 0.25
+      robot_bbox_center_overlap: 0.5
+      robot_mask_dilate_px: 3
+      show_3d_label_score: true
+
+    perception:
+      deadline_ms: 10000
+
+    instance:
+      observation_history_capacity: 256
+
+    queues:
+      input_queue_size: 60
+      pending_frame_limit: 120
+      mapping_queue_size: 30
+      detection_queue_size: 2
+      inference_request_queue_size: 1
+      inference_response_queue_size: 1
+      shutdown_drain_timeout_ms: 5000
+
+    sync:
+      max_image_stamp_delta_sec: 0.002
+      tf_buffer_duration_sec: 5.0
+      max_tf_gap_sec: 0.2
+      max_tf_translation_step_m: 0.5
+      max_tf_rotation_step_deg: 45.0
+
+    publishing:
+      publish_period_sec: 1.0
+
+    artifacts:
+      # Keep the default mapping-only launch free of semantic worker startup.
+      # The launch file enables this complete chain together with Boxer.
+      snapshot_enabled: false
+      asset_store_root: /home/lindenbot/Datasets/output/genie_live/assets
+      snapshot_top_k: 3
+      snapshot_queue_size: 32
+      snapshot_control_queue_size: 64
+      snapshot_minimum_quality: 0.02
+      snapshot_azimuth_bucket_degrees: 45.0
+      snapshot_elevation_bucket_degrees: 30.0
+      snapshot_scale_bucket_ratio: 1.41421356
+      snapshot_diversity_min_quality_ratio: 0.65
+      asset_gc_grace_period_sec: 300.0
+      asset_gc_period_ms: 60000
+      dam_enabled: false
+      dam_model_id: nvidia-dam-3b-official-v1
+      dam_prompt_hash: ""
+      dam_output_schema_version: roomie.dam.v1
+      dam_python_executable: /home/lindenbot/RealityLab/.venvs/roomie-dam/bin/python
+      dam_worker_script: /home/lindenbot/RealityLab/jarvis/src/roomie/scripts/roomie_python_dam_worker.py
+      dam_source: /home/lindenbot/RealityLab/describe-anything
+      dam_model_path: /home/lindenbot/hugging_face/DAM-3B
+      dam_conversation_mode: v1
+      dam_prompt_mode: full+focal_crop
+      dam_query: |-
+        <image>
+        Describe only the visible object inside the masked region in detail.
+        Include its color, material, shape, parts, pose, and distinctive visual
+        details. Do not describe unrelated background.
+      dam_max_new_tokens: 256
+      dam_temperature: 0.2
+      dam_top_p: 0.9
+      dam_bbox_pad_px: 2.0
+      dam_startup_timeout_ms: 120000
+      dam_request_timeout_ms: 120000
+      dam_shutdown_timeout_ms: 500
+      new_object_window_ms: 10000
+      new_object_interactive_limit: 5
+      embedding_enabled: false
+      embedding_model_id: sentence-t5-large.local.v1
+      embedding_dimension: 768
+      embedding_python_executable: /home/lindenbot/miniconda3/envs/jarvis/bin/python
+      embedding_worker_script: /home/lindenbot/RealityLab/jarvis/src/roomie/scripts/roomie_sentence_transformer_worker.py
+      embedding_model_path: /home/lindenbot/hugging_face/sentence_t5_large
+      embedding_device: cpu
+      embedding_batch_size: 16
+      embedding_record_history_capacity: 1024
+      embedding_startup_timeout_ms: 120000
+      embedding_request_timeout_ms: 120000
+      embedding_shutdown_timeout_ms: 500
+
+    persistence:
+      scene_store_enabled: true
+      scene_store_path: /home/lindenbot/Datasets/output/genie_live/roomie_scene.sqlite3
+      scene_store_flush_period_ms: 1000
+      scene_store_flush_batch_size: 16
+      scene_store_queue_size: 64
+      scene_store_soft_lag_revisions: 32
+      scene_store_hard_lag_revisions: 64
+      scene_store_terminal_failure_timeout_ms: 5000
+      load_scene_graph: false
+      freeze_instances: false
+      # The launch file overrides this to true with enable_boxer:=true.
+      save_scene_graph: false
+      scene_graph_save_path: /home/lindenbot/Datasets/output/genie_live/instances/
+      snapshot_remake_enabled: false
+      snapshot_staging_dir: /home/lindenbot/Datasets/output/genie_live/snapshots/
+
+    logging:
+      enabled: true
+      root_dir: /home/lindenbot/RealityLab/jarvis/src/roomie/logs/genie_live
+      period_sec: 2.0

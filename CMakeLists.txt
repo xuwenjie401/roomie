@@ -51,6 +51,14 @@ find_package(OpenCV REQUIRED COMPONENTS core imgproc)
 find_package(PNG REQUIRED)
 find_package(SQLite3 REQUIRED)
 
+if(TARGET SQLite3::SQLite3)
+  set(ROOMIE_SQLITE_TARGET SQLite3::SQLite3)
+elseif(TARGET SQLite::SQLite3)
+  set(ROOMIE_SQLITE_TARGET SQLite::SQLite3)
+else()
+  message(FATAL_ERROR "SQLite3 was found but did not export a supported CMake target")
+endif()
+
 rosidl_generate_interfaces(${PROJECT_NAME}
   "srv/MutateScene.srv"
   "srv/QueryScene.srv"
@@ -102,7 +110,7 @@ target_include_directories(
                          "$<INSTALL_INTERFACE:include/${PROJECT_NAME}>"
 )
 target_link_libraries(roomie_pipeline Eigen3::Eigen nlohmann_json::nlohmann_json
-                      SQLite3::SQLite3 PNG::PNG ${OpenCV_LIBS})
+                      ${ROOMIE_SQLITE_TARGET} PNG::PNG ${OpenCV_LIBS})
 
 if(ROOMIE_ENABLE_NVBLOX)
   find_package(CUDAToolkit REQUIRED)

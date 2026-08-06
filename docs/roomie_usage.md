@@ -153,6 +153,25 @@ ros2 launch roomie roomie_agibot_head_mapping.launch.py \
 
 使用 Genie Bag Player 时，`tf_topic` 通常为 `/tf`；直接连接 GDK 时可能需要改为 `/gdk/tf`。
 
+使用 `live_connect` 的本地 RGB-D 输出时，先启动连接节点，再使用 live 入口。该
+入口除订阅 `/live_connect/head_color` 和 `/live_connect/head_depth` 外，其余行为
+与 `roomie_agibot_head_mapping.launch.py` 一致。默认使用
+`config/pipeline_genie_live.yaml`，并将地图、SceneStore、资产和日志隔离到
+`genie_live` 数据目录：
+
+```bash
+ros2 launch live_connect live_connect.launch.py
+
+# 在另一个已加载工作区环境的终端中运行：
+ros2 launch roomie roomie_agibot_live.launch.py \
+  enable_boxer:=true \
+  use_rviz:=true
+
+# 完整语义、RViz 和浏览器问答一体启动：
+ros2 launch roomie roomie_agibot_live_with_qa.launch.py \
+  boxer_max_inference_fps:=5.0
+```
+
 ### 4.3 完整语义模式
 
 ```bash

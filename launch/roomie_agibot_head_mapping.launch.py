@@ -25,6 +25,8 @@ def generate_launch_description():
     adapter_config = LaunchConfiguration("adapter_config")
     pipeline_config = LaunchConfiguration("pipeline_config")
     calibration_file = LaunchConfiguration("calibration_file")
+    color_topic = LaunchConfiguration("color_topic")
+    depth_topic = LaunchConfiguration("depth_topic")
     tf_topic = LaunchConfiguration("tf_topic")
     publish_static_tf = LaunchConfiguration("publish_static_tf")
     enable_boxer = LaunchConfiguration("enable_boxer")
@@ -62,6 +64,16 @@ def generate_launch_description():
                     "roomie_base/calib/head_camera_params.yaml"
                 ),
                 description="Head camera intrinsic and static-extrinsic YAML.",
+            ),
+            DeclareLaunchArgument(
+                "color_topic",
+                default_value="/gdk/camera/head_color",
+                description="Live RGB image topic consumed by the adapter.",
+            ),
+            DeclareLaunchArgument(
+                "depth_topic",
+                default_value="/gdk/camera/head_depth",
+                description="Live depth image topic consumed by the adapter.",
             ),
             DeclareLaunchArgument(
                 "tf_topic",
@@ -116,6 +128,8 @@ def generate_launch_description():
                     adapter_config,
                     {
                         "calibration_file": calibration_file,
+                        "color_topic": color_topic,
+                        "depth_topic": depth_topic,
                         "publish_static_tf": ParameterValue(
                             publish_static_tf,
                             value_type=bool,
@@ -128,6 +142,14 @@ def generate_launch_description():
                 executable="roomie_pipeline_node",
                 name="roomie_pipeline_node",
                 output="screen",
+                # Saving the coordinated NVblox checkpoint happens at the end
+                # of Roomie's graceful shutdown, after all semantic and
+                # persistence queues have drained.  The launch default of five
+                # seconds can SIGTERM the node before it publishes the map
+                # manifest, leaving a non-empty SceneStore that cannot be
+                # recovered safely on the next start.
+                sigterm_timeout="120.0",
+                sigkill_timeout="10.0",
                 parameters=[
                     pipeline_config,
                     {
