@@ -488,8 +488,10 @@ void DetectionBridgeThread::processReadyCandidate(
     return;
   }
 
+  RequestBuildTiming request_build_timing;
   const auto resize_start = std::chrono::steady_clock::now();
-  InferenceRequest request = makeRequest(*frame, std::move(*patch_depth));
+  InferenceRequest request = makeRequest(*frame, std::move(*patch_depth),
+                                         &request_build_timing);
   const double resize_ms =
       elapsedMs(resize_start, std::chrono::steady_clock::now());
   if (request.rgb_960.empty()) {
@@ -497,7 +499,7 @@ void DetectionBridgeThread::processReadyCandidate(
     finishActiveCandidate("resize_failed");
     return;
   }
-  stashDebugFrame(request, projection_ms, resize_ms);
+  stashDebugFrame(request, projection_ms, resize_ms, request_build_timing);
   PendingDebugFrame& debug =
       pending_debug_frames_.at(request.provenance.request_id);
   debug.map_commit_wait_ms = map_commit_wait_ms;
@@ -546,6 +548,8 @@ void DetectionBridgeThread::processReadyCandidate(
     total_map_commit_wait_ms_ += map_commit_wait_ms;
     total_projection_compute_ms_ += projection_compute_ms;
     total_resize_ms_ += resize_ms;
+    total_rgb_resize_ms_ += request_build_timing.rgb_resize_ms;
+    total_mask_resize_ms_ += request_build_timing.mask_resize_ms;
     last_request_time_ = std::chrono::steady_clock::now();
     const double due_in_ms = elapsedMs(last_request_time_, request_due_time);
     RunLogger::logGlobal(
@@ -558,7 +562,10 @@ void DetectionBridgeThread::processReadyCandidate(
             " projection_compute_ms=" +
             std::to_string(projection_compute_ms) + " projection_ms=" +
             std::to_string(projection_ms) + " resize_ms=" +
-            std::to_string(resize_ms));
+            std::to_string(resize_ms) + " rgb_resize_ms=" +
+            std::to_string(request_build_timing.rgb_resize_ms) +
+            " mask_resize_ms=" +
+            std::to_string(request_build_timing.mask_resize_ms));
   } else {
     pending_debug_frames_.erase(request_provenance.request_id);
     pending_debug_order_.erase(
@@ -670,9 +677,14 @@ RequestId DetectionBridgeThread::allocateRequestId() {
   return request_id;
 }
 
-InferenceRequest DetectionBridgeThread::makeRequest(const FrameBundle& frame,
-                                                    PatchDepth patch_depth) {
+InferenceRequest DetectionBridgeThread::makeRequest(
+    const FrameBundle& frame,
+    PatchDepth patch_depth,
+    RequestBuildTiming* timing) {
   InferenceRequest request;
+  if (timing != nullptr) {
+    *timing = RequestBuildTiming{};
+  }
   request.time_ns = frame.provenance.sensor_time_ns;
   request.provenance = frame.provenance;
   if (request.provenance.sensor_time_ns == 0) {
@@ -698,12 +710,22 @@ InferenceRequest DetectionBridgeThread::makeRequest(const FrameBundle& frame,
   request.due_time = frame.due_time;
   request.camera_id = frame.camera_id;
   if (frame.rgb) {
+    const auto started = std::chrono::steady_clock::now();
     request.rgb_960 = resizeBilinear(
         *frame.rgb, config_.boxer_input_size, config_.boxer_input_size);
+    if (timing != nullptr) {
+      timing->rgb_resize_ms =
+          elapsedMs(started, std::chrono::steady_clock::now());
+    }
   }
   if (frame.robot_mask) {
+    const auto started = std::chrono::steady_clock::now();
     request.mask_960 = resizeNearest(
         *frame.robot_mask, config_.boxer_input_size, config_.boxer_input_size);
+    if (timing != nullptr) {
+      timing->mask_resize_ms =
+          elapsedMs(started, std::chrono::steady_clock::now());
+    }
   }
   request.patch_depth = std::move(patch_depth);
   request.patch_depth.provenance = request.provenance;
@@ -815,6 +837,12 @@ void DetectionBridgeThread::forwardBackendResponses() {
                                std::to_string(pending ? pending->map_commit_wait_ms : 0.0) +
                                " projection_compute_ms=" +
                                std::to_string(pending ? pending->projection_compute_ms : 0.0) +
+                               " resize_ms=" +
+                               std::to_string(pending ? pending->resize_ms : 0.0) +
+                               " rgb_resize_ms=" +
+                               std::to_string(pending ? pending->rgb_resize_ms : 0.0) +
+                               " mask_resize_ms=" +
+                               std::to_string(pending ? pending->mask_resize_ms : 0.0) +
                                " backend_response_queue_dwell_ms=" +
                                std::to_string(response_queue_dwell_ms) +
                                " ingest_to_response_forward_ms=" +
@@ -876,6 +904,8 @@ void DetectionBridgeThread::forwardBackendResponses() {
              << " map_commit_latency_ms=" << (pending ? pending->map_commit_latency_ms : 0.0)
              << " projection_compute_ms=" << (pending ? pending->projection_compute_ms : 0.0)
              << " resize_ms=" << (pending ? pending->resize_ms : 0.0)
+             << " rgb_resize_ms=" << (pending ? pending->rgb_resize_ms : 0.0)
+             << " mask_resize_ms=" << (pending ? pending->mask_resize_ms : 0.0)
              << " backend_ipc_ms=" << response.backend_ipc_ms
              << " worker_ms=" << response.python_worker_ms
              << " preprocess_ms=" << response.python_preprocess_ms
@@ -926,7 +956,8 @@ void DetectionBridgeThread::forwardBackendResponses() {
 
 void DetectionBridgeThread::stashDebugFrame(const InferenceRequest& request,
                                             double projection_ms,
-                                            double resize_ms) {
+                                            double resize_ms,
+                                            const RequestBuildTiming& timing) {
   if (request.rgb_960.empty()) {
     return;
   }
@@ -943,6 +974,8 @@ void DetectionBridgeThread::stashDebugFrame(const InferenceRequest& request,
   debug.T_world_camera = request.T_world_camera;
   debug.projection_ms = projection_ms;
   debug.resize_ms = resize_ms;
+  debug.rgb_resize_ms = timing.rgb_resize_ms;
+  debug.mask_resize_ms = timing.mask_resize_ms;
   debug.patch_coverage = request.patch_depth.coverageRatio();
   debug.valid_patches = request.patch_depth.valid_patches;
   debug.projected_points = request.patch_depth.projected_points;
@@ -1161,6 +1194,8 @@ void DetectionBridgeThread::maybeLogStatus() {
          << " avg_map_commit_wait_ms=" << total_map_commit_wait_ms_ / request_count
          << " avg_projection_compute_ms=" << total_projection_compute_ms_ / request_count
          << " avg_resize_ms=" << total_resize_ms_ / request_count
+         << " avg_rgb_resize_ms=" << total_rgb_resize_ms_ / request_count
+         << " avg_mask_resize_ms=" << total_mask_resize_ms_ / request_count
          << " avg_backend_ipc_ms=" << total_backend_ipc_ms_ / response_count
          << " avg_worker_ms=" << total_worker_ms_ / response_count
          << " avg_owl_ms=" << total_owl_ms_ / response_count

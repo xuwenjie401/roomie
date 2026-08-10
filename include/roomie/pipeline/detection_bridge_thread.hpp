@@ -41,6 +41,11 @@ class DetectionBridgeThread : public WorkerThread {
   void onStopRequested() override;
 
  private:
+  struct RequestBuildTiming {
+    double rgb_resize_ms = 0.0;
+    double mask_resize_ms = 0.0;
+  };
+
   struct PendingDebugFrame {
     ImageBuffer image;
     FrameProvenance provenance;
@@ -50,6 +55,8 @@ class DetectionBridgeThread : public WorkerThread {
     Eigen::Isometry3f T_world_camera = Eigen::Isometry3f::Identity();
     double projection_ms = 0.0;
     double resize_ms = 0.0;
+    double rgb_resize_ms = 0.0;
+    double mask_resize_ms = 0.0;
     float patch_coverage = 0.0f;
     int valid_patches = 0;
     int projected_points = 0;
@@ -91,11 +98,14 @@ class DetectionBridgeThread : public WorkerThread {
   void pruneMapCommitsLocked(std::chrono::steady_clock::time_point now);
   void discardUnstartedCandidatesForShutdown();
   RequestId allocateRequestId();
-  InferenceRequest makeRequest(const FrameBundle& frame, PatchDepth patch_depth);
+  InferenceRequest makeRequest(const FrameBundle& frame,
+                               PatchDepth patch_depth,
+                               RequestBuildTiming* timing);
   void forwardBackendResponses();
   void stashDebugFrame(const InferenceRequest& request,
                        double projection_ms,
-                       double resize_ms);
+                       double resize_ms,
+                       const RequestBuildTiming& timing);
   std::optional<PendingDebugFrame> takeDebugFrame(const InferenceResponse& response);
   void publishDetectionDebugImage(const InferenceResponse& response,
                                   const std::optional<PendingDebugFrame>& pending);
@@ -161,6 +171,8 @@ class DetectionBridgeThread : public WorkerThread {
   double total_response_queue_dwell_ms_ = 0.0;
   double total_ingest_to_forward_ms_ = 0.0;
   double total_resize_ms_ = 0.0;
+  double total_rgb_resize_ms_ = 0.0;
+  double total_mask_resize_ms_ = 0.0;
   double total_roundtrip_ms_ = 0.0;
   double total_backend_ipc_ms_ = 0.0;
   double total_worker_ms_ = 0.0;
