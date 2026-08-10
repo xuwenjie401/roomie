@@ -29,15 +29,13 @@ def generate_launch_description():
     slice_height = LaunchConfiguration("slice_height")
     slice_half_thickness = LaunchConfiguration("slice_half_thickness")
 
-    default_config = source_package_path("config", "pipeline_nvblox.yaml")
     default_rviz = source_package_path("rviz", "roomie_offline_room_partition.rviz")
 
     return LaunchDescription(
         [
             DeclareLaunchArgument(
                 "config_path",
-                default_value=default_config,
-                description="Path to the roomie pipeline parameter file.",
+                description="Required path to the roomie pipeline parameter file.",
             ),
             DeclareLaunchArgument(
                 "use_rviz",

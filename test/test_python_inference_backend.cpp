@@ -226,6 +226,25 @@ TEST(PythonInferenceBackendShutdown, HungWorkerIsCancelledWithinBound) {
   EXPECT_LT(shutdown_elapsed, 2s);
 }
 
+TEST(PythonInferenceBackendConfig, LabelThresholdFilesAreForwarded) {
+  TemporaryDirectory temporary;
+  ScopedEnvironment mode("ROOMIE_FAKE_WORKER_MODE", "hang_after_request");
+  ScopedEnvironment marker("ROOMIE_FAKE_WORKER_MARKER",
+                           temporary.markerPath());
+  ScopedEnvironment expected(
+      "ROOMIE_FAKE_WORKER_EXPECT_LABEL_THRESHOLD_FILE", __FILE__);
+  PipelineConfig config = makeConfig();
+  config.label_thresholds_file = __FILE__;
+  PythonInferenceBackend backend(std::move(config));
+  BackendStopGuard stop_guard(&backend);
+  backend.start();
+
+  ASSERT_TRUE(backend.enqueueRequest(makeRequest(7101)).accepted());
+  EXPECT_TRUE(waitUntil(
+      [&]() { return ::access(temporary.markerPath().c_str(), F_OK) == 0; },
+      5s));
+}
+
 TEST(PythonInferenceBackendAdmission,
      QueuedDeadlineIsRecheckedBeforeStartingWorker) {
   TemporaryDirectory temporary;

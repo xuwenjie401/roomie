@@ -13,7 +13,7 @@ DEFAULT_DESCRIBED_JSON = Path(
 )
 DEFAULT_EMBEDDING_MODEL = Path("/home/lindenbot/hugging_face/sentence_t5_large")
 DEFAULT_GEMINI_MODEL = "gemini-flash-latest"
-DEFAULT_DOUBAO_MODEL = "doubao-seed-2-0-lite-260215"
+DEFAULT_DOUBAO_MODEL = "doubao-seed-2-1-pro-260628"
 DEFAULT_DOUBAO_BASE_URL = "https://ark.cn-beijing.volces.com/api/v3"
 DEFAULT_QA_CONFIG_NAME = "config.json"
 DEFAULT_SYSTEM_PROMPT_PATH = Path("prompts/system.txt")

@@ -2583,7 +2583,11 @@ std::optional<InstanceObservation> InstanceMapThread::makeObservation(
       !std::isfinite(detection.yaw_rad)) {
     return std::nullopt;
   }
-  if (observation.confidence < config_.instance_min_confidence) {
+  const float min_confidence = labelConfidenceThreshold(
+      config_.instance_label_thresholds,
+      detection.label,
+      config_.instance_min_confidence);
+  if (observation.confidence < min_confidence) {
     return std::nullopt;
   }
   if ((detection.size_m.array() < config_.instance_min_bbox_size_m).any() ||

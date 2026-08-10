@@ -900,8 +900,7 @@ class NvbloxMapBackend : public MapBackend {
 
         const bool is_robot =
             frame.robot_mask &&
-            maskValueAt(*frame.robot_mask, u, v, width, height) >
-            static_cast<std::uint8_t>(std::clamp(config_.mask_robot_threshold, 0, 255));
+            maskValueAt(*frame.robot_mask, u, v, width, height) > 0U;
         mask_image_(v, u) = is_robot ? 1 : 0;
         depth_image_(v, u) = depth_m;
         color_depth_image_(v, u) = is_robot ? 0.0f : depth_m;

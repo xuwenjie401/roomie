@@ -66,7 +66,6 @@ PipelineConfig testConfig() {
   config.min_visualization_weight = 0.1f;
   config.min_color_weight = 0.1f;
   config.surface_visualization_distance_vox = 1.5f;
-  config.mask_robot_threshold = 0;
   config.file_logging_enabled = false;
   return config;
 }

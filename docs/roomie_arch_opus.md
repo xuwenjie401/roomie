@@ -12,7 +12,7 @@
 
 ```
 RosIoThread            被动。run() 只是空等 CV，实际工作全在 ROS 回调里做
-                       （handleRgb/handleDepth/handleMask/handleTf 各自加同一把 mutex_）
+                       （handleRgb/handleDepth/handleTf 更新共享状态；mask 按相机在锁外生成）
       │ mapping_queue_(30)          │ detection_queue_(8)
       ▼                             ▼
 MapThread                     DetectionBridgeThread  ← 事实上的主驱动
@@ -297,4 +297,3 @@ struct EmbeddingRecord {
 | description = label 赋值 | `src/dsg/object_graph.cpp:162` |
 | scene_graph 信封不透明回写 | `src/dsg/object_graph_io.cpp:491` |
 | embedding 惰性全量编码 | `scripts/scene_qa/embeddings.py:138` |
-

@@ -26,7 +26,7 @@ def generate_launch_description():
     use_rviz = LaunchConfiguration("use_rviz")
     show_manual_rooms = LaunchConfiguration("show_manual_rooms")
 
-    default_config = source_package_path("config", "pipeline_nvblox.yaml")
+    default_config = source_package_path("config", "pipeline_genie_live.yaml")
     default_rviz = source_package_path("rviz", "roomie_pipeline.rviz")
 
     return LaunchDescription(

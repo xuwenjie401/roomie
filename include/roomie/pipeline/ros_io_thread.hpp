@@ -18,6 +18,7 @@
 #include <tf2/buffer_core.h>
 #include <tf2_msgs/msg/tf_message.hpp>
 
+#include "roomie/pipeline/robot_mask_generator.hpp"
 #include "roomie/pipeline/thread_safe_queue.hpp"
 #include "roomie/pipeline/types.hpp"
 #include "roomie/pipeline/worker_thread.hpp"
@@ -28,14 +29,12 @@ struct RosCameraSubscriptionConfig {
   std::string camera_id;
   std::string camera_frame;
   std::string rgb_topic;
-  std::string robot_mask_topic;
   std::string depth_topic;
   std::string camera_info_topic;
   CameraIntrinsics fallback_intrinsics;
   float depth_scale = 0.001f;
   float depth_min_m = 0.1f;
   float depth_max_m = 10.0f;
-  int mask_robot_threshold = 0;
   bool enable_mapping = true;
   bool enable_detection = true;
 };
@@ -55,6 +54,7 @@ struct RosIoSubscriptionConfig {
   std::function<bool()> perception_admission_allowed;
   std::function<void(const FrameBundlePtr&, const std::string&)>
       perception_candidate_cancelled;
+  std::shared_ptr<RobotMaskGenerator> robot_mask_generator;
   std::vector<RosCameraSubscriptionConfig> cameras;
 };
 
@@ -100,24 +100,34 @@ class RosIoThread : public WorkerThread {
     std::chrono::steady_clock::time_point last_perception_admission_time =
         std::chrono::steady_clock::time_point::min();
     std::uint64_t calibration_revision = 0;
+    std::uint64_t rgb_revision = 0;
+    TimeNanoseconds mask_generation_in_flight_time_ns = 0;
+    std::uint64_t mask_generation_in_flight_rgb_revision = 0;
     TimeNanoseconds last_emitted_mapping_time_ns = 0;
     TimeNanoseconds last_emitted_detection_time_ns = 0;
+    std::uint64_t masks_rendered = 0;
+    std::uint64_t masks_reused = 0;
+    std::uint64_t mask_tf_waits = 0;
+    std::uint64_t mask_generation_failures = 0;
+    std::uint64_t mask_geometry_rejections = 0;
+    std::uint64_t full_masks = 0;
+    double last_mask_render_ms = 0.0;
+    std::size_t last_mask_pixels = 0;
+    std::string last_mask_error;
   };
 
   struct CameraSubscriptions {
     rclcpp::Subscription<sensor_msgs::msg::Image>::SharedPtr rgb;
-    rclcpp::Subscription<sensor_msgs::msg::Image>::SharedPtr robot_mask;
     rclcpp::Subscription<sensor_msgs::msg::Image>::SharedPtr depth;
     rclcpp::Subscription<sensor_msgs::msg::CameraInfo>::SharedPtr camera_info;
   };
 
   void handleRgb(const std::string& camera_id, const sensor_msgs::msg::Image::SharedPtr msg);
-  void handleRobotMask(const std::string& camera_id,
-                       const sensor_msgs::msg::Image::SharedPtr msg);
   void handleDepth(const std::string& camera_id, const sensor_msgs::msg::Image::SharedPtr msg);
   void handleCameraInfo(const std::string& camera_id,
                         const sensor_msgs::msg::CameraInfo::SharedPtr msg);
   void handleTf(const tf2_msgs::msg::TFMessage::SharedPtr msg, bool is_static);
+  void tryAssembleCamera(const std::string& camera_id);
   void maybeLogStatusLocked();
   FrameProvenance frameProvenanceLocked(CameraState* state,
                                         TimeNanoseconds time_ns,
@@ -147,7 +157,6 @@ class RosIoThread : public WorkerThread {
   std::chrono::steady_clock::time_point last_status_log_time_ =
       std::chrono::steady_clock::now();
   std::uint64_t rgb_messages_ = 0;
-  std::uint64_t mask_messages_ = 0;
   std::uint64_t depth_messages_ = 0;
   std::uint64_t camera_info_messages_ = 0;
   std::uint64_t tf_messages_ = 0;

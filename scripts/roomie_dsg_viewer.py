@@ -22,7 +22,6 @@ import yaml
 
 
 DEFAULT_JSON = Path("/home/lindenbot/Datasets/output/jarvis_home/instances/latest.json")
-DEFAULT_CONFIG = Path(__file__).resolve().parents[1] / "config" / "pipeline_nvblox.yaml"
 
 
 @dataclass
@@ -1489,8 +1488,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--config",
         type=Path,
-        default=DEFAULT_CONFIG,
-        help=f"pipeline YAML used to resolve saved DSG/map paths (default: {DEFAULT_CONFIG})",
+        default=None,
+        help="pipeline YAML used to resolve saved DSG/map paths",
     )
     parser.add_argument(
         "--json",

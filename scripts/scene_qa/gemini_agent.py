@@ -6,6 +6,7 @@ from dataclasses import dataclass
 import importlib.util
 import json
 import os
+import threading
 from typing import Any, Callable
 
 from .config import SceneQaConfig
@@ -53,6 +54,10 @@ class QaResponse:
     history: dict[str, Any]
 
 
+class SceneQaCancelledError(RuntimeError):
+    """Raised when the browser resets an in-flight question."""
+
+
 class _CompatValue:
     """Small google.genai.types-shaped value used by injected fake clients."""
 
@@ -97,6 +102,8 @@ class GeminiSceneQaAgent:
         api_key: str | None = None,
         client: Any | None = None,
         progress_callback: Callable[[dict[str, Any]], None] | None = None,
+        history_callback: Callable[[dict[str, Any]], None] | None = None,
+        cancel_event: threading.Event | None = None,
     ):
         try:
             from google import genai
@@ -115,6 +122,9 @@ class GeminiSceneQaAgent:
         self.config = config
         self._types = types
         self._progress_callback = progress_callback
+        self._history_callback = history_callback
+        self._cancel_event = cancel_event
+        self._active_history: dict[str, Any] | None = None
         if client is None:
             sanitize_proxy_environment()
         if client is not None:
@@ -128,10 +138,29 @@ class GeminiSceneQaAgent:
             )
 
     def answer_query(self, query: str) -> QaResponse:
-        session = self.registry.begin_answer()
+        # The live read session is deliberately created lazily by the first
+        # tool call, after the model's initial planning latency.
+        self.registry.end_answer()
         try:
-            return self._answer_query_in_session(query, session)
+            response = self._answer_query_in_session(query, None)
+            self._refresh_read_session(response.history)
+            self._emit_history(response.history)
+            return response
+        except Exception as exc:
+            if self._active_history is not None:
+                self._refresh_read_session(self._active_history)
+                self._active_history["error"] = {
+                    "type": type(exc).__name__,
+                    "message": str(exc),
+                }
+                self._emit_history(self._active_history)
+                try:
+                    setattr(exc, "scene_qa_history", self._active_history)
+                except Exception:
+                    pass
+            raise
         finally:
+            self._active_history = None
             self.registry.end_answer()
 
     def _answer_query_in_session(
@@ -150,14 +179,18 @@ class GeminiSceneQaAgent:
             "query": query,
             "graph_json": str(self.graph.json_path) if self.graph is not None else None,
             "source": "offline_json" if self.graph is not None else "live_query_service",
+            "provider": "gemini",
             "model": self.config.gemini_model,
             "tools": self.registry.list_tools(),
             "iterations": [],
         }
+        self._active_history = history
         if session is not None:
             history["read_session"] = session
+        self._emit_history(history)
 
         for iteration in range(1, self.config.max_iterations + 1):
+            self._check_cancelled()
             self._emit_progress(
                 "gemini_start",
                 "Gemini planning the next step...",
@@ -183,12 +216,16 @@ class GeminiSceneQaAgent:
                 "model_text": self._response_text(response),
                 "function_calls": [],
             }
+            history["iterations"].append(iter_data)
+            self._emit_history(history)
+            self._check_cancelled()
 
             if not function_calls:
                 raw_text = self._response_text(response)
                 parsed = self._parse_final_text(raw_text)
-                history["iterations"].append(iter_data)
                 history["final_response"] = parsed
+                self._refresh_read_session(history)
+                self._emit_history(history)
                 self._emit_progress(
                     "final_answer",
                     "Final answer received.",
@@ -203,6 +240,7 @@ class GeminiSceneQaAgent:
 
             response_parts = []
             for call in function_calls:
+                self._check_cancelled()
                 name = str(getattr(call, "name", ""))
                 args = dict(getattr(call, "args", {}) or {})
                 self._emit_progress(
@@ -212,7 +250,33 @@ class GeminiSceneQaAgent:
                     tool=name,
                     args=args,
                 )
-                tool_result = self.registry.call_tool(name, args)
+                try:
+                    tool_result = self.registry.call_tool(name, args)
+                except Exception as exc:
+                    failed_result = ToolResult(
+                        {
+                            "error": f"{type(exc).__name__}: {exc}",
+                            "status": str(getattr(exc, "status", "query_failed")),
+                        }
+                    )
+                    iter_data["function_calls"].append(
+                        self._history_call(
+                            name,
+                            args,
+                            failed_result,
+                            call_id=str(getattr(call, "id", "") or ""),
+                        )
+                    )
+                    self._refresh_read_session(history)
+                    self._emit_history(history)
+                    self._emit_progress(
+                        "tool_done",
+                        self._tool_done_message(name, failed_result),
+                        iteration=iteration,
+                        tool=name,
+                        status=str(getattr(exc, "status", "query_failed")),
+                    )
+                    raise
                 self._emit_progress(
                     "tool_done",
                     self._tool_done_message(name, tool_result),
@@ -220,8 +284,16 @@ class GeminiSceneQaAgent:
                     tool=name,
                     **self._tool_result_summary(tool_result),
                 )
-                call_data = self._history_call(name, args, tool_result)
+                call_data = self._history_call(
+                    name,
+                    args,
+                    tool_result,
+                    call_id=str(getattr(call, "id", "") or ""),
+                )
                 iter_data["function_calls"].append(call_data)
+                self._refresh_read_session(history)
+                self._emit_history(history)
+                self._check_cancelled()
 
                 response_parts.append(
                     types.Part.from_function_response(
@@ -237,13 +309,22 @@ class GeminiSceneQaAgent:
                         )
                     )
 
-            history["iterations"].append(iter_data)
             contents.append(types.Content(role="user", parts=response_parts))
 
         final_text = self._force_final_answer(contents)
         parsed = self._parse_final_text(final_text)
+        history["iterations"].append(
+            {
+                "iteration": self.config.max_iterations + 1,
+                "phase": "forced_final",
+                "model_text": final_text,
+                "function_calls": [],
+            }
+        )
         history["final_response"] = parsed
         history["max_iterations_reached"] = True
+        self._refresh_read_session(history)
+        self._emit_history(history)
         self._emit_progress("final_answer", "Final answer received after max iterations.")
         return QaResponse(
             reasoning=str(parsed.get("reasoning", "")),
@@ -306,6 +387,23 @@ class GeminiSceneQaAgent:
             self._progress_callback(event)
         except Exception:
             pass
+
+    def _emit_history(self, history: dict[str, Any]) -> None:
+        if self._history_callback is None:
+            return
+        try:
+            self._history_callback(history)
+        except Exception:
+            pass
+
+    def _refresh_read_session(self, history: dict[str, Any]) -> None:
+        session = self.registry.answer_metadata()
+        if session is not None and session.get("session_id"):
+            history["read_session"] = session
+
+    def _check_cancelled(self) -> None:
+        if self._cancel_event is not None and self._cancel_event.is_set():
+            raise SceneQaCancelledError("question was reset")
 
     def _tool_start_message(self, name: str, args: dict[str, Any]) -> str:
         if name == "search_objects":
@@ -418,12 +516,21 @@ class GeminiSceneQaAgent:
         texts = [getattr(part, "text", None) for part in parts if getattr(part, "text", None)]
         return "\n".join(str(text) for text in texts)
 
-    def _history_call(self, name: str, args: dict[str, Any], result: ToolResult) -> dict[str, Any]:
+    def _history_call(
+        self,
+        name: str,
+        args: dict[str, Any],
+        result: ToolResult,
+        *,
+        call_id: str = "",
+    ) -> dict[str, Any]:
         data = {
             "name": name,
             "args": args,
             "response": result.response,
         }
+        if call_id:
+            data["call_id"] = call_id
         if result.media:
             data["media"] = [media.summary for media in result.media]
         return data

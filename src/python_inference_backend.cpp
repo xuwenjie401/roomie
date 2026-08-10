@@ -1119,6 +1119,18 @@ bool PythonInferenceBackend::ensureWorkerProcess(std::string* error) {
     *error = "cannot read Python worker script: " + config_.python_worker_script;
     return false;
   }
+  if (!config_.text_prompt_file.empty() &&
+      ::access(config_.text_prompt_file.c_str(), R_OK) != 0) {
+    *error = "cannot read detection text prompt file: " +
+             config_.text_prompt_file;
+    return false;
+  }
+  if (!config_.label_thresholds_file.empty() &&
+      ::access(config_.label_thresholds_file.c_str(), R_OK) != 0) {
+    *error = "cannot read label thresholds file: " +
+             config_.label_thresholds_file;
+    return false;
+  }
 
   int to_child[2] = {-1, -1};
   int from_child[2] = {-1, -1};
@@ -1150,15 +1162,24 @@ bool PythonInferenceBackend::ensureWorkerProcess(std::string* error) {
   args.push_back(std::to_string(config_.owl_nms_iou_threshold));
   args.push_back("--boxernet-min-confidence");
   args.push_back(std::to_string(config_.boxernet_min_confidence));
+  if (!config_.label_thresholds_file.empty()) {
+    args.push_back("--label-thresholds-file");
+    args.push_back(config_.label_thresholds_file);
+  }
   args.push_back("--robot-bbox-mask-overlap");
   args.push_back(std::to_string(config_.robot_bbox_mask_overlap));
   args.push_back("--robot-bbox-center-overlap");
   args.push_back(std::to_string(config_.robot_bbox_center_overlap));
   args.push_back("--robot-mask-dilate-px");
   args.push_back(std::to_string(config_.robot_mask_dilate_px));
-  for (const std::string& prompt : config_.text_prompts) {
-    args.push_back("--text-prompt");
-    args.push_back(prompt);
+  if (!config_.text_prompt_file.empty()) {
+    args.push_back("--text-prompt-file");
+    args.push_back(config_.text_prompt_file);
+  } else {
+    for (const std::string& prompt : config_.text_prompts) {
+      args.push_back("--text-prompt");
+      args.push_back(prompt);
+    }
   }
 
   std::vector<char*> argv;

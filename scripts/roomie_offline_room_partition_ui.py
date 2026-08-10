@@ -79,20 +79,6 @@ class GridMap:
   cells_top: bytes
 
 
-def default_pipeline_config_path() -> Path:
-  script_path = Path(__file__).resolve()
-  for parent in script_path.parents:
-    for candidate in (
-        parent / "src" / "roomie" / "config" / "pipeline_nvblox.yaml",
-        parent / "roomie" / "config" / "pipeline_nvblox.yaml",
-        parent / "share" / "roomie" / "config" / "pipeline_nvblox.yaml",
-        parent / "config" / "pipeline_nvblox.yaml",
-    ):
-      if candidate.exists():
-        return candidate
-  return script_path.parents[1] / "config" / "pipeline_nvblox.yaml"
-
-
 def load_pipeline_params(config_path: Path) -> dict[str, Any]:
   if not config_path.exists():
     return {}
@@ -1505,8 +1491,7 @@ def start_http_server(node: OfflineRoomPartitionNode,
 
 def parse_args() -> tuple[argparse.Namespace, list[str]]:
   parser = argparse.ArgumentParser(description=__doc__)
-  parser.add_argument("--pipeline-config", type=Path,
-                      default=default_pipeline_config_path())
+  parser.add_argument("--pipeline-config", type=Path, required=True)
   parser.add_argument("--map-topic", default="")
   parser.add_argument("--marker-topic", default="/roomie/manual_room_boxes")
   parser.add_argument("--host", default="127.0.0.1")

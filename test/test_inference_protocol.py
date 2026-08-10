@@ -185,3 +185,76 @@ def test_request_id_distinguishes_same_camera_and_time() -> None:
     assert first["provenance"]["sensor_time_ns"] == retry["provenance"]["sensor_time_ns"]
     assert first["provenance"]["request_id"] == 1001
     assert retry["provenance"]["request_id"] == 1002
+
+
+def test_text_prompt_file_ignores_blank_lines(tmp_path: Path) -> None:
+    prompt_file = tmp_path / "roomie_classes.csv"
+    prompt_file.write_text("chair\n\n table \n", encoding="utf-8")
+
+    assert worker.load_text_prompt_file(str(prompt_file)) == ["chair", "table"]
+
+
+def test_text_prompt_file_rejects_empty_file(tmp_path: Path) -> None:
+    prompt_file = tmp_path / "empty.csv"
+    prompt_file.write_text("\n  \n", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="text prompt file is empty"):
+        worker.load_text_prompt_file(str(prompt_file))
+
+
+def test_label_confidence_thresholds_load_overrides_and_fallback(
+    tmp_path: Path,
+) -> None:
+    thresholds_file = tmp_path / "thresholds.json"
+    thresholds_file.write_text(
+        """{
+          "owl": {
+            "default": 0.25,
+            "labels": {"chair": 0.2, "table": 0.75}
+          }
+        }""",
+        encoding="utf-8",
+    )
+
+    thresholds = worker.load_label_confidence_thresholds(
+        str(thresholds_file), {"owl": 0.5}
+    )["owl"]
+    assert worker.label_confidence_threshold(thresholds, "chair") == 0.2
+    assert worker.label_confidence_threshold(thresholds, "table") == 0.75
+    assert worker.label_confidence_threshold(thresholds, "lamp") == 0.25
+
+
+def test_label_confidence_thresholds_keep_code_defaults_without_file() -> None:
+    thresholds = worker.load_label_confidence_thresholds(
+        "", {"owl": 0.25, "boxernet": 0.35}
+    )
+    assert worker.label_confidence_threshold(thresholds["owl"], "chair") == 0.25
+    assert (
+        worker.label_confidence_threshold(thresholds["boxernet"], "chair")
+        == 0.35
+    )
+
+
+@pytest.mark.parametrize(
+    "contents",
+    [
+        '[0.25, 0.35]',
+        '{}',
+        '{"owl": {"labels": {}}}',
+        '{"owl": {"default": 0.25}}',
+        '{"owl": {"default": 1.1, "labels": {}}}',
+        '{"owl": {"default": 0.25, "labels": {"chair": -0.1}}}',
+        '{"owl": {"default": 0.25, "labels": {"chair": "high"}}}',
+        '{"owl": {"default": 0.25, "labels": {"chair": true}}}',
+    ],
+)
+def test_label_confidence_thresholds_reject_invalid_values(
+    tmp_path: Path, contents: str
+) -> None:
+    thresholds_file = tmp_path / "invalid_thresholds.json"
+    thresholds_file.write_text(contents, encoding="utf-8")
+
+    with pytest.raises(ValueError):
+        worker.load_label_confidence_thresholds(
+            str(thresholds_file), {"owl": 0.25}
+        )

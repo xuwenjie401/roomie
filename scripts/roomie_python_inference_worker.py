@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import argparse
+import json
+import math
 import os
 import signal
 import struct
@@ -28,6 +30,81 @@ def configure_binary_stdout() -> None:
 
 class ProtocolError(RuntimeError):
     pass
+
+
+def load_text_prompt_file(path: str) -> list[str]:
+    resolved_path = os.path.abspath(os.path.expanduser(path))
+    with open(resolved_path, "r", encoding="utf-8") as stream:
+        labels = [line.strip() for line in stream if line.strip()]
+    if not labels:
+        raise ValueError(f"text prompt file is empty: {resolved_path}")
+    return labels
+
+
+def load_label_confidence_thresholds(
+    path: str, fallback_by_stage: dict[str, float]
+) -> dict[str, dict]:
+    if not path:
+        return {
+            stage: {"default": float(fallback), "labels": {}}
+            for stage, fallback in fallback_by_stage.items()
+        }
+    resolved_path = os.path.abspath(os.path.expanduser(path))
+    with open(resolved_path, "r", encoding="utf-8") as stream:
+        document = json.load(stream)
+    if not isinstance(document, dict):
+        raise ValueError(
+            f"label confidence thresholds must be a JSON object: {resolved_path}"
+        )
+
+    def checked_threshold(value, description: str) -> float:
+        if type(value) not in (int, float):
+            raise ValueError(f"{description} must be a number: {resolved_path}")
+        threshold = float(value)
+        if not math.isfinite(threshold) or threshold < 0.0 or threshold > 1.0:
+            raise ValueError(f"{description} must be in [0, 1]: {resolved_path}")
+        return threshold
+
+    thresholds: dict[str, dict] = {}
+    for stage in fallback_by_stage:
+        stage_config = document.get(stage)
+        if not isinstance(stage_config, dict):
+            raise ValueError(
+                f"label confidence thresholds must contain an object for stage "
+                f"'{stage}': {resolved_path}"
+            )
+        if "default" not in stage_config:
+            raise ValueError(
+                f"label confidence threshold stage '{stage}' is missing default: "
+                f"{resolved_path}"
+            )
+        labels = stage_config.get("labels")
+        if not isinstance(labels, dict):
+            raise ValueError(
+                f"label confidence threshold stage '{stage}' must contain a "
+                f"labels object: {resolved_path}"
+            )
+        checked_labels = {}
+        for label, value in labels.items():
+            if not isinstance(label, str) or not label:
+                raise ValueError(
+                    f"label confidence threshold labels must be non-empty: "
+                    f"{resolved_path}"
+                )
+            checked_labels[label] = checked_threshold(
+                value, f"label confidence threshold for '{label}'"
+            )
+        thresholds[stage] = {
+            "default": checked_threshold(
+                stage_config["default"], f"default threshold for stage '{stage}'"
+            ),
+            "labels": checked_labels,
+        }
+    return thresholds
+
+
+def label_confidence_threshold(stage_config: dict, label: str) -> float:
+    return stage_config["labels"].get(label, stage_config["default"])
 
 
 class RequestReader:
@@ -364,14 +441,31 @@ class InferenceRuntime:
 
         self.device = choose_device(args.device, torch)
         self.precision = args.precision
-        self.boxernet_min_confidence = float(args.boxernet_min_confidence)
+        confidence_thresholds = load_label_confidence_thresholds(
+            args.label_thresholds_file,
+            {
+                "owl": float(args.owl_min_confidence),
+                "boxernet": float(args.boxernet_min_confidence),
+            },
+        )
+        self.owl_confidence_thresholds = confidence_thresholds["owl"]
+        self.boxernet_confidence_thresholds = confidence_thresholds["boxernet"]
         self.robot_bbox_mask_overlap = float(args.robot_bbox_mask_overlap)
         self.robot_bbox_center_overlap = float(args.robot_bbox_center_overlap)
         self.robot_mask_dilate_px = int(args.robot_mask_dilate_px)
 
-        prompt_spec = args.text_prompt or ["lvisplus"]
-        self.text_labels = load_text_labels(prompt_spec)
+        if args.text_prompt_file:
+            self.text_labels = load_text_prompt_file(args.text_prompt_file)
+        else:
+            prompt_spec = args.text_prompt or ["lvisplus"]
+            self.text_labels = load_text_labels(prompt_spec)
         owl_precision = None if args.precision == "auto" else args.precision
+        owl_prefilter_confidence = min(
+            [
+                self.owl_confidence_thresholds["default"],
+                *self.owl_confidence_thresholds["labels"].values(),
+            ]
+        )
 
         print(
             "roomie inference worker loading "
@@ -381,7 +475,7 @@ class InferenceRuntime:
         self.owl = OwlWrapper(
             device=self.device,
             text_prompts=self.text_labels,
-            min_confidence=float(args.owl_min_confidence),
+            min_confidence=owl_prefilter_confidence,
             precision=owl_precision,
             warmup=True,
             nms_iou_threshold=float(args.owl_nms_iou_threshold),
@@ -416,6 +510,23 @@ class InferenceRuntime:
         t_owl_ms = (time.perf_counter() - t0) * 1000.0
         response["timings_ms"]["owl"] = t_owl_ms
 
+        if bb2d.shape[0] == 0:
+            response["timings_ms"]["worker_total"] = (time.perf_counter() - t_total) * 1000.0
+            return response
+
+        owl_thresholds = scores2d.new_tensor(
+            [
+                label_confidence_threshold(
+                    self.owl_confidence_thresholds,
+                    self.text_labels[int(label)],
+                )
+                for label in label_ints
+            ]
+        )
+        keep_confidence = scores2d > owl_thresholds
+        bb2d = bb2d[keep_confidence]
+        scores2d = scores2d[keep_confidence]
+        label_ints = label_ints[keep_confidence]
         if bb2d.shape[0] == 0:
             response["timings_ms"]["worker_total"] = (time.perf_counter() - t_total) * 1000.0
             return response
@@ -456,7 +567,16 @@ class InferenceRuntime:
         t_post = time.perf_counter()
         obb_pr_w = outputs["obbs_pr_w"].cpu()[0]
         scores3d = obb_pr_w.prob.squeeze(-1).clone()
-        keepers = scores3d >= self.boxernet_min_confidence
+        boxernet_thresholds = scores3d.new_tensor(
+            [
+                label_confidence_threshold(
+                    self.boxernet_confidence_thresholds,
+                    label,
+                )
+                for label in labels2d
+            ]
+        )
+        keepers = scores3d >= boxernet_thresholds
 
         detections = []
         for original_index in torch.nonzero(keepers, as_tuple=False).flatten().tolist():
@@ -747,10 +867,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--ckpt", required=True)
     parser.add_argument("--device", default="auto")
     parser.add_argument("--precision", default="auto", choices=["auto", "float32", "bfloat16"])
+    parser.add_argument("--text-prompt-file", default="")
     parser.add_argument("--text-prompt", action="append", default=[])
     parser.add_argument("--owl-min-confidence", type=float, default=0.25)
     parser.add_argument("--owl-nms-iou-threshold", type=float, default=0.5)
     parser.add_argument("--boxernet-min-confidence", type=float, default=0.5)
+    parser.add_argument("--label-thresholds-file", default="")
     parser.add_argument("--robot-bbox-mask-overlap", type=float, default=0.25)
     parser.add_argument("--robot-bbox-center-overlap", type=float, default=0.5)
     parser.add_argument("--robot-mask-dilate-px", type=int, default=3)

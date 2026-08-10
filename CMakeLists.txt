@@ -20,6 +20,7 @@ set(ROOMIE_NVBLOX_LIBRARY_DIR
     "Runtime library directory for the local nvblox install")
 
 find_package(ament_cmake REQUIRED)
+find_package(ament_index_cpp REQUIRED)
 # ROS Humble's rosidl_generator_py still consumes legacy FindPythonInterp and
 # FindPythonLibs variables. Resolve one modern Interpreter+Development tuple,
 # then fence every legacy cache input to that same ABI; setting only the
@@ -38,6 +39,7 @@ set(PYTHON_SOABI "${Python3_SOABI}" CACHE INTERNAL
     "Python extension ABI used by ROSIDL generators" FORCE)
 find_package(rosidl_default_generators REQUIRED)
 find_package(Eigen3 REQUIRED)
+find_package(ego_shade REQUIRED)
 find_package(geometry_msgs REQUIRED)
 find_package(nlohmann_json REQUIRED)
 find_package(rclcpp REQUIRED)
@@ -50,6 +52,7 @@ find_package(visualization_msgs REQUIRED)
 find_package(OpenCV REQUIRED COMPONENTS core imgproc)
 find_package(PNG REQUIRED)
 find_package(SQLite3 REQUIRED)
+find_package(yaml-cpp REQUIRED)
 
 if(TARGET SQLite3::SQLite3)
   set(ROOMIE_SQLITE_TARGET SQLite3::SQLite3)
@@ -85,12 +88,14 @@ add_library(
   src/dsg/object_snapshot_remaker.cpp
   src/image_utils.cpp
   src/instance_map_thread.cpp
+  src/label_thresholds.cpp
   src/map_backend.cpp
   src/map_thread.cpp
   src/pipeline.cpp
   src/pipeline_config.cpp
   src/publisher_persistence_thread.cpp
   src/python_inference_backend.cpp
+  src/robot_mask_generator.cpp
   src/query/scene_mutation_json_adapter.cpp
   src/query/scene_query_json_adapter.cpp
   src/query/scene_query_gateway.cpp
@@ -110,7 +115,8 @@ target_include_directories(
                          "$<INSTALL_INTERFACE:include/${PROJECT_NAME}>"
 )
 target_link_libraries(roomie_pipeline Eigen3::Eigen nlohmann_json::nlohmann_json
-                      ${ROOMIE_SQLITE_TARGET} PNG::PNG ${OpenCV_LIBS})
+                      ego_shade::core yaml-cpp ${ROOMIE_SQLITE_TARGET} PNG::PNG
+                      ${OpenCV_LIBS})
 
 if(ROOMIE_ENABLE_NVBLOX)
   find_package(CUDAToolkit REQUIRED)
@@ -151,6 +157,7 @@ endif()
 
 ament_target_dependencies(
   roomie_pipeline
+  ament_index_cpp
   geometry_msgs
   rclcpp
   sensor_msgs
@@ -210,6 +217,14 @@ if(BUILD_TESTING)
   target_link_libraries(test_version_types roomie_pipeline)
   ament_add_gtest(test_inference_wire test/test_inference_wire.cpp)
   target_link_libraries(test_inference_wire roomie_pipeline)
+  ament_add_gtest(test_label_thresholds test/test_label_thresholds.cpp)
+  target_link_libraries(test_label_thresholds roomie_pipeline)
+  ament_add_gtest(test_robot_mask_generator
+                  test/test_robot_mask_generator.cpp)
+  target_link_libraries(test_robot_mask_generator roomie_pipeline)
+  target_compile_definitions(
+    test_robot_mask_generator
+    PRIVATE "ROOMIE_SOURCE_DIR=\"${CMAKE_CURRENT_SOURCE_DIR}\"")
   ament_add_gtest(test_python_inference_backend
                   test/test_python_inference_backend.cpp)
   target_link_libraries(test_python_inference_backend roomie_pipeline)
@@ -324,6 +339,8 @@ endif()
 ament_export_targets(roomie-targets HAS_LIBRARY_TARGET)
 ament_export_dependencies(
   Eigen3
+  ament_index_cpp
+  ego_shade
   geometry_msgs
   nlohmann_json
   OpenCV
@@ -336,5 +353,6 @@ ament_export_dependencies(
   tf2
   tf2_msgs
   visualization_msgs
-  SQLite3)
+  SQLite3
+  yaml-cpp)
 ament_package()

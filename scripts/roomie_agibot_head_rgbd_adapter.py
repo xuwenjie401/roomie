@@ -502,12 +502,6 @@ class AgibotHeadRgbdAdapter(Node):
                 "/roomie/input/head_color/depth_registered",
             ).value
         )
-        self.output_mask_topic = str(
-            self.declare_parameter(
-                "output_mask_topic",
-                "/roomie/input/head_color/robot_mask",
-            ).value
-        )
         self.output_camera_info_topic = str(
             self.declare_parameter(
                 "output_camera_info_topic",
@@ -526,9 +520,6 @@ class AgibotHeadRgbdAdapter(Node):
         self.sync_queue_size = max(
             2,
             int(self.declare_parameter("sync_queue_size", 60).value),
-        )
-        self.publish_zero_robot_mask = bool(
-            self.declare_parameter("publish_zero_robot_mask", True).value
         )
         publish_static_tf = bool(
             self.declare_parameter("publish_static_tf", False).value
@@ -567,11 +558,6 @@ class AgibotHeadRgbdAdapter(Node):
         self.depth_publisher = self.create_publisher(
             Image,
             self.output_depth_topic,
-            sensor_qos,
-        )
-        self.mask_publisher = self.create_publisher(
-            Image,
-            self.output_mask_topic,
             sensor_qos,
         )
         self.camera_info_publisher = self.create_publisher(
@@ -727,14 +713,6 @@ class AgibotHeadRgbdAdapter(Node):
             )
             self.camera_info_publisher.publish(camera_info)
             self.color_publisher.publish(color_output)
-            if self.publish_zero_robot_mask:
-                mask = np.zeros(
-                    (self.calibration.color.height, self.calibration.color.width),
-                    dtype=np.uint8,
-                )
-                self.mask_publisher.publish(
-                    _image_message(mask, "mono8", self.output_frame, stamp)
-                )
             self.depth_publisher.publish(depth_output)
             self.matched_pairs += 1
         except Exception as error:

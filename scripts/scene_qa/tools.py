@@ -17,6 +17,26 @@ from .graph_store import GraphStore, _as_vec3, _round
 from .live_query import LiveSceneQueryClient
 
 
+SINGLE_IMPLICIT_ROOM_MESSAGE = "当前仅有一个房间"
+
+# These failures cannot be corrected by asking the model to choose another
+# argument. Feeding them back as ordinary tool output makes a tool-calling VLM
+# repeat the same request until max_iterations is exhausted.
+FATAL_SCENE_QUERY_STATUSES = {
+    "invalid_session",
+    "unknown_session",
+    "expired_session",
+    "stale_session",
+    "session_capacity_exhausted",
+    "expired_token",
+    "foreign_token",
+    "transport_error",
+    "service_unavailable",
+    "service_timeout",
+    "invalid_response",
+}
+
+
 @dataclass
 class MediaAttachment:
     data: bytes
@@ -61,10 +81,12 @@ class ToolRegistry:
         *,
         begin_answer: Callable[[], dict[str, Any] | None] | None = None,
         end_answer: Callable[[], None] | None = None,
+        answer_metadata: Callable[[], dict[str, Any] | None] | None = None,
     ):
         self._tools: dict[str, ToolSpec] = {}
         self._begin_answer = begin_answer
         self._end_answer = end_answer
+        self._answer_metadata = answer_metadata
 
     def register(self, spec: ToolSpec) -> None:
         self._tools[spec.name] = spec
@@ -85,8 +107,10 @@ class ToolRegistry:
         try:
             return self._tools[name].handler(**(args or {}))
         except Exception as exc:
-            response = {"error": f"{type(exc).__name__}: {exc}"}
             status = getattr(exc, "status", None)
+            if status in FATAL_SCENE_QUERY_STATUSES:
+                raise
+            response = {"error": f"{type(exc).__name__}: {exc}"}
             if status:
                 response["status"] = str(status)
             return ToolResult(response)
@@ -100,6 +124,26 @@ class ToolRegistry:
     def end_answer(self) -> None:
         if self._end_answer is not None:
             self._end_answer()
+
+    def answer_metadata(self) -> dict[str, Any] | None:
+        return self._answer_metadata() if self._answer_metadata is not None else None
+
+
+def _list_rooms_response(rooms: list[dict[str, Any]]) -> dict[str, Any]:
+    if rooms:
+        return {"count": len(rooms), "rooms": rooms}
+    return {
+        "count": 1,
+        "rooms": [
+            {
+                "name": "当前房间",
+                "label": "当前房间",
+                "implicit": True,
+            }
+        ],
+        "room_hierarchy_available": False,
+        "message": SINGLE_IMPLICIT_ROOM_MESSAGE,
+    }
 
 
 def create_default_tool_registry(
@@ -199,19 +243,17 @@ def create_default_tool_registry(
     )
 
     def list_rooms() -> ToolResult:
-        return ToolResult(
-            {
-                "count": graph.room_count,
-                "rooms": [graph.room_to_dict(room) for room in graph.room_records()],
-            }
-        )
+        rooms = [graph.room_to_dict(room) for room in graph.room_records()]
+        return ToolResult(_list_rooms_response(rooms))
 
     registry.register(
         ToolSpec(
             name="list_rooms",
             description=(
                 "List all manually annotated rooms/regions with bounds, object counts, "
-                "and representative objects."
+                "and representative objects. If no explicit room hierarchy exists, "
+                "the result identifies the whole current scene as one implicit room; "
+                "answer from that result without calling a room-scoped tool."
             ),
             parameters_json_schema={"type": "object", "properties": {}},
             handler=list_rooms,
@@ -463,6 +505,7 @@ def create_live_tool_registry(
     registry = ToolRegistry(
         begin_answer=client.begin_answer,
         end_answer=client.end_answer,
+        answer_metadata=client.session_metadata,
     )
 
     def search_objects(
@@ -548,12 +591,17 @@ def create_live_tool_registry(
 
     def list_rooms() -> ToolResult:
         rooms = client.call("rooms", {}) or []
-        return ToolResult({"count": len(rooms), "rooms": rooms})
+        return ToolResult(_list_rooms_response(rooms))
 
     registry.register(
         ToolSpec(
             name="list_rooms",
-            description="List canonical rooms and their live object ids.",
+            description=(
+                "List canonical rooms and their live object ids. If no explicit room "
+                "hierarchy exists, the result identifies the whole current scene as "
+                "one implicit room; answer from that result without calling a "
+                "room-scoped tool."
+            ),
             parameters_json_schema={"type": "object", "properties": {}},
             handler=list_rooms,
         )

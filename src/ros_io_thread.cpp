@@ -6,6 +6,7 @@
 #include <cstring>
 #include <limits>
 #include <sstream>
+#include <stdexcept>
 #include <utility>
 
 #include <geometry_msgs/msg/transform_stamped.hpp>
@@ -228,6 +229,41 @@ std::optional<Eigen::Isometry3f> transformFromRos(
   return transform;
 }
 
+std::optional<Eigen::Isometry3d> transformFromRosDouble(
+    const geometry_msgs::msg::TransformStamped& msg) {
+  const auto& rotation = msg.transform.rotation;
+  Eigen::Quaterniond quaternion(
+      rotation.w, rotation.x, rotation.y, rotation.z);
+  const double norm = quaternion.norm();
+  if (!std::isfinite(norm) || norm <= 0.0) {
+    return std::nullopt;
+  }
+  quaternion.normalize();
+
+  Eigen::Isometry3d transform = Eigen::Isometry3d::Identity();
+  transform.linear() = quaternion.toRotationMatrix();
+  transform.translation() = Eigen::Vector3d(msg.transform.translation.x,
+                                             msg.transform.translation.y,
+                                             msg.transform.translation.z);
+  return transform;
+}
+
+bool intrinsicsMatch(const CameraIntrinsics& actual,
+                     const RobotMaskCameraInfo& expected,
+                     double epsilon = 1.0e-3) {
+  return actual.width == expected.width && actual.height == expected.height &&
+         std::abs(static_cast<double>(actual.fx) - expected.fx) <= epsilon &&
+         std::abs(static_cast<double>(actual.fy) - expected.fy) <= epsilon &&
+         std::abs(static_cast<double>(actual.cx) - expected.cx) <= epsilon &&
+         std::abs(static_cast<double>(actual.cy) - expected.cy) <= epsilon;
+}
+
+bool hasZeroDistortion(const sensor_msgs::msg::CameraInfo& msg) {
+  return std::all_of(msg.d.begin(), msg.d.end(), [](double coefficient) {
+    return std::isfinite(coefficient) && std::abs(coefficient) <= 1.0e-12;
+  });
+}
+
 bool stampCloseEnough(TimeNanoseconds lhs, TimeNanoseconds rhs, TimeNanoseconds max_delta_ns) {
   if (lhs == 0 || rhs == 0 || max_delta_ns <= 0) {
     return true;
@@ -250,6 +286,26 @@ RosIoThread::RosIoThread(ThreadSafeQueue<FrameBundlePtr>& mapping_queue,
 
 void RosIoThread::configure(RosIoSubscriptionConfig config) {
   std::lock_guard<std::mutex> lock(mutex_);
+  if (!config.robot_mask_generator) {
+    throw std::invalid_argument("ROS IO requires a robot mask generator");
+  }
+  for (const auto& camera : config.cameras) {
+    if (camera.camera_id.empty()) {
+      continue;
+    }
+    if (!config.robot_mask_generator->hasCamera(camera.camera_id)) {
+      throw std::invalid_argument(
+          "robot mask config has no camera named '" + camera.camera_id + "'");
+    }
+    const RobotMaskCameraInfo expected =
+        config.robot_mask_generator->cameraInfo(camera.camera_id);
+    if (!hasUsableIntrinsics(camera.fallback_intrinsics) ||
+        !intrinsicsMatch(camera.fallback_intrinsics, expected)) {
+      throw std::invalid_argument(
+          "fallback intrinsics do not match rectified robot mask profile for camera '" +
+          camera.camera_id + "'");
+    }
+  }
   config_ = std::move(config);
   run_id_ = makeRunId();
   next_frame_id_ = 1;
@@ -328,14 +384,6 @@ void RosIoThread::attachNode(rclcpp::Node& node) {
           sensor_qos,
           [this, camera_id = camera.camera_id](sensor_msgs::msg::Image::SharedPtr msg) {
             handleRgb(camera_id, std::move(msg));
-          });
-    }
-    if (!camera.robot_mask_topic.empty()) {
-      subscriptions.robot_mask = node.create_subscription<sensor_msgs::msg::Image>(
-          camera.robot_mask_topic,
-          sensor_qos,
-          [this, camera_id = camera.camera_id](sensor_msgs::msg::Image::SharedPtr msg) {
-            handleRobotMask(camera_id, std::move(msg));
           });
     }
     if (!camera.depth_topic.empty()) {
@@ -529,13 +577,25 @@ void RosIoThread::handleRgb(const std::string& camera_id,
     return;
   }
 
-  FrameBundlePtr mapping_bundle;
-  FrameBundlePtr detection_bundle;
   {
     std::lock_guard<std::mutex> lock(mutex_);
     auto& state = camera_states_[camera_id];
     state.config.camera_id = camera_id;
     ++rgb_messages_;
+    const RobotMaskCameraInfo expected =
+        config_.robot_mask_generator->cameraInfo(camera_id);
+    if (rgb->width != expected.width || rgb->height != expected.height) {
+      ++state.mask_geometry_rejections;
+      RCLCPP_WARN(logger_,
+                  "dropping RGB frame for %s: got %dx%d, rectified mask profile is %dx%d",
+                  camera_id.c_str(),
+                  rgb->width,
+                  rgb->height,
+                  expected.width,
+                  expected.height);
+      maybeLogStatusLocked();
+      return;
+    }
     const TimeNanoseconds sensor_time_ns = toNanoseconds(msg->header.stamp);
     if (state.latest_rgb_time_ns != sensor_time_ns ||
         state.latest_rgb_ingest_time == std::chrono::steady_clock::time_point::min()) {
@@ -544,48 +604,16 @@ void RosIoThread::handleRgb(const std::string& camera_id,
     state.latest_rgb_time_ns = sensor_time_ns;
     state.latest_rgb =
         std::make_shared<const ImageBuffer>(std::move(*rgb));
-    auto bundles = makeFrameBundlesLocked(camera_id, state.latest_rgb_time_ns);
-    mapping_bundle = std::move(bundles.first);
-    detection_bundle = std::move(bundles.second);
+    ++state.rgb_revision;
+    state.latest_robot_mask.reset();
+    state.latest_robot_mask_time_ns = 0;
     maybeLogStatusLocked();
   }
-
-  enqueueBundles(std::move(mapping_bundle), std::move(detection_bundle));
-}
-
-void RosIoThread::handleRobotMask(const std::string& camera_id,
-                                  const sensor_msgs::msg::Image::SharedPtr msg) {
-  auto mask = imageBufferFromRos(*msg);
-  if (!mask) {
-    RCLCPP_WARN(logger_,
-                "dropping robot mask for %s with unsupported encoding '%s'",
-                camera_id.c_str(), msg->encoding.c_str());
-    return;
-  }
-
-  FrameBundlePtr mapping_bundle;
-  FrameBundlePtr detection_bundle;
-  {
-    std::lock_guard<std::mutex> lock(mutex_);
-    auto& state = camera_states_[camera_id];
-    state.config.camera_id = camera_id;
-    ++mask_messages_;
-    state.latest_robot_mask_time_ns = toNanoseconds(msg->header.stamp);
-    state.latest_robot_mask =
-        std::make_shared<const ImageBuffer>(std::move(*mask));
-    auto bundles = makeFrameBundlesLocked(camera_id, state.latest_rgb_time_ns);
-    mapping_bundle = std::move(bundles.first);
-    detection_bundle = std::move(bundles.second);
-    maybeLogStatusLocked();
-  }
-
-  enqueueBundles(std::move(mapping_bundle), std::move(detection_bundle));
+  tryAssembleCamera(camera_id);
 }
 
 void RosIoThread::handleDepth(const std::string& camera_id,
                               const sensor_msgs::msg::Image::SharedPtr msg) {
-  FrameBundlePtr mapping_bundle;
-  FrameBundlePtr detection_bundle;
   {
     std::lock_guard<std::mutex> lock(mutex_);
     auto& state = camera_states_[camera_id];
@@ -601,46 +629,57 @@ void RosIoThread::handleDepth(const std::string& camera_id,
                   camera_id.c_str(), msg->encoding.c_str());
       return;
     }
+    const RobotMaskCameraInfo expected =
+        config_.robot_mask_generator->cameraInfo(camera_id);
+    if (depth->width != expected.width || depth->height != expected.height) {
+      ++state.mask_geometry_rejections;
+      RCLCPP_WARN(logger_,
+                  "dropping registered depth for %s: got %dx%d, expected %dx%d",
+                  camera_id.c_str(),
+                  depth->width,
+                  depth->height,
+                  expected.width,
+                  expected.height);
+      maybeLogStatusLocked();
+      return;
+    }
     state.latest_depth_time_ns = toNanoseconds(msg->header.stamp);
     state.latest_depth =
         std::make_shared<const DepthBuffer>(std::move(*depth));
-    auto bundles = makeFrameBundlesLocked(camera_id, state.latest_rgb_time_ns);
-    mapping_bundle = std::move(bundles.first);
-    detection_bundle = std::move(bundles.second);
     maybeLogStatusLocked();
   }
-
-  enqueueBundles(std::move(mapping_bundle), std::move(detection_bundle));
+  tryAssembleCamera(camera_id);
 }
 
 void RosIoThread::handleCameraInfo(const std::string& camera_id,
                                    const sensor_msgs::msg::CameraInfo::SharedPtr msg) {
-  FrameBundlePtr mapping_bundle;
-  FrameBundlePtr detection_bundle;
   {
     std::lock_guard<std::mutex> lock(mutex_);
     auto& state = camera_states_[camera_id];
     state.config.camera_id = camera_id;
     const CameraIntrinsics intrinsics = intrinsicsFromRos(*msg);
-    if (hasUsableIntrinsics(intrinsics)) {
+    const RobotMaskCameraInfo expected =
+        config_.robot_mask_generator->cameraInfo(camera_id);
+    if (hasUsableIntrinsics(intrinsics) &&
+        intrinsicsMatch(intrinsics, expected) && hasZeroDistortion(*msg)) {
       ++camera_info_messages_;
       state.latest_intrinsics = intrinsics;
       ++state.calibration_revision;
-    } else if (!state.latest_intrinsics &&
-               hasUsableIntrinsics(state.config.fallback_intrinsics)) {
-      state.latest_intrinsics = state.config.fallback_intrinsics;
+    } else {
+      ++state.mask_geometry_rejections;
+      state.latest_intrinsics.reset();
       ++state.calibration_revision;
+      RCLCPP_WARN(logger_,
+                  "rejecting CameraInfo for %s: mask input must be rectified and match the configured geometry",
+                  camera_id.c_str());
     }
-    auto bundles = makeFrameBundlesLocked(camera_id, state.latest_rgb_time_ns);
-    mapping_bundle = std::move(bundles.first);
-    detection_bundle = std::move(bundles.second);
     maybeLogStatusLocked();
   }
-  enqueueBundles(std::move(mapping_bundle), std::move(detection_bundle));
+  tryAssembleCamera(camera_id);
 }
 
 void RosIoThread::handleTf(const tf2_msgs::msg::TFMessage::SharedPtr msg, bool is_static) {
-  std::vector<std::pair<FrameBundlePtr, FrameBundlePtr>> bundles_to_enqueue;
+  std::vector<std::string> cameras_to_retry;
   {
     std::lock_guard<std::mutex> lock(mutex_);
     if (is_static) {
@@ -685,20 +724,200 @@ void RosIoThread::handleTf(const tf2_msgs::msg::TFMessage::SharedPtr msg, bool i
       }
     }
 
-    for (auto& [camera_id, state] : camera_states_) {
+    for (const auto& [camera_id, state] : camera_states_) {
       if (state.latest_rgb_time_ns == 0) {
         continue;
       }
-      auto bundles = makeFrameBundlesLocked(camera_id, state.latest_rgb_time_ns);
-      if (bundles.first || bundles.second) {
-        bundles_to_enqueue.push_back(std::move(bundles));
-      }
+      cameras_to_retry.push_back(camera_id);
     }
     maybeLogStatusLocked();
   }
 
-  for (auto& bundles : bundles_to_enqueue) {
-    enqueueBundles(std::move(bundles.first), std::move(bundles.second));
+  for (const std::string& camera_id : cameras_to_retry) {
+    tryAssembleCamera(camera_id);
+  }
+}
+
+void RosIoThread::tryAssembleCamera(const std::string& camera_id) {
+  while (true) {
+    TimeNanoseconds image_time_ns = 0;
+    std::uint64_t rgb_revision = 0;
+    std::shared_ptr<RobotMaskGenerator> generator;
+    std::shared_ptr<tf2::BufferCore> tf_buffer;
+    FrameBundlePtr ready_mapping_bundle;
+    FrameBundlePtr ready_detection_bundle;
+    bool mask_was_already_ready = false;
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      const auto found = camera_states_.find(camera_id);
+      if (found == camera_states_.end()) {
+        return;
+      }
+      CameraState& state = found->second;
+      if (!state.latest_rgb || state.latest_rgb_time_ns == 0 ||
+          !config_.robot_mask_generator || !tf_buffer_) {
+        return;
+      }
+      if (state.latest_robot_mask &&
+          state.latest_robot_mask_time_ns == state.latest_rgb_time_ns) {
+        mask_was_already_ready = true;
+        auto bundles =
+            makeFrameBundlesLocked(camera_id, state.latest_rgb_time_ns);
+        ready_mapping_bundle = std::move(bundles.first);
+        ready_detection_bundle = std::move(bundles.second);
+        maybeLogStatusLocked();
+      } else {
+        if (state.mask_generation_in_flight_time_ns != 0) {
+          return;
+        }
+        image_time_ns = state.latest_rgb_time_ns;
+        rgb_revision = state.rgb_revision;
+        state.mask_generation_in_flight_time_ns = image_time_ns;
+        state.mask_generation_in_flight_rgb_revision = rgb_revision;
+        generator = config_.robot_mask_generator;
+        tf_buffer = tf_buffer_;
+      }
+    }
+    if (mask_was_already_ready) {
+      enqueueBundles(std::move(ready_mapping_bundle),
+                     std::move(ready_detection_bundle));
+      return;
+    }
+
+    RobotPoseSnapshot pose;
+    pose.time_ns = image_time_ns;
+    bool pose_ready = true;
+    std::string pose_error;
+    for (const std::string& frame : generator->requiredFrames()) {
+      if (normalizeFrameId(frame) == normalizeFrameId(generator->rootFrame())) {
+        pose.root_T_frame.emplace(frame, Eigen::Isometry3d::Identity());
+        continue;
+      }
+      try {
+        const geometry_msgs::msg::TransformStamped transform_msg =
+            tf_buffer->lookupTransform(
+                normalizeFrameId(generator->rootFrame()),
+                normalizeFrameId(frame),
+                tf2::TimePoint(std::chrono::nanoseconds(image_time_ns)));
+        auto transform = transformFromRosDouble(transform_msg);
+        if (!transform) {
+          pose_ready = false;
+          pose_error = "invalid rotation for internal TF " +
+                       generator->rootFrame() + " <- " + frame;
+          break;
+        }
+        pose.root_T_frame.emplace(frame, std::move(*transform));
+      } catch (const tf2::TransformException& error) {
+        pose_ready = false;
+        pose_error = error.what();
+        break;
+      } catch (const std::exception& error) {
+        pose_ready = false;
+        pose_error = error.what();
+        break;
+      }
+    }
+
+    if (!pose_ready) {
+      bool newer_rgb_waiting = false;
+      {
+        std::lock_guard<std::mutex> lock(mutex_);
+        const auto found = camera_states_.find(camera_id);
+        if (found == camera_states_.end()) {
+          return;
+        }
+        CameraState& state = found->second;
+        if (state.mask_generation_in_flight_time_ns == image_time_ns &&
+            state.mask_generation_in_flight_rgb_revision == rgb_revision) {
+          state.mask_generation_in_flight_time_ns = 0;
+          state.mask_generation_in_flight_rgb_revision = 0;
+        }
+        ++state.mask_tf_waits;
+        state.last_mask_error = pose_error;
+        newer_rgb_waiting = state.latest_rgb_time_ns != image_time_ns ||
+                            state.rgb_revision != rgb_revision;
+        maybeLogStatusLocked();
+      }
+      if (newer_rgb_waiting) {
+        continue;
+      }
+      return;
+    }
+
+    RobotMaskResult result;
+    try {
+      result = generator->generate(camera_id, pose);
+    } catch (const std::exception& error) {
+      bool newer_rgb_waiting = false;
+      {
+        std::lock_guard<std::mutex> lock(mutex_);
+        const auto found = camera_states_.find(camera_id);
+        if (found == camera_states_.end()) {
+          return;
+        }
+        CameraState& state = found->second;
+        if (state.mask_generation_in_flight_time_ns == image_time_ns &&
+            state.mask_generation_in_flight_rgb_revision == rgb_revision) {
+          state.mask_generation_in_flight_time_ns = 0;
+          state.mask_generation_in_flight_rgb_revision = 0;
+        }
+        ++state.mask_generation_failures;
+        state.last_mask_error = error.what();
+        newer_rgb_waiting = state.latest_rgb_time_ns != image_time_ns ||
+                            state.rgb_revision != rgb_revision;
+        maybeLogStatusLocked();
+      }
+      RCLCPP_ERROR(logger_,
+                   "robot mask generation failed for %s: %s",
+                   camera_id.c_str(),
+                   error.what());
+      if (newer_rgb_waiting) {
+        continue;
+      }
+      return;
+    }
+
+    bool newer_rgb_waiting = false;
+    FrameBundlePtr mapping_bundle;
+    FrameBundlePtr detection_bundle;
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      const auto found = camera_states_.find(camera_id);
+      if (found == camera_states_.end()) {
+        return;
+      }
+      CameraState& state = found->second;
+      if (state.mask_generation_in_flight_time_ns == image_time_ns &&
+          state.mask_generation_in_flight_rgb_revision == rgb_revision) {
+        state.mask_generation_in_flight_time_ns = 0;
+        state.mask_generation_in_flight_rgb_revision = 0;
+      }
+      newer_rgb_waiting = state.latest_rgb_time_ns != image_time_ns ||
+                          state.rgb_revision != rgb_revision;
+      if (!newer_rgb_waiting) {
+        state.last_mask_error.clear();
+        state.latest_robot_mask = std::move(result.mask);
+        state.latest_robot_mask_time_ns = image_time_ns;
+        state.last_mask_pixels = result.mask_pixels;
+        if (result.reused) {
+          ++state.masks_reused;
+        } else {
+          ++state.masks_rendered;
+          state.last_mask_render_ms = result.render_ms;
+        }
+        if (result.full_mask) {
+          ++state.full_masks;
+        }
+        auto bundles = makeFrameBundlesLocked(camera_id, image_time_ns);
+        mapping_bundle = std::move(bundles.first);
+        detection_bundle = std::move(bundles.second);
+      }
+      maybeLogStatusLocked();
+    }
+    enqueueBundles(std::move(mapping_bundle), std::move(detection_bundle));
+    if (!newer_rgb_waiting) {
+      return;
+    }
   }
 }
 
@@ -797,14 +1016,20 @@ std::pair<FrameBundlePtr, FrameBundlePtr> RosIoThread::makeFrameBundlesLocked(
       state.config.camera_frame.empty()) {
     return {};
   }
+  if (state.latest_rgb_time_ns != time_ns ||
+      state.latest_robot_mask_time_ns != time_ns ||
+      state.latest_robot_mask->width != state.latest_rgb->width ||
+      state.latest_robot_mask->height != state.latest_rgb->height ||
+      state.latest_robot_mask->channels != 1) {
+    return {};
+  }
 
   const TimeNanoseconds max_image_delta_ns =
       secondsToNanoseconds(config_.max_image_stamp_delta_sec);
-  if (!stampCloseEnough(time_ns, state.latest_robot_mask_time_ns, max_image_delta_ns)) {
-    return {};
-  }
   const bool depth_ready =
       state.latest_depth &&
+      state.latest_depth->width == state.latest_rgb->width &&
+      state.latest_depth->height == state.latest_rgb->height &&
       stampCloseEnough(time_ns, state.latest_depth_time_ns, max_image_delta_ns);
   if (mapping_pending && !depth_ready) {
     // Online perception must be assembled from the exact same immutable
@@ -885,8 +1110,6 @@ std::pair<FrameBundlePtr, FrameBundlePtr> RosIoThread::makeFrameBundlesLocked(
   mutable_bundle->intrinsics = *state.latest_intrinsics;
   mutable_bundle->T_world_camera = *state.latest_T_world_camera;
   mutable_bundle->calibration_revision = state.calibration_revision;
-  mutable_bundle->sync.rgb_mask_delta_ns =
-      absoluteDelta(time_ns, state.latest_robot_mask_time_ns);
   mutable_bundle->sync.rgb_depth_delta_ns =
       depth_ready ? absoluteDelta(time_ns, state.latest_depth_time_ns) : 0;
   mutable_bundle->sync.tf_delta_ns =
@@ -969,7 +1192,6 @@ void RosIoThread::maybeLogStatusLocked() {
          << " map_mode=" << mapModeName(config_.map_mode)
          << " last_frame_id=" << (next_frame_id_ > 1 ? next_frame_id_ - 1 : 0)
          << " rgb=" << rgb_messages_
-         << " mask=" << mask_messages_
          << " depth=" << depth_messages_
          << " camera_info=" << camera_info_messages_
          << " tf=" << tf_messages_
@@ -985,6 +1207,20 @@ void RosIoThread::maybeLogStatusLocked() {
          << " perception_backpressure_skips="
          << perception_backpressure_skips_
          << " cameras=" << camera_states_.size();
+  for (const auto& [camera_id, state] : camera_states_) {
+    stream << " camera[" << camera_id << "]={rendered="
+           << state.masks_rendered << ",reused=" << state.masks_reused
+           << ",tf_waits=" << state.mask_tf_waits
+           << ",failures=" << state.mask_generation_failures
+           << ",geometry_rejections=" << state.mask_geometry_rejections
+           << ",full_masks=" << state.full_masks
+           << ",last_render_ms=" << state.last_mask_render_ms
+           << ",last_pixels=" << state.last_mask_pixels;
+    if (!state.last_mask_error.empty()) {
+      stream << ",last_error='" << state.last_mask_error << "'";
+    }
+    stream << "}";
+  }
   RunLogger::logGlobal("ros_io", stream.str());
 }
 

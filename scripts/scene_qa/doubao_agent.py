@@ -5,12 +5,17 @@ from __future__ import annotations
 import base64
 import json
 import os
+import threading
 from typing import Any, Callable
 from urllib import error as urllib_error
 from urllib import request as urllib_request
 
 from .config import SceneQaConfig
-from .gemini_agent import QaResponse, sanitize_proxy_environment
+from .gemini_agent import (
+    QaResponse,
+    SceneQaCancelledError,
+    sanitize_proxy_environment,
+)
 from .graph_store import GraphStore
 from .tools import ToolRegistry, ToolResult
 
@@ -86,6 +91,8 @@ class DoubaoSceneQaAgent:
         api_key: str | None = None,
         client: Any | None = None,
         progress_callback: Callable[[dict[str, Any]], None] | None = None,
+        history_callback: Callable[[dict[str, Any]], None] | None = None,
+        cancel_event: threading.Event | None = None,
         request_timeout_sec: float = 180.0,
     ):
         if request_timeout_sec <= 0:
@@ -108,14 +115,36 @@ class DoubaoSceneQaAgent:
         self._api_key = resolved_key
         self._client = client or _UrllibJsonClient()
         self._progress_callback = progress_callback
+        self._history_callback = history_callback
+        self._cancel_event = cancel_event
         self._request_timeout_sec = float(request_timeout_sec)
         self._endpoint = f"{config.doubao_base_url.rstrip('/')}/responses"
+        self._active_history: dict[str, Any] | None = None
 
     def answer_query(self, query: str) -> QaResponse:
-        session = self.registry.begin_answer()
+        # Delay the live read session until the first local tool call so model
+        # planning time does not consume the fixed server lease.
+        self.registry.end_answer()
         try:
-            return self._answer_query_in_session(query, session)
+            response = self._answer_query_in_session(query, None)
+            self._refresh_read_session(response.history)
+            self._emit_history(response.history)
+            return response
+        except Exception as exc:
+            if self._active_history is not None:
+                self._refresh_read_session(self._active_history)
+                self._active_history["error"] = {
+                    "type": type(exc).__name__,
+                    "message": str(exc),
+                }
+                self._emit_history(self._active_history)
+                try:
+                    setattr(exc, "scene_qa_history", self._active_history)
+                except Exception:
+                    pass
+            raise
         finally:
+            self._active_history = None
             self.registry.end_answer()
 
     def _answer_query_in_session(
@@ -134,10 +163,13 @@ class DoubaoSceneQaAgent:
             "tools": self.registry.list_tools(),
             "iterations": [],
         }
+        self._active_history = history
         if session is not None:
             history["read_session"] = session
+        self._emit_history(history)
 
         for iteration in range(1, self.config.max_iterations + 1):
+            self._check_cancelled()
             self._emit_progress(
                 "doubao_start",
                 "Doubao planning the next step...",
@@ -165,11 +197,15 @@ class DoubaoSceneQaAgent:
                 "model_text": model_text,
                 "function_calls": [],
             }
+            history["iterations"].append(iter_data)
+            self._emit_history(history)
+            self._check_cancelled()
 
             if not calls:
                 parsed = self._parse_final_text(model_text)
-                history["iterations"].append(iter_data)
                 history["final_response"] = parsed
+                self._refresh_read_session(history)
+                self._emit_history(history)
                 self._emit_progress(
                     "final_answer",
                     "Final answer received.",
@@ -185,6 +221,7 @@ class DoubaoSceneQaAgent:
             tool_outputs: list[dict[str, Any]] = []
             media_inputs: list[dict[str, Any]] = []
             for call in calls:
+                self._check_cancelled()
                 call_id = str(call.get("call_id") or "")
                 name = str(call.get("name") or "")
                 if not call_id or not name:
@@ -199,11 +236,37 @@ class DoubaoSceneQaAgent:
                     tool=name,
                     args=args,
                 )
-                tool_result = (
-                    ToolResult({"error": argument_error})
-                    if argument_error
-                    else self.registry.call_tool(name, args)
-                )
+                try:
+                    tool_result = (
+                        ToolResult({"error": argument_error})
+                        if argument_error
+                        else self.registry.call_tool(name, args)
+                    )
+                except Exception as exc:
+                    failed_result = ToolResult(
+                        {
+                            "error": f"{type(exc).__name__}: {exc}",
+                            "status": str(getattr(exc, "status", "query_failed")),
+                        }
+                    )
+                    iter_data["function_calls"].append(
+                        self._history_call(
+                            name,
+                            args,
+                            failed_result,
+                            call_id=call_id,
+                        )
+                    )
+                    self._refresh_read_session(history)
+                    self._emit_history(history)
+                    self._emit_progress(
+                        "tool_done",
+                        self._tool_done_message(name, failed_result),
+                        iteration=iteration,
+                        tool=name,
+                        status=str(getattr(exc, "status", "query_failed")),
+                    )
+                    raise
                 self._emit_progress(
                     "tool_done",
                     self._tool_done_message(name, tool_result),
@@ -212,8 +275,16 @@ class DoubaoSceneQaAgent:
                     **self._tool_result_summary(tool_result),
                 )
                 iter_data["function_calls"].append(
-                    self._history_call(name, args, tool_result)
+                    self._history_call(
+                        name,
+                        args,
+                        tool_result,
+                        call_id=call_id,
+                    )
                 )
+                self._refresh_read_session(history)
+                self._emit_history(history)
+                self._check_cancelled()
                 tool_outputs.append(
                     {
                         "type": "function_call_output",
@@ -249,14 +320,23 @@ class DoubaoSceneQaAgent:
                         {"type": "message", "role": "user", "content": content}
                     )
 
-            history["iterations"].append(iter_data)
             previous_response_id = response_id
             next_input = [*tool_outputs, *media_inputs]
 
         final_text = self._force_final_answer(previous_response_id)
         parsed = self._parse_final_text(final_text)
+        history["iterations"].append(
+            {
+                "iteration": self.config.max_iterations + 1,
+                "phase": "forced_final",
+                "model_text": final_text,
+                "function_calls": [],
+            }
+        )
         history["final_response"] = parsed
         history["max_iterations_reached"] = True
+        self._refresh_read_session(history)
+        self._emit_history(history)
         self._emit_progress("final_answer", "Final answer received after max iterations.")
         return QaResponse(
             reasoning=str(parsed.get("reasoning", "")),
@@ -405,6 +485,23 @@ class DoubaoSceneQaAgent:
         except Exception:
             pass
 
+    def _emit_history(self, history: dict[str, Any]) -> None:
+        if self._history_callback is None:
+            return
+        try:
+            self._history_callback(history)
+        except Exception:
+            pass
+
+    def _refresh_read_session(self, history: dict[str, Any]) -> None:
+        session = self.registry.answer_metadata()
+        if session is not None and session.get("session_id"):
+            history["read_session"] = session
+
+    def _check_cancelled(self) -> None:
+        if self._cancel_event is not None and self._cancel_event.is_set():
+            raise SceneQaCancelledError("question was reset")
+
     @staticmethod
     def _tool_start_message(name: str, args: dict[str, Any]) -> str:
         if name == "search_objects":
@@ -479,12 +576,16 @@ class DoubaoSceneQaAgent:
         name: str,
         args: dict[str, Any],
         result: ToolResult,
+        *,
+        call_id: str = "",
     ) -> dict[str, Any]:
         data: dict[str, Any] = {
             "name": name,
             "args": args,
             "response": result.response,
         }
+        if call_id:
+            data["call_id"] = call_id
         if result.media:
             data["media"] = [media.summary for media in result.media]
         return data

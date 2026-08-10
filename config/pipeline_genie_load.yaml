@@ -12,7 +12,6 @@ roomie_pipeline_node:
     topics:
       color_topic: /roomie/input/head_color/image_rect
       depth_topic: /roomie/input/head_color/depth_registered
-      mask_topic: /roomie/input/head_color/robot_mask
       camera_info_topic: /roomie/input/head_color/camera_info
       tf_topic: /tf
       tf_static_topic: /tf_static
@@ -32,13 +31,18 @@ roomie_pipeline_node:
       cx: 318.5672912598
       cy: 204.0587768555
 
+    robot_mask:
+      robot_config: G2/robot.yaml
+      camera_config: G2/cameras.yaml
+      reuse_translation_epsilon_m: 0.000005
+      reuse_rotation_epsilon_rad: 0.000005
+
     input_filter:
       depth_min_m: 0.1
       depth_max_m: 6.0
       # The adapter publishes 32FC1 meters; Roomie only applies this scale to
       # 16UC1 input.
       depth_scale: 0.001
-      mask_robot_threshold: 0
 
     tsdf:
       map_backend: nvblox
@@ -79,7 +83,8 @@ roomie_pipeline_node:
       boxernet_ckpt_path: /home/lindenbot/hugging_face/boxer/boxernet_hw960in4x6d768-3e37cfc4.ckpt
       inference_device: cuda
       inference_precision: auto
-      text_prompts: [lvisplus]
+      text_prompt_file: /home/lindenbot/RealityLab/jarvis/src/roomie/config/detection/roomie_classes.csv
+      label_thresholds_file: /home/lindenbot/RealityLab/jarvis/src/roomie/config/detection/label_confidence_thresholds.json
       owl_min_confidence: 0.25
       owl_nms_iou_threshold: 0.5
       boxernet_min_confidence: 0.35

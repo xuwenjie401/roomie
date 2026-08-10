@@ -2,22 +2,23 @@
 
 #include <cstddef>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 #include <rclcpp/rclcpp.hpp>
 
+#include "roomie/pipeline/label_thresholds.hpp"
 #include "roomie/pipeline/types.hpp"
 
 namespace roomie {
 
 struct PipelineConfig {
-  std::string world_frame = "world";
-  std::string mapping_camera_id = "head_front_left_color";
-  std::string mapping_camera_frame = "head_front_left_color";
-  std::string rgb_topic = "/head_front_left_color_rgb";
-  std::string depth_topic = "/head_front_left_color_depth";
-  std::string mask_topic = "/head_front_left_color_robot_mask";
-  std::string camera_info_topic = "/head_front_left_color_camera_info";
+  std::string world_frame = "map";
+  std::string mapping_camera_id = "head_color";
+  std::string mapping_camera_frame = "head_color";
+  std::string rgb_topic = "/roomie/input/head_color/image_rect";
+  std::string depth_topic = "/roomie/input/head_color/depth_registered";
+  std::string camera_info_topic = "/roomie/input/head_color/camera_info";
   std::string tf_topic = "/tf";
   std::string tf_static_topic = "/tf_static";
   std::string tsdf_output_topic = "/roomie/map_surface";
@@ -27,16 +28,20 @@ struct PipelineConfig {
   std::string instance_markers_topic = "/roomie/instances";
 
   int camera_width = 640;
-  int camera_height = 480;
-  float camera_fx = 211.2f;
-  float camera_fy = 211.2f;
-  float camera_cx = 291.19999872f;
-  float camera_cy = 240.0f;
+  int camera_height = 400;
+  float camera_fx = 305.2087402344f;
+  float camera_fy = 305.0057678223f;
+  float camera_cx = 318.5672912598f;
+  float camera_cy = 204.0587768555f;
+
+  std::string robot_mask_robot_config = "G2/robot.yaml";
+  std::string robot_mask_camera_config = "G2/cameras.yaml";
+  double robot_mask_reuse_translation_epsilon_m = 5.0e-6;
+  double robot_mask_reuse_rotation_epsilon_rad = 5.0e-6;
 
   float depth_min_m = 0.1f;
   float depth_max_m = 10.0f;
   float depth_scale = 0.001f;
-  int mask_robot_threshold = 0;
 
   float voxel_size_m = 0.03f;
   float truncation_distance_vox = 8.0f;
@@ -67,7 +72,9 @@ struct PipelineConfig {
       "/home/lindenbot/hugging_face/boxer/boxernet_hw960in4x6d768-3e37cfc4.ckpt";
   std::string inference_device = "cuda";
   std::string inference_precision = "auto";
+  std::string text_prompt_file;
   std::vector<std::string> text_prompts = {"lvisplus"};
+  std::string label_thresholds_file;
   float owl_min_confidence = 0.25f;
   float owl_nms_iou_threshold = 0.5f;
   float boxernet_min_confidence = 0.35f;
@@ -77,6 +84,7 @@ struct PipelineConfig {
   bool show_3d_label_score = true;
 
   float instance_min_confidence = 0.35f;
+  LabelConfidenceThresholds instance_label_thresholds;
   float instance_object_min_confidence = 0.5f;
   float instance_min_bbox_size_m = 0.02f;
   float instance_max_bbox_size_m = 8.0f;

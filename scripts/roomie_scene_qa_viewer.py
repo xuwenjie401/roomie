@@ -20,7 +20,6 @@ if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 
 from roomie_dsg_viewer import (  # noqa: E402
-    DEFAULT_CONFIG,
     as_path,
     empty_point_cloud,
     find_auto_point_cloud,
@@ -33,9 +32,16 @@ from roomie_dsg_viewer import (  # noqa: E402
 from scene_qa.config import SceneQaConfig, default_qa_config_path  # noqa: E402
 from scene_qa.doubao_agent import DoubaoSceneQaAgent  # noqa: E402
 from scene_qa.embeddings import ObjectSearchIndex  # noqa: E402
-from scene_qa.gemini_agent import GeminiSceneQaAgent  # noqa: E402
+from scene_qa.gemini_agent import (  # noqa: E402
+    GeminiSceneQaAgent,
+    SceneQaCancelledError,
+)
 from scene_qa.graph_store import GraphStore  # noqa: E402
 from scene_qa.live_query import LiveSceneQueryClient, RosQuerySceneTransport  # noqa: E402
+from scene_qa.session_log import (  # noqa: E402
+    SceneQaSessionLog,
+    default_scene_qa_log_dir,
+)
 from scene_qa.tools import create_default_tool_registry, create_live_tool_registry  # noqa: E402
 
 
@@ -49,6 +55,8 @@ PALETTE = [
     "#72b7b2",
     "#9d755d",
 ]
+
+LIVE_READ_SESSION_TTL_MS = 300_000
 
 
 def collect_object_ids(value: Any) -> list[int]:
@@ -125,12 +133,11 @@ def parse_args() -> argparse.Namespace:
         help="explicitly use a static Roomie DSG JSON",
     )
     parser.add_argument("--service", default="/roomie/query_scene", help="live QueryScene service")
-    parser.add_argument("--session-ttl-ms", type=int, default=30_000)
     parser.add_argument("--service-timeout-sec", type=float, default=10.0)
     parser.add_argument(
         "--config",
         type=Path,
-        default=DEFAULT_CONFIG,
+        default=None,
         help="pipeline YAML used to resolve an offline point cloud",
     )
     parser.add_argument("--model", default=None, help="Gemini model; overrides QA config")
@@ -280,6 +287,92 @@ class ProgressLog:
             }
 
 
+class QaRuntime:
+    """Resettable agents and read-session state for one QA generation."""
+
+    def __init__(
+        self,
+        generation: int,
+        scene_log: SceneQaSessionLog,
+        progress_log: ProgressLog,
+    ) -> None:
+        self.generation = int(generation)
+        self.scene_log = scene_log
+        self.progress_log = progress_log
+        self.qa_lock = threading.Lock()
+        self.cancel_event = threading.Event()
+        self.agents: dict[str, Any] = {}
+        self.provider_status: dict[str, dict[str, Any]] = {}
+        self.retired = False
+        self._state_lock = threading.Lock()
+        self._active_turn: int | None = None
+        self._active_started_time_s: float | None = None
+        self._active_progress_after = 0
+
+    def activate_turn(
+        self,
+        turn_index: int,
+        *,
+        started_time_s: float,
+        progress_after: int,
+    ) -> None:
+        with self._state_lock:
+            self._active_turn = int(turn_index)
+            self._active_started_time_s = float(started_time_s)
+            self._active_progress_after = int(progress_after)
+
+    def checkpoint_history(self, history: dict[str, Any]) -> None:
+        with self._state_lock:
+            turn_index = self._active_turn
+            progress_after = self._active_progress_after
+        if turn_index is None:
+            return
+        progress = self.progress_log.snapshot(progress_after)
+        self.scene_log.checkpoint_turn(
+            turn_index,
+            history=history,
+            progress_events=progress["events"],
+        )
+
+    def add_progress(self, event: dict[str, Any]) -> dict[str, Any]:
+        if self.retired:
+            return event
+        return self.progress_log.add({"generation": self.generation, **event})
+
+    def finish_turn(
+        self,
+        *,
+        response: dict[str, Any] | None = None,
+        history: dict[str, Any] | None = None,
+        error: BaseException | None = None,
+        status: str | None = None,
+    ) -> bool:
+        with self._state_lock:
+            turn_index = self._active_turn
+            started = self._active_started_time_s
+            progress_after = self._active_progress_after
+            self._active_turn = None
+            self._active_started_time_s = None
+        if turn_index is None or started is None:
+            return False
+        progress = self.progress_log.snapshot(progress_after)
+        return self.scene_log.finish_turn(
+            turn_index,
+            started_time_s=started,
+            response=response,
+            history=history,
+            error=error,
+            status=status,
+            progress_events=progress["events"],
+        )
+
+    def cancel(self) -> None:
+        self.cancel_event.set()
+        self.finish_turn(
+            error=SceneQaCancelledError("question was reset from the browser"),
+            status="reset",
+        )
+
 HTML = r"""<!doctype html>
 <html lang="en">
 <head>
@@ -414,6 +507,8 @@ HTML = r"""<!doctype html>
       color: #fff;
       font-weight: 650;
     }
+    .ask-actions { display: grid; grid-template-columns: 1fr auto; gap: 8px; }
+    .reset-button { color: var(--warn); border-color: #dfb08f; min-width: 92px; }
     button:disabled { opacity: .55; cursor: default; }
     .answer {
       margin: 12px 14px;
@@ -731,7 +826,10 @@ HTML = r"""<!doctype html>
           </div>
           <div class="provider-status" id="providerStatus">Loading providers...</div>
         </div>
-        <button id="askBtn" class="primary">Ask</button>
+        <div class="ask-actions">
+          <button id="askBtn" class="primary">Ask</button>
+          <button id="resetBtn" class="reset-button" type="button">Reset QA</button>
+        </div>
       </div>
       <div class="scroll">
         <div class="answer" id="answerBox">
@@ -777,6 +875,7 @@ HTML = r"""<!doctype html>
       lastEventId: 0,
       pollTimer: null,
       asking: false,
+      askController: null,
       provider: 'gemini',
       yaw: 2.45,
       pitch: 0.72,
@@ -809,6 +908,7 @@ HTML = r"""<!doctype html>
     const canvas = document.getElementById('view');
     const questionInput = document.getElementById('question');
     const askBtn = document.getElementById('askBtn');
+    const resetBtn = document.getElementById('resetBtn');
     const objectList = document.getElementById('objectList');
     const traceList = document.getElementById('traceList');
     const progressList = document.getElementById('progressList');
@@ -1451,6 +1551,8 @@ HTML = r"""<!doctype html>
       const query = questionInput.value.trim();
       if (!query) return;
       const provider = state.provider;
+      const controller = new AbortController();
+      state.askController = controller;
       askBtn.disabled = true;
       askBtn.textContent = 'Asking...';
       document.getElementById('answerText').textContent = 'Working...';
@@ -1466,7 +1568,8 @@ HTML = r"""<!doctype html>
         const response = await fetch('/ask', {
           method: 'POST',
           headers: {'Content-Type': 'application/json'},
-          body: JSON.stringify({query, provider})
+          body: JSON.stringify({query, provider}),
+          signal: controller.signal
         });
         const data = await response.json();
         if (!response.ok) throw new Error(data.error || response.statusText);
@@ -1477,16 +1580,56 @@ HTML = r"""<!doctype html>
         document.getElementById('reasoningText').textContent = data.reasoning || '';
         setHighlights(data.highlight_groups || []);
       } catch (error) {
-        document.getElementById('answerText').textContent = 'Request failed';
+        if (error?.name !== 'AbortError') {
+          document.getElementById('answerText').textContent = 'Request failed';
+          document.getElementById('reasoningText').textContent = String(error);
+        }
+      } finally {
+        if (state.askController === controller) {
+          await pollProgress();
+          state.askController = null;
+          state.asking = false;
+          stopProgressPolling();
+          renderProgress();
+          askBtn.disabled = false;
+          askBtn.textContent = 'Ask';
+          updateProviderControls();
+        }
+      }
+    }
+    async function resetQuestion() {
+      resetBtn.disabled = true;
+      resetBtn.textContent = 'Resetting...';
+      const controller = state.askController;
+      state.askController = null;
+      if (controller) controller.abort();
+      state.asking = false;
+      stopProgressPolling();
+      try {
+        const response = await fetch('/reset', {method: 'POST'});
+        const data = await response.json();
+        if (!response.ok) throw new Error(data.error || response.statusText);
+        if (state.graph?.qa && data.providers) {
+          state.graph.qa.providers = data.providers;
+          state.graph.qa.default_provider = data.default_provider || state.provider;
+        }
+        state.progressEvents = [];
+        state.lastEventId = 0;
+        state.lastHistory = null;
+        setHighlights([]);
+        renderTraceGroups();
+        document.getElementById('answerText').textContent = 'QA reset. Ready for a new question.';
+        document.getElementById('reasoningText').textContent = '';
+      } catch (error) {
+        document.getElementById('answerText').textContent = 'Reset failed';
         document.getElementById('reasoningText').textContent = String(error);
       } finally {
-        await pollProgress();
-        state.asking = false;
-        stopProgressPolling();
-        renderProgress();
+        resetBtn.disabled = false;
+        resetBtn.textContent = 'Reset QA';
         askBtn.disabled = false;
         askBtn.textContent = 'Ask';
         updateProviderControls();
+        renderProgress();
       }
     }
     canvas.addEventListener('mousedown', event => {
@@ -1516,6 +1659,7 @@ HTML = r"""<!doctype html>
       render();
     }, {passive: false});
     askBtn.addEventListener('click', askQuestion);
+    resetBtn.addEventListener('click', resetQuestion);
     for (const button of providerButtons) {
       button.addEventListener('click', () => selectProvider(button.dataset.provider));
     }
@@ -1601,10 +1745,18 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:
         parsed = urllib.parse.urlparse(self.path)
+        if parsed.path == "/reset":
+            self._reset_qa()
+            return
         if parsed.path != "/ask":
             self.send_error(404, "not found")
             return
         acquired = False
+        request_lock: threading.Lock | None = None
+        runtime: QaRuntime | None = None
+        query = ""
+        provider = ""
+        turn_finished = False
         try:
             length = int(self.headers.get("Content-Length", "0") or "0")
             if length <= 0 or length > 1_048_576:
@@ -1618,9 +1770,9 @@ class Handler(BaseHTTPRequestHandler):
             provider = str(
                 payload.get("provider") or self.server.default_provider  # type: ignore[attr-defined]
             ).strip().lower()
-            agents = self.server.agents  # type: ignore[attr-defined]
-            if provider not in agents:
-                provider_status = self.server.provider_status  # type: ignore[attr-defined]
+            runtime = self.server.current_runtime()  # type: ignore[attr-defined]
+            if provider not in runtime.agents:
+                provider_status = runtime.provider_status
                 known = provider_status.get(provider)
                 if known is not None:
                     self._send_json(
@@ -1633,21 +1785,39 @@ class Handler(BaseHTTPRequestHandler):
                         status=400,
                     )
                 return
-            acquired = self.server.qa_lock.acquire(blocking=False)  # type: ignore[attr-defined]
+            request_lock = runtime.qa_lock
+            acquired = request_lock.acquire(blocking=False)
             if not acquired:
                 self._send_json(
                     {"error": "another scene QA request is still running"},
                     status=409,
                 )
                 return
-            self.server.progress_log.add(  # type: ignore[attr-defined]
+            if runtime.retired or not self.server.is_current_runtime(runtime):  # type: ignore[attr-defined]
+                self._send_json({"error": "QA was reset; retry the question"}, status=409)
+                return
+            started_time_s = time.time()
+            request_event = runtime.add_progress(
                 {
                     "phase": "request_start",
                     "message": f"Question received by {provider}.",
                     "provider": provider,
                 }
             )
-            response = agents[provider].answer_query(query)
+            progress_after = int(request_event.get("id", 1)) - 1
+            model = str(runtime.provider_status.get(provider, {}).get("model") or "")
+            turn_index = self.server.scene_qa_log.begin_turn(  # type: ignore[attr-defined]
+                query=query,
+                provider=provider,
+                model=model,
+                started_time_s=started_time_s,
+            )
+            runtime.activate_turn(
+                turn_index,
+                started_time_s=started_time_s,
+                progress_after=progress_after,
+            )
+            response = runtime.agents[provider].answer_query(query)
             highlight_groups = highlight_groups_from_history(response.history)
             body = {
                 "reasoning": response.reasoning,
@@ -1658,22 +1828,64 @@ class Handler(BaseHTTPRequestHandler):
                 "provider": provider,
                 "model": response.history.get("model"),
             }
-            self.server.progress_log.add(  # type: ignore[attr-defined]
+            runtime.add_progress(
                 {
                     "phase": "request_done",
                     "message": f"{provider} answer ready.",
                     "provider": provider,
                 }
             )
+            turn_finished = runtime.finish_turn(
+                response={
+                    "reasoning": response.reasoning,
+                    "answer": response.answer,
+                    "raw_text": response.raw_text,
+                },
+                history=response.history,
+            )
+            if not self.server.is_current_runtime(runtime):  # type: ignore[attr-defined]
+                self._send_json({"error": "question result discarded after reset"}, status=409)
+                return
             self._send_json(body)
         except Exception as exc:
-            self.server.progress_log.add(  # type: ignore[attr-defined]
-                {"phase": "request_error", "message": f"{type(exc).__name__}: {exc}"}
-            )
-            self._send_json({"error": f"{type(exc).__name__}: {exc}"}, status=500)
+            if runtime is None:
+                self.server.progress_log.add(  # type: ignore[attr-defined]
+                    {"phase": "request_error", "message": f"{type(exc).__name__}: {exc}"}
+                )
+            else:
+                runtime.add_progress(
+                    {"phase": "request_error", "message": f"{type(exc).__name__}: {exc}"}
+                )
+            if runtime is not None and acquired and query and provider and not turn_finished:
+                history = getattr(exc, "scene_qa_history", None)
+                if not isinstance(history, dict):
+                    history = {}
+                turn_finished = runtime.finish_turn(
+                    history=history,
+                    error=exc,
+                )
+            if runtime is None or self.server.is_current_runtime(runtime):  # type: ignore[attr-defined]
+                self._send_json({"error": f"{type(exc).__name__}: {exc}"}, status=500)
         finally:
-            if acquired:
-                self.server.qa_lock.release()  # type: ignore[attr-defined]
+            if acquired and request_lock is not None:
+                request_lock.release()
+
+    def _reset_qa(self) -> None:
+        try:
+            runtime = self.server.reset_runtime()  # type: ignore[attr-defined]
+            self._send_json(
+                {
+                    "reset": True,
+                    "generation": runtime.generation,
+                    "providers": runtime.provider_status,
+                    "default_provider": self.server.default_provider,  # type: ignore[attr-defined]
+                }
+            )
+        except Exception as exc:
+            self._send_json(
+                {"error": f"{type(exc).__name__}: {exc}"},
+                status=500,
+            )
 
     def _send_json(self, body: dict[str, Any], status: int = 200) -> None:
         self._send_bytes(
@@ -1697,7 +1909,6 @@ def main() -> int:
     args = parse_args()
     qa_config = apply_cli_overrides(load_qa_config(args.qa_config), args)
     offline = args.offline_json is not None
-    transport: RosQuerySceneTransport | None = None
     point_cloud = empty_point_cloud()
     if offline:
         json_path = qa_config.resolved_graph_json()
@@ -1733,32 +1944,17 @@ def main() -> int:
             backend=qa_config.embedding_backend,
             device=qa_config.device,
         )
-        def registry_factory():
-            return create_default_tool_registry(graph, search_index, qa_config)
-
         graph_data = graph_payload(graph)
         snapshot_paths = graph.snapshot_paths
         source_label = f"Loaded DSG: {json_path}"
     else:
         graph = None
-        transport = RosQuerySceneTransport(
-            service_name=args.service,
-            timeout_sec=args.service_timeout_sec,
-        )
-        def registry_factory():
-            live_client = LiveSceneQueryClient(
-                transport,
-                session_ttl_ms=args.session_ttl_ms,
-            )
-            return create_live_tool_registry(live_client, qa_config)
-
         graph_data = live_graph_payload(args.service)
         snapshot_paths = {}
         source_label = f"Live QueryScene service: {args.service}"
 
     progress_log = ProgressLog()
-    agents: dict[str, Any] = {}
-    provider_status: dict[str, dict[str, Any]] = {
+    configured_providers: dict[str, dict[str, Any]] = {
         "gemini": {
             "label": "Gemini",
             "model": qa_config.gemini_model,
@@ -1770,53 +1966,170 @@ def main() -> int:
             "available": False,
         },
     }
-    provider_builders = {
-        "gemini": lambda: GeminiSceneQaAgent(
-            graph,
-            registry_factory(),
-            qa_config,
-            api_key=args.api_key,
-            progress_callback=progress_log.add,
-        ),
-        "doubao": lambda: DoubaoSceneQaAgent(
-            graph,
-            registry_factory(),
-            qa_config,
-            api_key=args.doubao_api_key,
-            progress_callback=progress_log.add,
-        ),
-    }
-    for provider, builder in provider_builders.items():
+
+    try:
+        qa_config_path = (
+            as_path(args.qa_config)
+            if args.qa_config is not None
+            else default_qa_config_path()
+        )
+        scene_qa_log = SceneQaSessionLog(
+            default_scene_qa_log_dir(),
+            metadata={
+                "mode": "offline" if offline else "live",
+                "source": source_label,
+                "service": None if offline else args.service,
+                "qa_config": str(qa_config_path) if qa_config_path is not None else None,
+                "providers": configured_providers,
+            },
+        )
+    except Exception as exc:
+        print(
+            f"Could not initialize Scene QA log: {type(exc).__name__}: {exc}",
+            file=sys.stderr,
+        )
+        return 2
+
+    live_transport: RosQuerySceneTransport | None = None
+    live_transport_lock = threading.Lock()
+    if not offline:
         try:
-            agents[provider] = builder()
-            provider_status[provider]["available"] = True
+            live_transport = RosQuerySceneTransport(
+                service_name=args.service,
+                timeout_sec=args.service_timeout_sec,
+            )
         except Exception as exc:
-            provider_status[provider]["error"] = f"{type(exc).__name__}: {exc}"
+            scene_qa_log.close()
             print(
-                f"Scene QA provider {provider} unavailable: {type(exc).__name__}: {exc}",
+                f"Could not initialize live QueryScene transport: "
+                f"{type(exc).__name__}: {exc}",
                 file=sys.stderr,
             )
-    if not agents:
-        if transport is not None:
-            transport.close()
+            return 2
+
+    def call_live_scene(payload: dict[str, Any]) -> dict[str, Any]:
+        if live_transport is None:
+            raise RuntimeError("live QueryScene transport is unavailable")
+        # rclpy nodes/clients are not used concurrently. A retired agent can
+        # finish a bounded service call while the new generation is already
+        # accepting model requests.
+        with live_transport_lock:
+            return live_transport(payload)
+
+    def build_runtime(generation: int) -> QaRuntime:
+        runtime = QaRuntime(generation, scene_qa_log, progress_log)
+        if offline:
+            def registry_factory():
+                return create_default_tool_registry(graph, search_index, qa_config)
+        else:
+            def registry_factory():
+                live_client = LiveSceneQueryClient(
+                    call_live_scene,
+                    session_ttl_ms=LIVE_READ_SESSION_TTL_MS,
+                )
+                return create_live_tool_registry(live_client, qa_config)
+
+        runtime.provider_status = {
+            name: dict(status) for name, status in configured_providers.items()
+        }
+        provider_builders = {
+            "gemini": lambda: GeminiSceneQaAgent(
+                graph,
+                registry_factory(),
+                qa_config,
+                api_key=args.api_key,
+                progress_callback=runtime.add_progress,
+                history_callback=runtime.checkpoint_history,
+                cancel_event=runtime.cancel_event,
+            ),
+            "doubao": lambda: DoubaoSceneQaAgent(
+                graph,
+                registry_factory(),
+                qa_config,
+                api_key=args.doubao_api_key,
+                progress_callback=runtime.add_progress,
+                history_callback=runtime.checkpoint_history,
+                cancel_event=runtime.cancel_event,
+            ),
+        }
+        for provider, builder in provider_builders.items():
+            try:
+                runtime.agents[provider] = builder()
+                runtime.provider_status[provider]["available"] = True
+                runtime.provider_status[provider].pop("error", None)
+            except Exception as exc:
+                runtime.provider_status[provider]["available"] = False
+                runtime.provider_status[provider]["error"] = (
+                    f"{type(exc).__name__}: {exc}"
+                )
+                print(
+                    f"Scene QA provider {provider} unavailable: "
+                    f"{type(exc).__name__}: {exc}",
+                    file=sys.stderr,
+                )
+        return runtime
+
+    initial_runtime = build_runtime(1)
+    if not initial_runtime.agents:
+        if live_transport is not None:
+            live_transport.close()
+        scene_qa_log.close()
         print("No Scene QA model provider is available.", file=sys.stderr)
         return 2
     default_provider = args.default_provider
-    if default_provider not in agents:
-        default_provider = next(iter(agents))
+    if default_provider not in initial_runtime.agents:
+        default_provider = next(iter(initial_runtime.agents))
         print(
             f"Requested default provider is unavailable; using {default_provider}.",
             file=sys.stderr,
         )
     graph_data["qa"] = {
         "default_provider": default_provider,
-        "providers": provider_status,
+        "providers": initial_runtime.provider_status,
     }
 
     server: ThreadingHTTPServer | None = None
     try:
         server = ThreadingHTTPServer((args.host, args.port), Handler)
         server.daemon_threads = True
+        runtime_lock = threading.Lock()
+        reset_lock = threading.Lock()
+        runtime_state = {"current": initial_runtime}
+
+        def current_runtime() -> QaRuntime:
+            with runtime_lock:
+                return runtime_state["current"]
+
+        def is_current_runtime(candidate: QaRuntime) -> bool:
+            with runtime_lock:
+                return runtime_state["current"] is candidate
+
+        def reset_runtime() -> QaRuntime:
+            nonlocal default_provider
+            with reset_lock:
+                old_runtime = current_runtime()
+                new_runtime = build_runtime(old_runtime.generation + 1)
+                if not new_runtime.agents:
+                    raise RuntimeError("no Scene QA model provider is available after reset")
+                with runtime_lock:
+                    if runtime_state["current"] is not old_runtime:
+                        return runtime_state["current"]
+                    runtime_state["current"] = new_runtime
+                old_runtime.retired = True
+                old_runtime.cancel()
+                if default_provider not in new_runtime.agents:
+                    default_provider = next(iter(new_runtime.agents))
+                server.default_provider = default_provider  # type: ignore[attr-defined]
+                progress_log.clear()
+                progress_log.add(
+                    {
+                        "phase": "qa_reset",
+                        "message": "Scene QA runtime reset; ready for a new question.",
+                        "generation": new_runtime.generation,
+                    }
+                )
+                return new_runtime
+
         server.graph_json = json.dumps(graph_data, ensure_ascii=False, separators=(",", ":")).encode("utf-8")  # type: ignore[attr-defined]
         server.snapshot_paths = snapshot_paths  # type: ignore[attr-defined]
         server.points_meta_json = json.dumps(points_meta(point_cloud), separators=(",", ":")).encode("utf-8")  # type: ignore[attr-defined]
@@ -1824,20 +2137,22 @@ def main() -> int:
         server.colors_bytes = point_cloud.colors.astype("u1", copy=False).tobytes()  # type: ignore[attr-defined]
         server.point_size = repr(float(args.point_size))  # type: ignore[attr-defined]
         server.progress_log = progress_log  # type: ignore[attr-defined]
-        server.qa_lock = threading.Lock()  # type: ignore[attr-defined]
-        server.agents = agents  # type: ignore[attr-defined]
-        server.provider_status = provider_status  # type: ignore[attr-defined]
         server.default_provider = default_provider  # type: ignore[attr-defined]
+        server.scene_qa_log = scene_qa_log  # type: ignore[attr-defined]
+        server.current_runtime = current_runtime  # type: ignore[attr-defined]
+        server.is_current_runtime = is_current_runtime  # type: ignore[attr-defined]
+        server.reset_runtime = reset_runtime  # type: ignore[attr-defined]
 
         browser_host = "127.0.0.1" if args.host in {"0.0.0.0", "::"} else args.host
         url = f"http://{browser_host}:{server.server_port}/"
         print(f"Roomie Scene QA viewer: {url}")
         print(source_label)
+        print(f"Scene QA conversation log: {scene_qa_log.path}")
         print(
             "QA providers: "
             + ", ".join(
-                f"{name}={provider_status[name]['model']}"
-                for name in agents
+                f"{name}={initial_runtime.provider_status[name]['model']}"
+                for name in initial_runtime.agents
             )
         )
         if args.browser == "auto" and not args.no_browser:
@@ -1848,8 +2163,11 @@ def main() -> int:
     finally:
         if server is not None:
             server.server_close()
-        if transport is not None:
-            transport.close()
+        current_runtime = initial_runtime if server is None else server.current_runtime()  # type: ignore[attr-defined]
+        current_runtime.cancel()
+        if live_transport is not None:
+            live_transport.close()
+        scene_qa_log.close()
     return 0
 
 

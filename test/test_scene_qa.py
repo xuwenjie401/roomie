@@ -26,10 +26,13 @@ from scene_qa.embeddings import ObjectSearchIndex  # noqa: E402
 from scene_qa.gemini_agent import GeminiSceneQaAgent, sanitize_proxy_environment  # noqa: E402
 from scene_qa.graph_store import GraphStore  # noqa: E402
 from scene_qa.live_query import LiveSceneQueryClient, LiveSceneQueryError  # noqa: E402
+from scene_qa.session_log import SceneQaSessionLog  # noqa: E402
 from scene_qa.tools import create_default_tool_registry, create_live_tool_registry  # noqa: E402
 import roomie_scene_qa  # noqa: E402
 import roomie_scene_qa_viewer  # noqa: E402
 from roomie_scene_qa_viewer import (  # noqa: E402
+    ProgressLog,
+    QaRuntime,
     highlight_groups_from_history,
     live_graph_payload,
 )
@@ -237,6 +240,30 @@ class SceneQaToolTests(unittest.TestCase):
         nearby_ids = [obj["object_id"] for obj in nearby.response["objects"]]
         self.assertEqual(nearby_ids, [1, 2])
 
+    def test_list_rooms_treats_missing_hierarchy_as_one_implicit_room(self) -> None:
+        raw_root = dict(self.graph.raw_root)
+        raw_root["rooms"] = []
+        raw_root["relations"] = []
+        raw_root["objects"] = [
+            {**item, "parent_room_ids": []}
+            for item in self.graph.raw_root["objects"]
+        ]
+        graph = GraphStore(self.json_path, raw_root)
+        search = ObjectSearchIndex(
+            graph,
+            model_path=self.config.embedding_model,
+            backend="lexical",
+        )
+        registry = create_default_tool_registry(graph, search, self.config)
+
+        result = registry.call_tool("list_rooms", {})
+
+        self.assertEqual(result.response["count"], 1)
+        self.assertFalse(result.response["room_hierarchy_available"])
+        self.assertEqual(result.response["message"], "当前仅有一个房间")
+        self.assertTrue(result.response["rooms"][0]["implicit"])
+        self.assertNotIn("room_id", result.response["rooms"][0])
+
     def test_inspect_snapshot_returns_media_attachment(self) -> None:
         result = self.registry.call_tool(
             "inspect_snapshot",
@@ -245,6 +272,163 @@ class SceneQaToolTests(unittest.TestCase):
         self.assertTrue(result.response["image_attached"])
         self.assertEqual(len(result.media), 1)
         self.assertEqual(result.media[0].mime_type, "image/jpeg")
+
+    def test_scene_qa_session_log_persists_multi_turn_trace_and_errors(self) -> None:
+        log_dir = Path(self.tmp.name) / "scene_qa_logs"
+        session_log = SceneQaSessionLog(
+            log_dir,
+            metadata={"mode": "live", "service": "/roomie/query_scene"},
+            started_time_s=1.0,
+        )
+        trace = {
+            "provider": "gemini",
+            "model": "gemini-test-model",
+            "iterations": [
+                {
+                    "iteration": 1,
+                    "model_text": "",
+                    "function_calls": [
+                        {
+                            "name": "list_rooms",
+                            "args": {},
+                            "response": {"count": 1, "message": "当前仅有一个房间"},
+                        }
+                    ],
+                },
+                {
+                    "iteration": 2,
+                    "model_text": '{"answer":"当前仅有一个房间"}',
+                    "function_calls": [],
+                },
+            ],
+        }
+        session_log.record_turn(
+            query="有几个房间？",
+            provider="gemini",
+            model="gemini-test-model",
+            started_time_s=2.0,
+            completed_time_s=3.0,
+            response={
+                "reasoning": "list_rooms returned one implicit room",
+                "answer": "当前仅有一个房间",
+                "raw_text": '{"answer":"当前仅有一个房间"}',
+            },
+            history=trace,
+            progress_events=[{"phase": "tool_done", "tool": "list_rooms"}],
+        )
+        session_log.record_turn(
+            query="房间里有什么？",
+            provider="doubao",
+            model="doubao-test-model",
+            started_time_s=4.0,
+            completed_time_s=5.0,
+            history={"iterations": []},
+            error=RuntimeError("provider unavailable"),
+        )
+        session_log.close(ended_time_s=6.0)
+
+        document = json.loads(session_log.path.read_text(encoding="utf-8"))
+        latest = json.loads(session_log.latest_path.read_text(encoding="utf-8"))
+        self.assertEqual(document, latest)
+        self.assertEqual(document["turn_count"], 2)
+        self.assertEqual(
+            [message["role"] for message in document["messages"]],
+            ["user", "assistant", "user", "assistant"],
+        )
+        first_answer = document["messages"][1]
+        self.assertEqual(first_answer["content"], "当前仅有一个房间")
+        tool_call = first_answer["vlm_trace"]["iterations"][0]["function_calls"][0]
+        self.assertEqual(tool_call["name"], "list_rooms")
+        self.assertEqual(tool_call["response"]["message"], "当前仅有一个房间")
+        self.assertEqual(document["messages"][3]["status"], "error")
+        self.assertEqual(
+            document["messages"][3]["error"]["message"],
+            "provider unavailable",
+        )
+        self.assertIsNotNone(document["ended_at"])
+
+    def test_scene_qa_session_log_checkpoints_running_turn(self) -> None:
+        session_log = SceneQaSessionLog(
+            Path(self.tmp.name) / "checkpoint_logs",
+            started_time_s=1.0,
+        )
+        turn = session_log.begin_turn(
+            query="沙发在哪里？",
+            provider="doubao",
+            model="doubao-test-model",
+            started_time_s=2.0,
+        )
+        running = json.loads(session_log.path.read_text(encoding="utf-8"))
+        self.assertEqual(running["messages"][1]["status"], "running")
+
+        trace = {
+            "iterations": [
+                {
+                    "iteration": 1,
+                    "model_text": "",
+                    "function_calls": [
+                        {
+                            "name": "search_objects",
+                            "args": {"description": "沙发"},
+                            "response": {"count": 1},
+                        }
+                    ],
+                }
+            ]
+        }
+        self.assertTrue(
+            session_log.checkpoint_turn(
+                turn,
+                history=trace,
+                checkpoint_time_s=3.0,
+            )
+        )
+        checkpoint = json.loads(session_log.path.read_text(encoding="utf-8"))
+        call = checkpoint["messages"][1]["vlm_trace"]["iterations"][0][
+            "function_calls"
+        ][0]
+        self.assertEqual(call["name"], "search_objects")
+        self.assertTrue(
+            session_log.finish_turn(
+                turn,
+                started_time_s=2.0,
+                history=trace,
+                error=RuntimeError("question was reset"),
+                status="reset",
+                completed_time_s=4.0,
+            )
+        )
+        finished = json.loads(session_log.path.read_text(encoding="utf-8"))
+        self.assertEqual(finished["messages"][1]["status"], "reset")
+
+    def test_resettable_runtime_cancels_and_checkpoints_active_turn(self) -> None:
+        session_log = SceneQaSessionLog(
+            Path(self.tmp.name) / "runtime_logs",
+            started_time_s=1.0,
+        )
+        progress = ProgressLog()
+        runtime = QaRuntime(1, session_log, progress)
+        turn = session_log.begin_turn(
+            query="卡住的问题",
+            provider="doubao",
+            model="doubao-test-model",
+            started_time_s=2.0,
+        )
+        runtime.activate_turn(turn, started_time_s=2.0, progress_after=0)
+        runtime.checkpoint_history(
+            {"iterations": [{"iteration": 1, "model_text": "planning"}]}
+        )
+
+        runtime.cancel()
+
+        self.assertTrue(runtime.cancel_event.is_set())
+        document = json.loads(session_log.path.read_text(encoding="utf-8"))
+        assistant = document["messages"][1]
+        self.assertEqual(assistant["status"], "reset")
+        self.assertEqual(
+            assistant["vlm_trace"]["iterations"][0]["model_text"],
+            "planning",
+        )
 
     def test_gemini_loop_executes_local_tool_with_fake_client(self) -> None:
         class FakeCall:
@@ -388,6 +572,10 @@ class SceneQaToolTests(unittest.TestCase):
         self.assertEqual(response.answer, "object 1 is the yellow bottle")
         self.assertEqual(response.history["provider"], "doubao")
         self.assertEqual(response.history["model"], "doubao-test-model")
+        self.assertEqual(
+            response.history["iterations"][0]["function_calls"][0]["call_id"],
+            "call-search",
+        )
         self.assertEqual(len(fake_client.calls), 2)
         self.assertEqual(
             fake_client.calls[0]["url"],
@@ -477,6 +665,14 @@ class FakeLiveQueryTransport:
         self.requests: list[dict] = []
         self.session_number = 0
         self.expire_calls = False
+        self.failure_status: str | None = None
+        self.rooms_result = [
+            {
+                "room_id": "kitchen",
+                "name": "Kitchen",
+                "object_ids": [1],
+            }
+        ]
 
     def __call__(self, payload: dict) -> dict:
         self.requests.append(json.loads(json.dumps(payload)))
@@ -499,11 +695,12 @@ class FakeLiveQueryTransport:
                 },
                 "calls": [],
             }
-        if self.expire_calls:
+        if self.expire_calls or self.failure_status:
+            status = self.failure_status or "expired_session"
             return {
                 "success": False,
-                "status": "expired_session",
-                "error": "read session expired",
+                "status": status,
+                "error": f"scene query failed with {status}",
                 "session_id": payload.get("session_id"),
             }
         self.assert_session_request(payload)
@@ -526,13 +723,7 @@ class FakeLiveQueryTransport:
             elif method == "get_objects_near":
                 result = [self.object_result(1, "yellow bottle", [1.0, 0.0, 0.5])]
             elif method == "rooms":
-                result = [
-                    {
-                        "room_id": "kitchen",
-                        "name": "Kitchen",
-                        "object_ids": [1],
-                    }
-                ]
+                result = self.rooms_result
             elif method == "inspect_snapshot":
                 result = {
                     "object": self.object_result(1, "yellow bottle", [1.0, 0.0, 0.5]),
@@ -615,6 +806,28 @@ class LiveSceneQaTests(unittest.TestCase):
         registry.end_answer()
         self.assertIsNone(self.client.session_id)
 
+    def test_live_list_rooms_treats_missing_hierarchy_as_one_room(self) -> None:
+        self.transport.rooms_result = []
+        registry = create_live_tool_registry(self.client, self.config)
+        registry.begin_answer()
+
+        result = registry.call_tool("list_rooms", {})
+
+        self.assertEqual(result.response["count"], 1)
+        self.assertFalse(result.response["room_hierarchy_available"])
+        self.assertEqual(result.response["message"], "当前仅有一个房间")
+        self.assertTrue(result.response["rooms"][0]["implicit"])
+        registry.end_answer()
+
+    def test_live_registry_propagates_nonrecoverable_transport_error(self) -> None:
+        self.transport.failure_status = "service_timeout"
+        registry = create_live_tool_registry(self.client, self.config)
+
+        with self.assertRaises(LiveSceneQueryError) as context:
+            registry.call_tool("list_rooms", {})
+
+        self.assertEqual(context.exception.status, "service_timeout")
+
     def test_one_gemini_answer_uses_one_live_read_session(self) -> None:
         class FakeCall:
             def __init__(self, name: str, args: dict):
@@ -675,6 +888,104 @@ class LiveSceneQaTests(unittest.TestCase):
             self.assertEqual(request["session_id"], "opaque-1")
             self.assertEqual(request["expected_scene_revision"], 77)
         self.assertIsNone(self.client.session_id)
+
+    def test_terminal_session_error_stops_after_first_tool_call(self) -> None:
+        self.transport.expire_calls = True
+
+        class FakeCall:
+            name = "search_objects"
+            args = {"description": "沙发"}
+
+        class FakeResponse:
+            text = ""
+            function_calls = [FakeCall()]
+            candidates = []
+            parts = []
+
+        class FakeModels:
+            def __init__(models_self) -> None:
+                models_self.calls = 0
+
+            def generate_content(models_self, **_kwargs):
+                self.assertEqual(self.transport.requests, [])
+                models_self.calls += 1
+                return FakeResponse()
+
+        class FakeGeminiClient:
+            def __init__(client_self) -> None:
+                client_self.models = FakeModels()
+
+        fake_client = FakeGeminiClient()
+        history_checkpoints: list[dict] = []
+        registry = create_live_tool_registry(self.client, self.config)
+        agent = GeminiSceneQaAgent(
+            None,
+            registry,
+            self.config,
+            client=fake_client,
+            history_callback=history_checkpoints.append,
+        )
+
+        with self.assertRaises(LiveSceneQueryError) as context:
+            agent.answer_query("沙发在哪里？")
+
+        self.assertEqual(context.exception.status, "expired_session")
+        self.assertEqual(fake_client.models.calls, 1)
+        history = getattr(context.exception, "scene_qa_history")
+        failed_call = history["iterations"][0]["function_calls"][0]
+        self.assertEqual(failed_call["name"], "search_objects")
+        self.assertEqual(failed_call["response"]["status"], "expired_session")
+        self.assertGreaterEqual(len(history_checkpoints), 3)
+
+    def test_doubao_terminal_session_error_does_not_replan(self) -> None:
+        self.transport.expire_calls = True
+
+        class FakeHttpResponse:
+            status_code = 200
+
+            def json(response_self) -> dict:
+                return {
+                    "id": "resp-tool",
+                    "output": [
+                        {
+                            "type": "function_call",
+                            "call_id": "call-search",
+                            "name": "search_objects",
+                            "arguments": json.dumps({"description": "沙发"}),
+                        }
+                    ],
+                }
+
+        class FakeHttpClient:
+            def __init__(client_self) -> None:
+                client_self.calls = 0
+
+            def post(client_self, *_args, **_kwargs):
+                self.assertEqual(self.transport.requests, [])
+                client_self.calls += 1
+                return FakeHttpResponse()
+
+        fake_http = FakeHttpClient()
+        registry = create_live_tool_registry(self.client, self.config)
+        agent = DoubaoSceneQaAgent(
+            None,
+            registry,
+            self.config,
+            api_key="test-key",
+            client=fake_http,
+        )
+
+        with self.assertRaises(LiveSceneQueryError) as context:
+            agent.answer_query("沙发在哪里？")
+
+        self.assertEqual(context.exception.status, "expired_session")
+        self.assertEqual(fake_http.calls, 1)
+        history = getattr(context.exception, "scene_qa_history")
+        self.assertEqual(len(history["iterations"]), 1)
+        self.assertEqual(
+            history["iterations"][0]["function_calls"][0]["response"]["status"],
+            "expired_session",
+        )
 
     def test_cli_defaults_to_live_and_offline_requires_explicit_flag(self) -> None:
         with patch.object(sys, "argv", ["roomie_scene_qa.py"]):
@@ -779,8 +1090,13 @@ class LiveSceneQaTests(unittest.TestCase):
         self.assertIsNone(args.offline_json)
         self.assertEqual(args.service, "/roomie/query_scene")
         self.assertEqual(args.default_provider, "gemini")
+        self.assertFalse(hasattr(args, "session_ttl_ms"))
+        self.assertFalse(hasattr(args, "log_dir"))
+        self.assertEqual(roomie_scene_qa_viewer.LIVE_READ_SESSION_TTL_MS, 300_000)
         self.assertIn('data-provider="gemini"', roomie_scene_qa_viewer.HTML)
         self.assertIn('data-provider="doubao"', roomie_scene_qa_viewer.HTML)
+        self.assertIn('id="resetBtn"', roomie_scene_qa_viewer.HTML)
+        self.assertIn("fetch('/reset'", roomie_scene_qa_viewer.HTML)
         self.assertIn("JSON.stringify({query, provider})", roomie_scene_qa_viewer.HTML)
         payload = live_graph_payload(args.service)
         self.assertTrue(payload["live"])

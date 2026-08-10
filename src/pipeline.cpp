@@ -10,6 +10,8 @@
 #include <utility>
 #include <vector>
 
+#include <ament_index_cpp/get_package_share_directory.hpp>
+
 #include "roomie/dsg/object_graph_io.hpp"
 #include "roomie/artifacts/python_dam_worker.hpp"
 #include "roomie/artifacts/python_embedding_encoder.hpp"
@@ -19,6 +21,17 @@
 
 namespace roomie {
 namespace {
+
+std::filesystem::path resolveRobotMaskConfigPath(
+    const std::string& configured_path) {
+  std::filesystem::path path(configured_path);
+  if (path.is_absolute()) {
+    return path;
+  }
+  return std::filesystem::path(
+             ament_index_cpp::get_package_share_directory("roomie")) /
+         "config" / "robots" / path;
+}
 
 GeometrySchedulerConfig geometrySchedulerConfig(
     const PipelineConfig& config) {
@@ -1029,7 +1042,6 @@ RoomiePipeline::RoomiePipeline(
   mapping_camera.camera_id = config_.mapping_camera_id;
   mapping_camera.camera_frame = config_.mapping_camera_frame;
   mapping_camera.rgb_topic = config_.rgb_topic;
-  mapping_camera.robot_mask_topic = config_.mask_topic;
   mapping_camera.depth_topic = config_.depth_topic;
   mapping_camera.camera_info_topic = config_.camera_info_topic;
   mapping_camera.fallback_intrinsics.width = config_.camera_width;
@@ -1041,7 +1053,6 @@ RoomiePipeline::RoomiePipeline(
   mapping_camera.depth_scale = config_.depth_scale;
   mapping_camera.depth_min_m = config_.depth_min_m;
   mapping_camera.depth_max_m = config_.depth_max_m;
-  mapping_camera.mask_robot_threshold = config_.mask_robot_threshold;
   mapping_camera.enable_mapping = !config_.freeze_tsdf_map;
   mapping_camera.enable_detection = config_.detection_enabled;
 
@@ -1068,6 +1079,17 @@ RoomiePipeline::RoomiePipeline(
         detection_bridge_thread_.cancelPendingCandidate(frame, reason);
         map_thread_.cancelPerceptionCandidate(frame, reason);
       };
+  RobotMaskGeneratorConfig robot_mask_config;
+  robot_mask_config.robot_config =
+      resolveRobotMaskConfigPath(config_.robot_mask_robot_config);
+  robot_mask_config.camera_config =
+      resolveRobotMaskConfigPath(config_.robot_mask_camera_config);
+  robot_mask_config.reuse_translation_epsilon_m =
+      config_.robot_mask_reuse_translation_epsilon_m;
+  robot_mask_config.reuse_rotation_epsilon_rad =
+      config_.robot_mask_reuse_rotation_epsilon_rad;
+  ros_io_config.robot_mask_generator =
+      std::make_shared<RobotMaskGenerator>(std::move(robot_mask_config));
   ros_io_config.cameras.push_back(std::move(mapping_camera));
   ros_io_thread_.configure(std::move(ros_io_config));
   ros_io_thread_.attachNode(node);

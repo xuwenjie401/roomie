@@ -1,0 +1,47 @@
+{
+  "owl": {
+    "default": 0.25,
+    "labels": {
+      "medicine_carton": 0.15,
+      "printed_carton": 0.15,
+      "labeled_package": 0.15,
+      "plastic_bag": 0.15,
+      "box": 0.2,
+      "bottle_cap": 0.15,
+      "bottled_water": 0.15,
+
+      "writing_board": 0.55,
+      "speaker": 0.6
+    }
+  },
+  "boxernet": {
+    "default": 0.35,
+    "labels": {
+      "medicine_carton": 0.15,
+      "printed_carton": 0.15,
+      "labeled_package": 0.15,
+      "plastic_bag": 0.15,
+      "box": 0.2,
+      "bottle_cap": 0.15,
+      "bottled_water": 0.15,
+
+      "writing_board": 0.55,
+      "speaker": 0.6
+    }
+  },
+  "instance": {
+    "default": 0.35,
+    "labels": {
+      "medicine_carton": 0.25,
+      "printed_carton": 0.25,
+      "labeled_package": 0.25,
+      "plastic_bag": 0.25,
+      "box": 0.3,
+      "bottle_cap": 0.25,
+      "bottled_water": 0.25,
+
+      "writing_board": 0.55,
+      "speaker": 0.6
+    }
+  }
+}

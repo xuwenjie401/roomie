@@ -61,7 +61,6 @@ def generate_launch_description() -> LaunchDescription:
     qa_python = LaunchConfiguration("qa_python")
     qa_config = LaunchConfiguration("qa_config")
     qa_service = LaunchConfiguration("qa_service")
-    qa_session_ttl_ms = LaunchConfiguration("qa_session_ttl_ms")
     qa_service_timeout_sec = LaunchConfiguration("qa_service_timeout_sec")
     qa_host = LaunchConfiguration("qa_host")
     qa_port = LaunchConfiguration("qa_port")
@@ -94,8 +93,6 @@ def generate_launch_description() -> LaunchDescription:
             qa_config,
             "--service",
             qa_service,
-            "--session-ttl-ms",
-            qa_session_ttl_ms,
             "--service-timeout-sec",
             qa_service_timeout_sec,
             "--host",
@@ -161,7 +158,6 @@ def generate_launch_description() -> LaunchDescription:
                 description="Gemini/Doubao models, prompt, and Scene QA runtime config.",
             ),
             DeclareLaunchArgument("qa_service", default_value="/roomie/query_scene"),
-            DeclareLaunchArgument("qa_session_ttl_ms", default_value="30000"),
             DeclareLaunchArgument("qa_service_timeout_sec", default_value="10.0"),
             DeclareLaunchArgument("qa_host", default_value="127.0.0.1"),
             DeclareLaunchArgument("qa_port", default_value="8776"),

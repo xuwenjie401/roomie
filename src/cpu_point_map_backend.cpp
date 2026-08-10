@@ -19,8 +19,7 @@ bool isRobotMaskedPixel(const ImageBuffer& mask,
                         int x,
                         int y,
                         int image_width,
-                        int image_height,
-                        int threshold) {
+                        int image_height) {
   if (mask.empty() || mask.width <= 0 || mask.height <= 0 || mask.channels <= 0) {
     return false;
   }
@@ -41,7 +40,7 @@ bool isRobotMaskedPixel(const ImageBuffer& mask,
   if (offset >= mask.data.size()) {
     return false;
   }
-  return static_cast<int>(mask.data[offset]) > threshold;
+  return mask.data[offset] > 0U;
 }
 
 }  // namespace
@@ -184,12 +183,8 @@ void CpuPointMapBackend::appendDepthFramePoints(const FrameBundle& frame) {
 
     const int y = static_cast<int>(linear / static_cast<std::size_t>(width));
     const int x = static_cast<int>(linear % static_cast<std::size_t>(width));
-    if (frame.robot_mask && isRobotMaskedPixel(*frame.robot_mask,
-                           x,
-                           y,
-                           width,
-                           height,
-                           config_.mask_robot_threshold)) {
+    if (frame.robot_mask &&
+        isRobotMaskedPixel(*frame.robot_mask, x, y, width, height)) {
       continue;
     }
     const Eigen::Vector3f point_camera(

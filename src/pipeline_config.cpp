@@ -1,6 +1,8 @@
 #include "roomie/pipeline/pipeline_config.hpp"
 
 #include <algorithm>
+#include <cmath>
+#include <stdexcept>
 
 namespace roomie {
 
@@ -38,8 +40,6 @@ PipelineConfig PipelineConfig::declareAndLoad(rclcpp::Node& node) {
       node.declare_parameter<std::string>("topics.color_topic", config.rgb_topic);
   config.depth_topic =
       node.declare_parameter<std::string>("topics.depth_topic", config.depth_topic);
-  config.mask_topic =
-      node.declare_parameter<std::string>("topics.mask_topic", config.mask_topic);
   config.camera_info_topic = node.declare_parameter<std::string>(
       "topics.camera_info_topic", config.camera_info_topic);
   config.tf_topic =
@@ -74,6 +74,31 @@ PipelineConfig PipelineConfig::declareAndLoad(rclcpp::Node& node) {
   config.camera_cy =
       static_cast<float>(node.declare_parameter<double>("camera.cy", config.camera_cy));
 
+  config.robot_mask_robot_config = node.declare_parameter<std::string>(
+      "robot_mask.robot_config", config.robot_mask_robot_config);
+  config.robot_mask_camera_config = node.declare_parameter<std::string>(
+      "robot_mask.camera_config", config.robot_mask_camera_config);
+  config.robot_mask_reuse_translation_epsilon_m =
+      node.declare_parameter<double>(
+          "robot_mask.reuse_translation_epsilon_m",
+          config.robot_mask_reuse_translation_epsilon_m);
+  config.robot_mask_reuse_rotation_epsilon_rad =
+      node.declare_parameter<double>(
+          "robot_mask.reuse_rotation_epsilon_rad",
+          config.robot_mask_reuse_rotation_epsilon_rad);
+  if (config.robot_mask_robot_config.empty() ||
+      config.robot_mask_camera_config.empty()) {
+    throw std::invalid_argument(
+        "robot_mask robot_config and camera_config must not be empty");
+  }
+  if (!std::isfinite(config.robot_mask_reuse_translation_epsilon_m) ||
+      !std::isfinite(config.robot_mask_reuse_rotation_epsilon_rad) ||
+      config.robot_mask_reuse_translation_epsilon_m < 0.0 ||
+      config.robot_mask_reuse_rotation_epsilon_rad < 0.0) {
+    throw std::invalid_argument(
+        "robot_mask reuse thresholds must be finite and non-negative");
+  }
+
   config.depth_min_m = positiveFloatOrDefault(
       node.declare_parameter<double>("input_filter.depth_min_m", config.depth_min_m),
       config.depth_min_m);
@@ -86,8 +111,6 @@ PipelineConfig PipelineConfig::declareAndLoad(rclcpp::Node& node) {
   config.depth_scale = positiveFloatOrDefault(
       node.declare_parameter<double>("input_filter.depth_scale", config.depth_scale),
       config.depth_scale);
-  config.mask_robot_threshold = node.declare_parameter<int>(
-      "input_filter.mask_robot_threshold", config.mask_robot_threshold);
 
   config.map_backend =
       node.declare_parameter<std::string>("tsdf.map_backend", config.map_backend);
@@ -192,8 +215,12 @@ PipelineConfig PipelineConfig::declareAndLoad(rclcpp::Node& node) {
       "detection.inference_device", config.inference_device);
   config.inference_precision = node.declare_parameter<std::string>(
       "detection.inference_precision", config.inference_precision);
+  config.text_prompt_file = node.declare_parameter<std::string>(
+      "detection.text_prompt_file", config.text_prompt_file);
   config.text_prompts = node.declare_parameter<std::vector<std::string>>(
       "detection.text_prompts", config.text_prompts);
+  config.label_thresholds_file = node.declare_parameter<std::string>(
+      "detection.label_thresholds_file", config.label_thresholds_file);
   config.owl_min_confidence = static_cast<float>(std::clamp(
       node.declare_parameter<double>("detection.owl_min_confidence",
                                      config.owl_min_confidence),
@@ -231,6 +258,8 @@ PipelineConfig PipelineConfig::declareAndLoad(rclcpp::Node& node) {
                                      config.instance_min_confidence),
       0.0,
       1.0));
+  config.instance_label_thresholds = loadLabelConfidenceThresholds(
+      config.label_thresholds_file, "instance");
   config.instance_object_min_confidence = static_cast<float>(std::clamp(
       node.declare_parameter<double>("instance.object_min_confidence",
                                      config.instance_object_min_confidence),

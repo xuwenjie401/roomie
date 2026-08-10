@@ -8,6 +8,7 @@ from pathlib import Path
 import sys
 
 import numpy as np
+import yaml
 
 
 ROOMIE_ROOT = Path(__file__).resolve().parents[1]
@@ -23,6 +24,50 @@ CALIBRATION_PATH = Path(
     "/home/lindenbot/sensor_base/agibot_genie/"
     "roomie_base/calib/head_camera_params.yaml"
 )
+
+
+def _roomie_parameters(path: Path) -> dict:
+    document = yaml.safe_load(path.read_text(encoding="utf-8"))
+    return document["roomie_pipeline_node"]["ros__parameters"]
+
+
+def test_roomie_owns_robot_mask_generation_contract() -> None:
+    adapter_params = yaml.safe_load(
+        (ROOMIE_ROOT / "config" / "agibot_head_rgbd_adapter.yaml").read_text(
+            encoding="utf-8"
+        )
+    )["roomie_agibot_head_rgbd_adapter"]["ros__parameters"]
+    assert "output_mask_topic" not in adapter_params
+    assert "publish_zero_robot_mask" not in adapter_params
+
+    for name in (
+        "pipeline_genie_live.yaml",
+        "pipeline_genie_load.yaml",
+        "pipeline_agibot_head_mapping.yaml",
+    ):
+        params = _roomie_parameters(ROOMIE_ROOT / "config" / name)
+        assert "mask_topic" not in params["topics"]
+        assert "mask_robot_threshold" not in params["input_filter"]
+        assert params["robot_mask"] == {
+            "robot_config": "G2/robot.yaml",
+            "camera_config": "G2/cameras.yaml",
+            "reuse_translation_epsilon_m": 5.0e-6,
+            "reuse_rotation_epsilon_rad": 5.0e-6,
+        }
+
+    camera_document = yaml.safe_load(
+        (ROOMIE_ROOT / "config" / "robots" / "G2" / "cameras.yaml").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert set(camera_document["cameras"]) == {
+        "head_color",
+        "hand_left_color",
+        "hand_right_color",
+    }
+    for camera in camera_document["cameras"].values():
+        assert camera["topic"].endswith("/image_rect")
+        assert camera["distortion"]["coefficients"] == [0.0] * 5
 
 
 def test_loads_head_color_depth_calibration() -> None:

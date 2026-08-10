@@ -208,7 +208,6 @@ struct DepthBuffer {
 
 struct SyncDiagnostics {
   TimeNanoseconds rgb_depth_delta_ns = 0;
-  TimeNanoseconds rgb_mask_delta_ns = 0;
   TimeNanoseconds tf_delta_ns = 0;
   bool used_latest_tf_fallback = false;
 };

@@ -34,7 +34,7 @@ Gemini 依次读取 `--api-key`、`GEMINI_API_KEY`、`GOOGLE_API_KEY`；Doubao �
 `--doubao-api-key`、`DOUBAO_API_KEY`、`doubao_api_key`、`ARK_API_KEY`。如果 key
 已经在 `.bashrc` 中通过 `export` 设置，打开新终端后 launch 会直接继承，不要再把它
 写到 launch 参数或命令历史里。在线问答还需要能够访问相应 API 并具有模型配额。
-Doubao 默认模型和地址为 `doubao-seed-2-0-lite-260215`、
+Doubao 默认模型和地址为 `doubao-seed-2-1-pro-260628`、
 `https://ark.cn-beijing.volces.com/api/v3`，都可在
 `config/scene_qa/config.json` 中修改。ROS 2 Humble
 继续使用系统 Python 3.10；QA 程序会自动通过系统 Python 子进程访问
@@ -84,16 +84,27 @@ AgiBot 头部相机映射的参考配置：
 开始运行前，应检查以下配置项：
 
 ```yaml
-world:
-  frame_id: map
+basic:
+  world_frame: map
 
 topics:
-  color_image: /roomie/input/head_color/image_rect
-  depth_image: /roomie/input/head_color/depth_registered
-  robot_mask: /roomie/input/head_color/robot_mask
-  camera_info: /roomie/input/head_color/camera_info
-  tf: /tf
+  color_topic: /roomie/input/head_color/image_rect
+  depth_topic: /roomie/input/head_color/depth_registered
+  camera_info_topic: /roomie/input/head_color/camera_info
+  tf_topic: /tf
+
+robot_mask:
+  robot_config: G2/robot.yaml
+  camera_config: G2/cameras.yaml
+  reuse_translation_epsilon_m: 0.000005
+  reuse_rotation_epsilon_rad: 0.000005
 ```
+
+输入图像必须是与相机 profile 完全一致的 rectified pinhole 图像。Roomie 不再订阅
+mask topic，而是在每个 RGB 时间戳上用 G2 内部 TF 直接生成 mask；每个相机拥有独立
+缓存。精确时刻的内部 TF 不完整时，该帧会等待后续 TF，若期间 RGB 已更新则丢弃旧帧。
+后续增加 `hand_left_color` 或 `hand_right_color` 时，应为各自的 rectified 图像建立独立
+相机订阅，mask 生成与缓存仍按 camera id 隔离。
 
 还需要检查所有本机路径：
 
@@ -124,7 +135,7 @@ ros2 launch roomie roomie_pipeline.launch.py \
   show_manual_rooms:=true
 ```
 
-注意：默认的 `pipeline_nvblox.yaml` 包含当前机器的绝对路径，并可能配置为加载已有地图，使用前应先检查。
+默认使用 `pipeline_genie_live.yaml`。其中仍包含当前机器的模型和输出路径，使用前应先检查。
 
 ### 4.2 AgiBot 建图模式
 
@@ -225,7 +236,6 @@ Gemini/Doubao 并输入问题，中间显示从工具结果获得的对象几何
 | `qa_python` | `jarvis` 环境 Python | Gemini 需要包含 `google-genai`；Doubao 无额外 SDK |
 | `qa_config` | 包内 `config/scene_qa/config.json` | Gemini/Doubao 模型、system prompt 和 QA 参数 |
 | `qa_service` | `/roomie/query_scene` | live QueryScene 服务名 |
-| `qa_session_ttl_ms` | `30000` | 单个回答固定场景版本的 session TTL |
 | `qa_service_timeout_sec` | `10.0` | 服务发现和调用超时 |
 | `qa_host` | `127.0.0.1` | Web 服务监听地址 |
 | `qa_port` | `8776` | Web 服务端口；设为 `0` 可由系统分配 |
@@ -553,6 +563,24 @@ ros2 run roomie roomie_scene_qa_viewer.py --live
 实时进度与每轮场景工具调用；Gemini/Doubao 按钮决定下一问使用哪个 provider。
 一次只执行一个问题；并发请求会返回 HTTP 409，
 避免多个请求共享同一 live read-session transport。
+
+live read session 在 VLM 第一次调用场景工具时才创建，TTL 固定为 300 秒，避免首轮
+模型规划时间消耗 session。session、transport 和响应格式等不可恢复错误会立即终止
+当前问答，不会继续交给模型反复重试。页面上的 `Reset QA` 可以丢弃当前阻塞问答并
+切换到新的 agent/read-session generation；旧请求稍后返回时结果也不会进入新问答。
+
+每次 Web viewer 启动都会在 `logs/scene_qa/` 创建
+`conversation_<时间>_pid<进程号>.json`，并原子更新 `latest.json`。单个文件以交替的
+`user`/`assistant` messages 保存该进程接收的全部问题；每条 assistant message 包含
+provider、model、最终 reasoning/answer/raw text、耗时、progress events 和
+`vlm_trace`。`vlm_trace.iterations` 按实际顺序记录每轮可见模型文本，以及工具调用的
+名称、call id（provider 提供时）、参数、完整 JSON 返回和媒体摘要。日志在问题开始、
+每轮 VLM 输出和每次工具返回后原子 checkpoint；失败或 Reset 的问答分别写为
+`status: "error"` 或 `status: "reset"`，并保留此前完成的 iteration。日志不会保存 API key，
+也不会包含模型不可见的内部 chain-of-thought。
+
+该 JSON 是同一 viewer 进程的多轮审计记录；当前问答推理仍是逐题独立的，前一问文本
+不会自动作为下一问的 VLM 上下文。
 
 ### 11.3 离线问答
 

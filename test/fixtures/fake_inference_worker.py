@@ -4,6 +4,7 @@
 import os
 import signal
 import struct
+import sys
 import time
 
 
@@ -24,6 +25,21 @@ def read_exact(size: int) -> bytes:
         chunks.append(chunk)
         remaining -= len(chunk)
     return b"".join(chunks)
+
+
+expected_threshold_file = os.environ.get(
+    "ROOMIE_FAKE_WORKER_EXPECT_LABEL_THRESHOLD_FILE", ""
+)
+if expected_threshold_file:
+    flag = "--label-thresholds-file"
+    if flag not in sys.argv:
+        raise RuntimeError(f"missing expected worker argument: {flag}")
+    value_index = sys.argv.index(flag) + 1
+    if (
+        value_index >= len(sys.argv)
+        or sys.argv[value_index] != expected_threshold_file
+    ):
+        raise RuntimeError(f"unexpected value for worker argument: {flag}")
 
 
 mode = os.environ.get("ROOMIE_FAKE_WORKER_MODE", "hang_after_request")
