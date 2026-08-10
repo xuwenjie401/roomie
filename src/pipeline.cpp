@@ -1360,6 +1360,109 @@ SceneMutationSubmitResult RoomiePipeline::mutateScene(
   return response;
 }
 
+FurnitureGraphRebuildResult RoomiePipeline::rebuildFurnitureGraph(
+    std::chrono::milliseconds timeout) {
+  std::lock_guard<std::mutex> mutation_lock(scene_mutation_mutex_);
+  FurnitureGraphRebuildResult result;
+  SceneMutationSubmitResult& response = result.submission;
+  if (timeout < std::chrono::milliseconds::zero()) {
+    timeout = std::chrono::milliseconds::zero();
+  }
+
+  const auto fill_counts = [&result](const SceneSnapshot& snapshot) {
+    result.furniture_count = snapshot.graphMetadata().furniture.size();
+    for (const SceneRelation& relation :
+         snapshot.graphMetadata().relations) {
+      if (!isDerivedFurnitureRelation(relation)) {
+        continue;
+      }
+      if (relation.relation_type == "in") {
+        ++result.in_relation_count;
+      } else if (relation.relation_type == "on") {
+        ++result.on_relation_count;
+      } else if (relation.relation_type == "room_contains_furniture") {
+        ++result.room_relation_count;
+      }
+    }
+  };
+
+  if (persistence_actor_ && !persistence_actor_->admissionAllowed()) {
+    const SceneSnapshot current = instance_map_thread_.sceneSnapshot();
+    const PersistenceActorStatus persistence = persistence_actor_->status();
+    response.status = SceneMutationStatus::kUnavailable;
+    response.latest_scene_revision = current.revision();
+    response.durable_scene_revision = persistence.durable_scene_revision;
+    response.message =
+        "furniture rebuild admission is closed because persistence cannot "
+        "accept another authoritative revision";
+    if (!persistence.last_error.empty()) {
+      response.message += ": " + persistence.last_error;
+    }
+    fill_counts(current);
+    return result;
+  }
+
+  const auto started = std::chrono::steady_clock::now();
+  const std::optional<SceneApplyResult> applied =
+      instance_map_thread_.applySceneCommandAndWait(
+          SceneCommand{RebuildFurnitureGraphCommand{}}, timeout);
+  if (!applied) {
+    const SceneSnapshot current = instance_map_thread_.sceneSnapshot();
+    response.status = SceneMutationStatus::kTimeout;
+    response.message =
+        "scene reducer did not acknowledge the furniture rebuild before "
+        "the deadline; the outcome is unknown";
+    response.latest_scene_revision = current.revision();
+    response.durable_scene_revision =
+        persistence_actor_ ? persistence_actor_->durableRevision()
+                           : current.durableRevision();
+    fill_counts(current);
+    return result;
+  }
+
+  response.latest_scene_revision = applied->revision;
+  response.durable_scene_revision =
+      persistence_actor_ ? persistence_actor_->durableRevision()
+                         : applied->snapshot.durableRevision();
+  response.message = applied->reason;
+  fill_counts(applied->snapshot);
+  if (!applied->accepted()) {
+    response.status = applied->reason.find("persistence") != std::string::npos
+                          ? SceneMutationStatus::kUnavailable
+                          : SceneMutationStatus::kRejected;
+    return result;
+  }
+  if (!applied->committedRevision()) {
+    response.status = SceneMutationStatus::kNoOp;
+    return result;
+  }
+
+  response.status = SceneMutationStatus::kCommitted;
+  response.committed_scene_revision = applied->revision;
+  if (!persistence_actor_) {
+    return result;
+  }
+  const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+      std::chrono::steady_clock::now() - started);
+  const std::chrono::milliseconds remaining =
+      elapsed < timeout ? timeout - elapsed : std::chrono::milliseconds::zero();
+  if (persistence_actor_->waitUntilDurable(applied->revision, remaining)) {
+    response.durable_scene_revision = persistence_actor_->durableRevision();
+    return result;
+  }
+
+  const PersistenceActorStatus persistence = persistence_actor_->status();
+  response.status = SceneMutationStatus::kCommittedNotDurable;
+  response.durable_scene_revision = persistence.durable_scene_revision;
+  response.message =
+      "furniture graph committed in memory but did not become durable before "
+      "the deadline";
+  if (!persistence.last_error.empty()) {
+    response.message += ": " + persistence.last_error;
+  }
+  return result;
+}
+
 void RoomiePipeline::start() {
   if (started_) {
     return;

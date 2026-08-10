@@ -112,7 +112,7 @@ Json nullableString(const std::optional<std::string>& value) {
 }
 
 Json queryObjectJson(const QueryObjectView& object) {
-  return Json{
+  Json result{
       {"requested_object_id", object.requested_object_id},
       {"object_id", object.object_id},
       {"resolved_alias", object.resolved_alias},
@@ -133,11 +133,24 @@ Json queryObjectJson(const QueryObjectView& object) {
       {"indexed_document_hash", nullableString(object.indexed_document_hash)},
       {"snapshot_set_hash", object.snapshot_set_hash},
       {"freshness", objectFreshnessJson(object.freshness)}};
+  result["furniture_role"] =
+      object.furniture_role
+          ? Json{{"object_id", object.furniture_role->object_id},
+                 {"classification_label",
+                  object.furniture_role->classification_label},
+                 {"revision", object.furniture_role->revision}}
+          : Json(nullptr);
+  return result;
 }
 
 Json entityRefJson(const SceneEntityRef& entity) {
-  return Json{{"type", entity.type == SceneEntityType::kRoom ? "room" : "object"},
-              {"id", entity.id}};
+  const char* type = "object";
+  if (entity.type == SceneEntityType::kRoom) {
+    type = "room";
+  } else if (entity.type == SceneEntityType::kFurniture) {
+    type = "furniture";
+  }
+  return Json{{"type", type}, {"id", entity.id}};
 }
 
 Json relationJson(const CanonicalRelation& relation) {
@@ -160,7 +173,17 @@ Json roomJson(const CanonicalRoom& room) {
               {"room_object_id",
                room.room_object_id ? Json(*room.room_object_id) : Json(nullptr)},
               {"attributes", room.attributes},
-              {"object_ids", room.object_ids}};
+              {"object_ids", room.object_ids},
+              {"furniture_ids", room.furniture_ids}};
+}
+
+Json furnitureJson(const QueryFurnitureView& furniture) {
+  return Json{{"role",
+               {{"object_id", furniture.role.object_id},
+                {"classification_label",
+                 furniture.role.classification_label},
+                {"revision", furniture.role.revision}}},
+              {"object", queryObjectJson(furniture.object)}};
 }
 
 Json mapStampJson(const MapStamp& stamp) {
@@ -442,6 +465,15 @@ Json dispatchCall(const Json& call, const LocalSceneQueryHandlers& handlers) {
       rooms.push_back(roomJson(room));
     }
     return makeCallResult(call, method, result, std::move(rooms));
+  }
+
+  if (method == "furniture") {
+    const auto result = handlers.furniture();
+    Json furniture = Json::array();
+    for (const QueryFurnitureView& item : result.value) {
+      furniture.push_back(furnitureJson(item));
+    }
+    return makeCallResult(call, method, result, std::move(furniture));
   }
 
   if (method == "relations") {

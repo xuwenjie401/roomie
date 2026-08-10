@@ -13,8 +13,10 @@ DEFAULT_DESCRIBED_JSON = Path(
 )
 DEFAULT_EMBEDDING_MODEL = Path("/home/lindenbot/hugging_face/sentence_t5_large")
 DEFAULT_GEMINI_MODEL = "gemini-flash-latest"
-DEFAULT_DOUBAO_MODEL = "doubao-seed-2-1-pro-260628"
+DEFAULT_DOUBAO_MODEL = "doubao-seed-2-0-lite-260428"
 DEFAULT_DOUBAO_BASE_URL = "https://ark.cn-beijing.volces.com/api/v3"
+DEFAULT_DOUBAO_THINKING_TYPE = "disabled"
+DOUBAO_THINKING_TYPES = frozenset({"enabled", "disabled", "auto"})
 DEFAULT_QA_CONFIG_NAME = "config.json"
 DEFAULT_SYSTEM_PROMPT_PATH = Path("prompts/system.txt")
 FALLBACK_SYSTEM_PROMPT = """You are a scene understanding assistant for a Roomie 3D scene graph.
@@ -77,6 +79,14 @@ def _float_or_default(value: Any, default: float) -> float:
     return float(value)
 
 
+def _doubao_thinking_type_or_default(value: Any, default: str) -> str:
+    thinking_type = str(value or default).strip().lower()
+    if thinking_type not in DOUBAO_THINKING_TYPES:
+        choices = ", ".join(sorted(DOUBAO_THINKING_TYPES))
+        raise ValueError(f"doubao_thinking_type must be one of: {choices}")
+    return thinking_type
+
+
 @dataclass
 class SceneQaConfig:
     """Runtime settings for the scene QA agent."""
@@ -85,6 +95,7 @@ class SceneQaConfig:
     gemini_model: str = DEFAULT_GEMINI_MODEL
     doubao_model: str = DEFAULT_DOUBAO_MODEL
     doubao_base_url: str = DEFAULT_DOUBAO_BASE_URL
+    doubao_thinking_type: str = DEFAULT_DOUBAO_THINKING_TYPE
     embedding_model: Path = DEFAULT_EMBEDDING_MODEL
     embedding_backend: str = "embedding"
     device: str = "auto"
@@ -140,6 +151,9 @@ class SceneQaConfig:
             doubao_base_url=str(
                 data.get("doubao_base_url") or defaults.doubao_base_url
             ).rstrip("/"),
+            doubao_thinking_type=_doubao_thinking_type_or_default(
+                data.get("doubao_thinking_type"), defaults.doubao_thinking_type
+            ),
             embedding_model=_path_or_default(
                 data.get("embedding_model"), defaults.embedding_model
             ),

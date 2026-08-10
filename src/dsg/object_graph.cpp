@@ -95,13 +95,23 @@ bool ObjectGraph::removeNode(int object_id) {
                                   return node.object_id == object_id;
                                 }),
                  objects_.end());
+  furniture_.erase(
+      std::remove_if(furniture_.begin(), furniture_.end(),
+                     [object_id](const FurnitureRole& role) {
+                       return role.object_id == object_id;
+                     }),
+      furniture_.end());
   relations_.erase(std::remove_if(relations_.begin(),
                                   relations_.end(),
                                   [object_id](const ObjectRelation& relation) {
-                                    const SceneEntityRef endpoint{
-                                        SceneEntityType::kObject, object_id};
-                                    return relationSource(relation) == endpoint ||
-                                           relationTarget(relation) == endpoint;
+                                    const SceneEntityRef source =
+                                        relationSource(relation);
+                                    const SceneEntityRef target =
+                                        relationTarget(relation);
+                                    return (entityBackedByObject(source) &&
+                                            source.id == object_id) ||
+                                           (entityBackedByObject(target) &&
+                                            target.id == object_id);
                                   }),
                    relations_.end());
   return objects_.size() != before;
@@ -110,6 +120,7 @@ bool ObjectGraph::removeNode(int object_id) {
 void ObjectGraph::loadSnapshot(const ObjectGraphSnapshot& snapshot) {
   objects_ = snapshot.objects;
   rooms_ = snapshot.rooms;
+  furniture_ = snapshot.furniture;
   relations_ = snapshot.relations;
   snapshot_images_ = snapshot.snapshot_images;
   import_warnings_ = snapshot.import_warnings;
@@ -126,6 +137,7 @@ ObjectGraphSnapshot ObjectGraph::snapshot() const {
   snapshot.next_object_id = next_object_id_;
   snapshot.objects = objects_;
   snapshot.rooms = rooms_;
+  snapshot.furniture = furniture_;
   snapshot.relations = relations_;
   snapshot.snapshot_images = snapshot_images_;
   snapshot.import_warnings = import_warnings_;

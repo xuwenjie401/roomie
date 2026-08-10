@@ -833,6 +833,7 @@ TEST(SceneStore, CanonicalRoomsTypedRelationsAndWarningsSurviveRestore) {
   room.height_m = 3.0f;
   room.attributes["floor"] = "2";
   command.graph.rooms.push_back(room);
+  command.graph.furniture.push_back(FurnitureRole{1, 5, "chair"});
   ObjectRelation containment;
   setRelationEndpoints(
       &containment,
@@ -867,6 +868,10 @@ TEST(SceneStore, CanonicalRoomsTypedRelationsAndWarningsSurviveRestore) {
   EXPECT_EQ(graph.rooms.front().room_id, 9);
   EXPECT_EQ(graph.rooms.front().revision, 4u);
   EXPECT_EQ(graph.rooms.front().attributes.at("floor"), "2");
+  ASSERT_EQ(graph.furniture.size(), 1U);
+  EXPECT_EQ(graph.furniture.front().object_id, 1);
+  EXPECT_EQ(graph.furniture.front().revision, 5U);
+  EXPECT_EQ(graph.furniture.front().classification_label, "chair");
   ASSERT_EQ(graph.relations.size(), expected_graph.relations.size());
   const auto saved_relation = std::find_if(
       graph.relations.begin(), graph.relations.end(),

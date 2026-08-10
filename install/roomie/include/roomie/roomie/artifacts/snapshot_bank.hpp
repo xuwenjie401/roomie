@@ -1,0 +1,1 @@
+/home/lindenbot/RealityLab/jarvis/src/roomie/include/roomie/artifacts/snapshot_bank.hpp

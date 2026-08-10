@@ -557,6 +557,77 @@ TEST(SceneReducer, RoomAnnotationsOwnCanonicalContainmentAndRecomputeLocally) {
   ASSERT_EQ(removed.snapshot.graphMetadata().rooms.size(), 1U);
 }
 
+TEST(SceneReducer, FurnitureRolesRebuildExplicitlyAndRelationsTrackGeometry) {
+  ReducerCore reducer;
+  ObjectNode table = makeNode(1, "table");
+  table.center_world = Eigen::Vector3f(0.0f, 0.0f, 0.5f);
+  table.size_m = Eigen::Vector3f(1.0f, 1.0f, 1.0f);
+  table.yaw_rad = 0.0f;
+  ObjectNode cup = makeNode(2, "cup");
+  cup.center_world = Eigen::Vector3f(0.0f, 0.0f, 1.1f);
+  cup.size_m = Eigen::Vector3f(0.2f, 0.2f, 0.2f);
+  cup.yaw_rad = 0.0f;
+  ObjectNode lamp = makeNode(3, "lamp");
+  lamp.center_world = Eigen::Vector3f(4.0f, 0.0f, 0.5f);
+  ASSERT_TRUE(reducer
+                  .apply(SceneCommand{loadCommand({table, cup, lamp})})
+                  .committedRevision());
+
+  const SceneApplyResult rebuilt =
+      reducer.apply(SceneCommand{RebuildFurnitureGraphCommand{}});
+  ASSERT_TRUE(rebuilt.committedRevision()) << rebuilt.reason;
+  ASSERT_EQ(rebuilt.snapshot.graphMetadata().furniture.size(), 1U);
+  EXPECT_EQ(rebuilt.snapshot.graphMetadata().furniture.front().object_id, 1);
+  ASSERT_EQ(std::count_if(
+                rebuilt.snapshot.graphMetadata().relations.begin(),
+                rebuilt.snapshot.graphMetadata().relations.end(),
+                [](const SceneRelation& relation) {
+                  return relation.relation_type == "on";
+                }),
+            1);
+  EXPECT_EQ(
+      reducer.apply(SceneCommand{RebuildFurnitureGraphCommand{}}).status,
+      SceneApplyStatus::kNoOp);
+
+  ApplyHumanAnnotationCommand relabel_lamp;
+  relabel_lamp.object_id = 3;
+  relabel_lamp.expected_identity_revision =
+      reducer.snapshot().findObject(3)->identity->revision;
+  relabel_lamp.expected_annotation_revision =
+      reducer.snapshot().findObject(3)->annotation->revision;
+  relabel_lamp.patch.label = "chair";
+  ASSERT_TRUE(reducer.apply(SceneCommand{relabel_lamp}).committedRevision());
+  EXPECT_EQ(reducer.snapshot().graphMetadata().furniture.size(), 1U);
+
+  ASSERT_TRUE(reducer
+                  .apply(SceneCommand{RebuildFurnitureGraphCommand{}})
+                  .committedRevision());
+  EXPECT_EQ(reducer.snapshot().graphMetadata().furniture.size(), 2U);
+
+  UpsertTrackMutation move_cup;
+  move_cup.object_id = 2;
+  move_cup.track.track_id = 1002;
+  move_cup.track.object_id = 2;
+  move_cup.track.state = InstanceTrackState::kStable;
+  move_cup.track.publishable = true;
+  move_cup.track.label = "cup";
+  move_cup.track.center_world = Eigen::Vector3f(8.0f, 0.0f, 1.1f);
+  move_cup.track.size_m = cup.size_m;
+  move_cup.track.yaw_rad = cup.yaw_rad;
+  const SceneApplyResult moved =
+      reducer.apply(SceneCommand{mutationBatch(move_cup)});
+  ASSERT_TRUE(moved.committedRevision()) << moved.reason;
+  EXPECT_EQ(std::count_if(
+                moved.snapshot.graphMetadata().relations.begin(),
+                moved.snapshot.graphMetadata().relations.end(),
+                [](const SceneRelation& relation) {
+                  return relation.relation_type == "on" &&
+                         relationSource(relation).id == 2;
+                }),
+            0);
+  EXPECT_EQ(moved.snapshot.graphMetadata().furniture.size(), 2U);
+}
+
 TEST(SceneReducer, ObservationRetriesAreIdempotentAndLateWindowIsBounded) {
   ReducerCore reducer;
   UpsertTrackMutation create;

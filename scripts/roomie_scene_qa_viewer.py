@@ -214,6 +214,7 @@ def apply_cli_overrides(config: SceneQaConfig, args: argparse.Namespace) -> Scen
         gemini_model=args.model or config.gemini_model,
         doubao_model=args.doubao_model or config.doubao_model,
         doubao_base_url=(args.doubao_base_url or config.doubao_base_url).rstrip("/"),
+        doubao_thinking_type=config.doubao_thinking_type,
         embedding_model=args.embedding_model or config.embedding_model,
         embedding_backend=args.embedding_backend or config.embedding_backend,
         device=args.device or config.device,

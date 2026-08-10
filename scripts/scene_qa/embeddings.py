@@ -60,13 +60,24 @@ class ObjectSearchIndex:
         *,
         top_k: int,
         room_id: int | None = None,
+        include_unpublishable: bool = False,
     ) -> list[SearchResult]:
         if not description.strip():
             return []
         top_k = max(1, min(int(top_k), 100))
         if self.backend == "lexical":
-            return self._lexical_search(description, top_k=top_k, room_id=room_id)
-        return self._embedding_search(description, top_k=top_k, room_id=room_id)
+            return self._lexical_search(
+                description,
+                top_k=top_k,
+                room_id=room_id,
+                include_unpublishable=include_unpublishable,
+            )
+        return self._embedding_search(
+            description,
+            top_k=top_k,
+            room_id=room_id,
+            include_unpublishable=include_unpublishable,
+        )
 
     def _records_and_texts(self) -> tuple[list[ObjectRecord], list[str]]:
         if self._records is None or self._texts is None:
@@ -81,12 +92,15 @@ class ObjectSearchIndex:
         *,
         top_k: int,
         room_id: int | None,
+        include_unpublishable: bool,
     ) -> list[SearchResult]:
         records, _ = self._records_and_texts()
         embeddings = self._get_object_embeddings()
         query = self._encode([description])
         scores = embeddings @ query[0]
-        candidate_indices = self._candidate_indices(records, room_id)
+        candidate_indices = self._candidate_indices(
+            records, room_id, include_unpublishable
+        )
         ranked = sorted(candidate_indices, key=lambda idx: float(scores[idx]), reverse=True)
         return [
             SearchResult(records[idx], float(scores[idx]))
@@ -99,6 +113,7 @@ class ObjectSearchIndex:
         *,
         top_k: int,
         room_id: int | None,
+        include_unpublishable: bool,
     ) -> list[SearchResult]:
         records, texts = self._records_and_texts()
         if self._token_sets is None:
@@ -106,7 +121,9 @@ class ObjectSearchIndex:
         query_tokens = _tokenize(description)
         query_lower = description.lower()
         scored: list[SearchResult] = []
-        for idx in self._candidate_indices(records, room_id):
+        for idx in self._candidate_indices(
+            records, room_id, include_unpublishable
+        ):
             record = records[idx]
             text_lower = texts[idx].lower()
             tokens = self._token_sets[idx]
@@ -127,9 +144,12 @@ class ObjectSearchIndex:
         self,
         records: Iterable[ObjectRecord],
         room_id: int | None,
+        include_unpublishable: bool,
     ) -> list[int]:
         indices = []
         for idx, record in enumerate(records):
+            if not include_unpublishable and not record.publishable:
+                continue
             if room_id is not None and int(room_id) not in record.room_ids:
                 continue
             indices.append(idx)

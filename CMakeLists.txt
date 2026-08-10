@@ -103,6 +103,7 @@ add_library(
   src/ros_io_thread.cpp
   src/scene/geometry_scheduler.cpp
   src/scene/geometry_worker.cpp
+  src/scene/furniture_graph.cpp
   src/scene/persistence_actor.cpp
   src/scene/scene_reducer.cpp
   src/scene/scene_store.cpp
@@ -170,7 +171,7 @@ ament_target_dependencies(
 
 add_executable(roomie_pipeline_node src/pipeline_node.cpp)
 target_link_libraries(roomie_pipeline_node roomie_pipeline)
-ament_target_dependencies(roomie_pipeline_node rclcpp)
+ament_target_dependencies(roomie_pipeline_node rclcpp std_srvs)
 rosidl_get_typesupport_target(roomie_cpp_typesupport_target
                               ${PROJECT_NAME} "rosidl_typesupport_cpp")
 target_link_libraries(roomie_pipeline_node "${roomie_cpp_typesupport_target}")
@@ -245,6 +246,8 @@ if(BUILD_TESTING)
   target_link_libraries(test_map_causal_barrier roomie_pipeline)
   ament_add_gtest(test_scene_reducer test/test_scene_reducer.cpp)
   target_link_libraries(test_scene_reducer roomie_pipeline)
+  ament_add_gtest(test_furniture_graph test/test_furniture_graph.cpp)
+  target_link_libraries(test_furniture_graph roomie_pipeline)
   ament_add_gtest(test_geometry_scheduler test/test_geometry_scheduler.cpp)
   target_link_libraries(test_geometry_scheduler roomie_pipeline)
   ament_add_gtest(test_geometry_worker test/test_geometry_worker.cpp)

@@ -12,6 +12,7 @@
 #include <map>
 #include <set>
 #include <sstream>
+#include <stdexcept>
 #include <utility>
 
 #include <nlohmann/json.hpp>
@@ -19,7 +20,7 @@
 namespace roomie {
 namespace {
 
-constexpr int kRoomieObjectGraphFormatVersion = 3;
+constexpr int kRoomieObjectGraphFormatVersion = 4;
 constexpr const char* kRoomieObjectGraphFormat = "roomie_object_graph";
 constexpr const char* kRoomieManualSceneGraphFormat = "roomie_manual_scene_graph";
 
@@ -572,12 +573,29 @@ RoomNode roomNodeFromJson(const json& value) {
 }
 
 const char* entityTypeToString(SceneEntityType type) {
-  return type == SceneEntityType::kRoom ? "room" : "object";
+  switch (type) {
+    case SceneEntityType::kObject:
+      return "object";
+    case SceneEntityType::kRoom:
+      return "room";
+    case SceneEntityType::kFurniture:
+      return "furniture";
+  }
+  throw std::invalid_argument("unknown scene entity type");
 }
 
 SceneEntityType entityTypeFromString(const std::string& value) {
-  return lowercase(value) == "room" ? SceneEntityType::kRoom
-                                     : SceneEntityType::kObject;
+  const std::string normalized = lowercase(value);
+  if (normalized == "object") {
+    return SceneEntityType::kObject;
+  }
+  if (normalized == "room") {
+    return SceneEntityType::kRoom;
+  }
+  if (normalized == "furniture") {
+    return SceneEntityType::kFurniture;
+  }
+  throw std::invalid_argument("unknown scene entity type: " + value);
 }
 
 json entityRefToJson(SceneEntityRef ref) {
@@ -602,11 +620,12 @@ json relationToJson(const ObjectRelation& relation) {
   const SceneEntityRef target = relationTarget(relation);
   value["source"] = entityRefToJson(source);
   value["target"] = entityRefToJson(target);
-  // Object-only legacy readers can continue consuming v3 relations.
-  if (source.type == SceneEntityType::kObject) {
+  // Furniture uses the same canonical object id, so legacy readers can still
+  // identify that physical endpoint even though they lose the role type.
+  if (entityBackedByObject(source)) {
     value["source_object_id"] = source.id;
   }
-  if (target.type == SceneEntityType::kObject) {
+  if (entityBackedByObject(target)) {
     value["target_object_id"] = target.id;
   }
   value["relation_type"] = relation.relation_type;
@@ -639,6 +658,21 @@ ObjectRelation relationFromJson(const json& value) {
   return relation;
 }
 
+json furnitureRoleToJson(const FurnitureRole& role) {
+  return json{{"object_id", role.object_id},
+              {"revision", role.revision},
+              {"classification_label", role.classification_label}};
+}
+
+FurnitureRole furnitureRoleFromJson(const json& value) {
+  FurnitureRole role;
+  role.object_id = value.value("object_id", -1);
+  role.revision = value.value("revision", std::uint64_t{0});
+  role.classification_label =
+      value.value("classification_label", std::string());
+  return role;
+}
+
 json objectGraphToJson(const ObjectGraphSnapshot& snapshot,
                        const std::string& world_frame,
                        TimeNanoseconds saved_time_ns) {
@@ -655,6 +689,10 @@ json objectGraphToJson(const ObjectGraphSnapshot& snapshot,
   root["rooms"] = json::array();
   for (const RoomNode& room : snapshot.rooms) {
     root["rooms"].push_back(roomNodeToJson(room));
+  }
+  root["furniture"] = json::array();
+  for (const FurnitureRole& role : snapshot.furniture) {
+    root["furniture"].push_back(furnitureRoleToJson(role));
   }
   root["relations"] = json::array();
   for (const ObjectRelation& relation : snapshot.relations) {
@@ -682,7 +720,7 @@ json snapshotToJson(const ObjectGraphSnapshot& snapshot,
   }
   try {
     json root = json::parse(snapshot.scene_graph_json);
-    // Schema v3 has exactly one canonical object list. Preserve envelope-only
+    // Schema v4 has exactly one canonical object list. Preserve envelope-only
     // metadata (map, root, source paths, etc.) but remove the legacy nested
     // object graph before overwriting every canonical scene field.
     root.erase("object_graph");
@@ -693,6 +731,7 @@ json snapshotToJson(const ObjectGraphSnapshot& snapshot,
     root["next_object_id"] = snapshot.next_object_id;
     root["objects"] = object_graph.at("objects");
     root["rooms"] = object_graph.at("rooms");
+    root["furniture"] = object_graph.at("furniture");
     root["relations"] = object_graph.at("relations");
     root["snapshot_images"] = object_graph.at("snapshot_images");
     if (object_graph.contains("migration_warnings")) {
@@ -711,6 +750,11 @@ json snapshotToJson(const ObjectGraphSnapshot& snapshot,
       }
       root["root"]["object_ids"] = std::move(object_ids);
       root["root"]["room_ids"] = std::move(room_ids);
+      json furniture_ids = json::array();
+      for (const FurnitureRole& role : snapshot.furniture) {
+        furniture_ids.push_back(role.object_id);
+      }
+      root["root"]["furniture_ids"] = std::move(furniture_ids);
     }
     return root;
   } catch (const std::exception&) {
@@ -736,6 +780,14 @@ ObjectGraphSnapshot snapshotFromJson(const json& root) {
     snapshot.rooms.reserve(rooms.size());
     for (const json& room_json : rooms) {
       snapshot.rooms.push_back(roomNodeFromJson(room_json));
+    }
+  }
+
+  const json furniture = root.value("furniture", json::array());
+  if (furniture.is_array()) {
+    snapshot.furniture.reserve(furniture.size());
+    for (const json& role_json : furniture) {
+      snapshot.furniture.push_back(furnitureRoleFromJson(role_json));
     }
   }
 
@@ -874,6 +926,16 @@ bool validateCanonicalSnapshot(const ObjectGraphSnapshot& snapshot,
       return false;
     }
   }
+  std::set<int> furniture_ids;
+  for (const FurnitureRole& role : snapshot.furniture) {
+    if (role.object_id < 0 || object_ids.count(role.object_id) == 0U ||
+        role.classification_label.empty() ||
+        !furniture_ids.insert(role.object_id).second) {
+      setError(error,
+               "canonical furniture contains an invalid or duplicate role");
+      return false;
+    }
+  }
   for (const ObjectRelation& relation : snapshot.relations) {
     const SceneEntityRef source = relationSource(relation);
     const SceneEntityRef target = relationTarget(relation);
@@ -882,9 +944,13 @@ bool validateCanonicalSnapshot(const ObjectGraphSnapshot& snapshot,
       return false;
     }
     const auto exists = [&](SceneEntityRef endpoint) {
-      return endpoint.type == SceneEntityType::kRoom
-                 ? room_ids.count(endpoint.id) != 0
-                 : object_ids.count(endpoint.id) != 0;
+      if (endpoint.type == SceneEntityType::kRoom) {
+        return room_ids.count(endpoint.id) != 0U;
+      }
+      if (endpoint.type == SceneEntityType::kFurniture) {
+        return furniture_ids.count(endpoint.id) != 0U;
+      }
+      return object_ids.count(endpoint.id) != 0U;
     };
     if (!exists(source) || !exists(target)) {
       setError(error, "canonical relation endpoint does not exist");
@@ -1056,7 +1122,7 @@ bool loadObjectGraphSnapshotJson(const std::filesystem::path& path,
       }
       if (envelope_version >= 3 && has_nested) {
         setError(error,
-                 "schema v3 manual scene graph must not contain a nested "
+                 "schema v3+ manual scene graph must not contain a nested "
                  "object_graph; objects have a single canonical top-level list");
         return false;
       }
@@ -1094,7 +1160,8 @@ bool loadObjectGraphSnapshotJson(const std::filesystem::path& path,
         }
         // Legacy manual envelopes own rooms and cross-layer relations at the
         // top level. Overlay them onto the selected object graph once.
-        for (const char* field : {"rooms", "relations", "snapshot_images"}) {
+        for (const char* field : {"rooms", "furniture", "relations",
+                                  "snapshot_images"}) {
           if (root.contains(field)) {
             canonical_root[field] = root.at(field);
           }
@@ -1111,7 +1178,7 @@ bool loadObjectGraphSnapshotJson(const std::filesystem::path& path,
     const std::string object_graph_format =
         canonical_root.value("format", std::string());
     if (!object_graph_format.empty() && object_graph_format != kRoomieObjectGraphFormat) {
-      // A schema-v3 manual envelope is itself the canonical graph root.
+      // A schema-v3+ manual envelope is itself the canonical graph root.
       if (!(manual_envelope &&
             object_graph_format == kRoomieManualSceneGraphFormat)) {
         setError(error, "unsupported embedded object graph format: " + object_graph_format);

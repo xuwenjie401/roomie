@@ -1,0 +1,1 @@
+/home/lindenbot/RealityLab/jarvis/src/roomie/build/roomie/ament_cmake_core/roomieConfig-version.cmake

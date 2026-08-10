@@ -105,6 +105,14 @@ SceneSnapshot makeQuerySnapshot(SceneRevision revision) {
   setRelationEndpoints(&relation,
                        SceneEntityRef{SceneEntityType::kRoom, 10},
                        SceneEntityRef{SceneEntityType::kObject, 7});
+  ObjectRelation furniture_relation;
+  furniture_relation.relation_type = "room_contains_furniture";
+  furniture_relation.confidence = 1.0f;
+  furniture_relation.revision = 6;
+  furniture_relation.derived = true;
+  setRelationEndpoints(&furniture_relation,
+                       SceneEntityRef{SceneEntityType::kRoom, 10},
+                       SceneEntityRef{SceneEntityType::kFurniture, 7});
 
   ObjectSnapshotImage image;
   image.image_index = 3;
@@ -117,7 +125,9 @@ SceneSnapshot makeQuerySnapshot(SceneRevision revision) {
 
   auto graph = std::make_shared<SceneGraphMetadata>();
   graph->rooms.push_back(room);
+  graph->furniture.push_back(FurnitureRole{7, 2, "chair"});
   graph->relations.push_back(relation);
+  graph->relations.push_back(furniture_relation);
   graph->snapshot_images.push_back(image);
   state->graph = graph;
   return SceneSnapshot{state};
@@ -144,6 +154,7 @@ TEST(SceneQueryJsonAdapter, BatchPinsOnceAndEveryCallUsesOneRevision) {
               {{"center_world", Json::array({1.0, 2.0, 0.5})},
                {"radius_m", 2.0}}}},
             {{"id", "room"}, {"method", "rooms"}},
+            {{"id", "furniture"}, {"method", "furniture"}},
             {{"id", "edges"},
              {"method", "relations"},
              {"params", {{"object_id", 7}, {"direction", "incoming"}}}},
@@ -158,19 +169,26 @@ TEST(SceneQueryJsonAdapter, BatchPinsOnceAndEveryCallUsesOneRevision) {
   ASSERT_TRUE(response.success) << response.error;
   EXPECT_EQ(response.scene_revision, 41U);
   EXPECT_EQ(response.durable_scene_revision, 40U);
-  EXPECT_EQ(response.call_count, 6U);
+  EXPECT_EQ(response.call_count, 7U);
   EXPECT_EQ(supplier_calls, 1);
   const Json result = Json::parse(response.response_json);
   EXPECT_EQ(result.at("schema_version"),
             "roomie.query_scene.response.v1");
   EXPECT_EQ(result.at("read_token").at("scene_revision"), 41);
-  ASSERT_EQ(result.at("calls").size(), 6U);
+  ASSERT_EQ(result.at("calls").size(), 7U);
   for (const Json& call : result.at("calls")) {
     EXPECT_TRUE(call.at("success")) << call.dump();
     EXPECT_EQ(call.at("status"), "ok");
     EXPECT_EQ(call.at("metadata").at("scene_revision"), 41);
     EXPECT_EQ(call.at("metadata").at("durable_scene_revision"), 40);
   }
+  const Json& object_result = result.at("calls").at(0).at("result");
+  ASSERT_TRUE(object_result.at("furniture_role").is_object());
+  EXPECT_EQ(object_result.at("furniture_role").at("object_id"), 7);
+  const Json& furniture_result = result.at("calls").at(3).at("result");
+  ASSERT_EQ(furniture_result.size(), 1U);
+  EXPECT_EQ(furniture_result.at(0).at("role").at("object_id"), 7);
+  EXPECT_EQ(furniture_result.at(0).at("object").at("object_id"), 7);
 }
 
 TEST(SceneQueryJsonAdapter, ParameterErrorsArePerCallAndEnvelopeErrorsDoNotPin) {

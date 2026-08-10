@@ -358,6 +358,7 @@ class DoubaoSceneQaAgent:
             "instructions": self.config.load_system_prompt(),
             "temperature": self.config.temperature,
             "max_output_tokens": self.config.max_output_tokens,
+            "thinking": {"type": self.config.doubao_thinking_type},
             # Ark's documented function-call continuation uses
             # previous_response_id, which requires stored responses.
             "store": True,

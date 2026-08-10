@@ -256,7 +256,8 @@ struct SceneGraphMetadata {
   // ObjectGraphSnapshot is materialized from this component; the preserved
   // envelope is metadata only and is never consulted for current facts.
   std::vector<RoomNode, Eigen::aligned_allocator<RoomNode>> rooms;
-  std::vector<ObjectRelation> relations;
+  std::vector<FurnitureRole> furniture;
+  std::vector<SceneRelation> relations;
   std::vector<ObjectSnapshotImage> snapshot_images;
   std::vector<std::string> import_warnings;
   bool has_scene_graph_envelope = false;

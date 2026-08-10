@@ -91,6 +91,15 @@ class ObjectRecord:
     raw: dict[str, Any]
 
 
+@dataclass(frozen=True)
+class FurnitureRecord:
+    object_id: int
+    classification_label: str
+    revision: int
+    object: ObjectRecord
+    raw: dict[str, Any]
+
+
 class GraphStore:
     """Normalized, query-friendly view of a Roomie scene graph JSON file."""
 
@@ -105,6 +114,14 @@ class GraphStore:
         self.objects_by_id = self._build_objects(
             self.graph.get("objects", []), relation_room_map
         )
+        self.furniture_by_id = self._build_furniture(
+            self.graph.get("furniture", [])
+        )
+        self.relations = [
+            relation
+            for relation in self.graph.get("relations", [])
+            if isinstance(relation, dict)
+        ]
         self.room_objects = self._build_room_objects()
 
     @classmethod
@@ -127,6 +144,10 @@ class GraphStore:
         return len(self.rooms_by_id)
 
     @property
+    def furniture_count(self) -> int:
+        return len(self.furniture_by_id)
+
+    @property
     def snapshot_count(self) -> int:
         return len(self.graph.get("snapshot_images", []))
 
@@ -135,6 +156,9 @@ class GraphStore:
 
     def room_records(self) -> list[RoomRecord]:
         return [self.rooms_by_id[k] for k in sorted(self.rooms_by_id)]
+
+    def furniture_records(self) -> list[FurnitureRecord]:
+        return [self.furniture_by_id[k] for k in sorted(self.furniture_by_id)]
 
     def get_object(self, object_id: int) -> ObjectRecord:
         try:
@@ -147,6 +171,12 @@ class GraphStore:
             return self.rooms_by_id[int(room_id)]
         except KeyError as exc:
             raise KeyError(f"unknown room_id: {room_id}") from exc
+
+    def get_furniture(self, object_id: int) -> FurnitureRecord:
+        try:
+            return self.furniture_by_id[int(object_id)]
+        except KeyError as exc:
+            raise KeyError(f"object_id is not furniture: {object_id}") from exc
 
     def object_text(self, record: ObjectRecord) -> str:
         room_labels = [
@@ -191,7 +221,65 @@ class GraphStore:
             ]
         if include_snapshot:
             data["snapshot"] = self.snapshot_metadata(record)
+        role = self.furniture_by_id.get(record.object_id)
+        data["furniture_role"] = (
+            {
+                "object_id": role.object_id,
+                "classification_label": role.classification_label,
+                "revision": role.revision,
+            }
+            if role is not None
+            else None
+        )
         return data
+
+    def furniture_to_dict(self, record: FurnitureRecord) -> dict[str, Any]:
+        return {
+            "role": {
+                "object_id": record.object_id,
+                "classification_label": record.classification_label,
+                "revision": record.revision,
+            },
+            "object": self.object_to_dict(record.object, include_snapshot=False),
+        }
+
+    def relations_for_object(
+        self,
+        object_id: int | None = None,
+        relation_type: str | None = None,
+        direction: str = "either",
+    ) -> list[dict[str, Any]]:
+        if direction not in {"either", "outgoing", "incoming"}:
+            raise ValueError("direction must be either, outgoing, or incoming")
+        if object_id is not None:
+            self.get_object(object_id)
+
+        def object_endpoint(value: Any) -> int | None:
+            if not isinstance(value, dict) or value.get("type") not in {
+                "object",
+                "furniture",
+            }:
+                return None
+            endpoint_id = value.get("id")
+            return endpoint_id if isinstance(endpoint_id, int) else None
+
+        result = []
+        for relation in self.relations:
+            if relation_type is not None and str(
+                relation.get("relation_type") or ""
+            ) != relation_type:
+                continue
+            source_id = object_endpoint(relation.get("source"))
+            target_id = object_endpoint(relation.get("target"))
+            if object_id is not None:
+                matches = (
+                    (direction in {"either", "outgoing"} and source_id == object_id)
+                    or (direction in {"either", "incoming"} and target_id == object_id)
+                )
+                if not matches:
+                    continue
+            result.append(_round(dict(relation)))
+        return result
 
     def room_to_dict(self, room: RoomRecord, *, include_objects: bool = False) -> dict[str, Any]:
         object_ids = sorted(self.room_objects.get(room.room_id, set()))
@@ -246,9 +334,18 @@ class GraphStore:
         image_index = record.snapshot.get("image_index")
         return self.snapshot_paths.get(image_index) if isinstance(image_index, int) else None
 
-    def objects_in_room(self, room_id: int) -> list[ObjectRecord]:
+    def objects_in_room(
+        self,
+        room_id: int,
+        *,
+        include_unpublishable: bool = False,
+    ) -> list[ObjectRecord]:
         object_ids = self.room_objects.get(int(room_id), set())
-        return [self.objects_by_id[obj_id] for obj_id in sorted(object_ids)]
+        return [
+            self.objects_by_id[obj_id]
+            for obj_id in sorted(object_ids)
+            if include_unpublishable or self.objects_by_id[obj_id].publishable
+        ]
 
     def objects_near(
         self,
@@ -256,9 +353,12 @@ class GraphStore:
         radius_m: float,
         *,
         top_k: int,
+        include_unpublishable: bool = False,
     ) -> list[tuple[ObjectRecord, float]]:
         results: list[tuple[ObjectRecord, float]] = []
         for obj in self.objects_by_id.values():
+            if not include_unpublishable and not obj.publishable:
+                continue
             if obj.center_world is None:
                 continue
             dist = _distance(obj.center_world, position)
@@ -365,6 +465,32 @@ class GraphStore:
                 snapshot=snapshot,
                 active=bool(item.get("active", True)),
                 publishable=bool(item.get("publishable", True)),
+                raw=item,
+            )
+        return records
+
+    def _build_furniture(self, furniture: Any) -> dict[int, FurnitureRecord]:
+        records: dict[int, FurnitureRecord] = {}
+        if not isinstance(furniture, list):
+            return records
+        for item in furniture:
+            if not isinstance(item, dict):
+                continue
+            object_id = item.get("object_id")
+            label = item.get("classification_label")
+            if (
+                not isinstance(object_id, int)
+                or object_id not in self.objects_by_id
+                or not isinstance(label, str)
+                or not label
+            ):
+                continue
+            revision = item.get("revision", 0)
+            records[object_id] = FurnitureRecord(
+                object_id=object_id,
+                classification_label=label,
+                revision=revision if isinstance(revision, int) else 0,
+                object=self.objects_by_id[object_id],
                 raw=item,
             )
         return records

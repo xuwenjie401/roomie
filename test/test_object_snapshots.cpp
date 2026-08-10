@@ -255,7 +255,7 @@ TEST(ObjectGraphIo, ManualSceneGraphPreservesEnvelopeWhenSavingSnapshots) {
   ASSERT_TRUE(saved_stream);
   const nlohmann::json saved = nlohmann::json::parse(saved_stream);
   EXPECT_EQ(saved.value("format", std::string()), "roomie_manual_scene_graph");
-  EXPECT_EQ(saved.value("format_version", 0), 3);
+  EXPECT_EQ(saved.value("format_version", 0), 4);
   EXPECT_FALSE(saved.contains("object_graph"));
   ASSERT_TRUE(saved.contains("rooms"));
   EXPECT_EQ(saved.at("rooms").at(0).value("room_id", -1), 3);
@@ -338,6 +338,7 @@ TEST(ObjectGraphIo, LegacyV1AndSchemaV3TypedRoomsRelationsAreCompatible) {
   room.max_xy = {3.0f, 4.5f};
   room.has_xy_bounds = true;
   loaded_v1.rooms.push_back(room);
+  loaded_v1.furniture.push_back(FurnitureRole{1, 2, "chair"});
   ObjectRelation containment;
   setRelationEndpoints(
       &containment, SceneEntityRef{SceneEntityType::kRoom, 9},
@@ -347,16 +348,26 @@ TEST(ObjectGraphIo, LegacyV1AndSchemaV3TypedRoomsRelationsAreCompatible) {
   containment.revision = 5;
   containment.derived = true;
   loaded_v1.relations.push_back(containment);
+  ObjectRelation room_furniture;
+  setRelationEndpoints(
+      &room_furniture, SceneEntityRef{SceneEntityType::kRoom, 9},
+      SceneEntityRef{SceneEntityType::kFurniture, 1});
+  room_furniture.relation_type = "room_contains_furniture";
+  room_furniture.confidence = 1.0f;
+  room_furniture.revision = 5;
+  room_furniture.derived = true;
+  loaded_v1.relations.push_back(room_furniture);
 
-  const std::filesystem::path v3_path = dir / "canonical_v3.json";
+  const std::filesystem::path v3_path = dir / "canonical_v4.json";
   ASSERT_TRUE(saveObjectGraphSnapshotJsonAtomic(
       loaded_v1, "map", 456, v3_path, &error)) << error;
   std::ifstream stream(v3_path);
   const nlohmann::json v3 = nlohmann::json::parse(stream);
-  EXPECT_EQ(v3.value("format_version", 0), 3);
+  EXPECT_EQ(v3.value("format_version", 0), 4);
   ASSERT_EQ(v3.at("objects").size(), 1U);
   ASSERT_EQ(v3.at("rooms").size(), 1U);
-  ASSERT_EQ(v3.at("relations").size(), 1U);
+  ASSERT_EQ(v3.at("furniture").size(), 1U);
+  ASSERT_EQ(v3.at("relations").size(), 2U);
   EXPECT_EQ(v3.at("relations").at(0).at("source").value(
                 "type", std::string()), "room");
   EXPECT_TRUE(v3.at("objects").at(0).value(
@@ -366,7 +377,10 @@ TEST(ObjectGraphIo, LegacyV1AndSchemaV3TypedRoomsRelationsAreCompatible) {
   ASSERT_TRUE(loadObjectGraphSnapshotJson(
       v3_path, &loaded_v3, &world_frame, &error)) << error;
   ASSERT_EQ(loaded_v3.rooms.size(), 1U);
-  ASSERT_EQ(loaded_v3.relations.size(), 1U);
+  ASSERT_EQ(loaded_v3.furniture.size(), 1U);
+  EXPECT_EQ(loaded_v3.furniture.front().object_id, 1);
+  EXPECT_EQ(loaded_v3.furniture.front().classification_label, "chair");
+  ASSERT_EQ(loaded_v3.relations.size(), 2U);
   EXPECT_EQ(relationSource(loaded_v3.relations.front()).type,
             SceneEntityType::kRoom);
   EXPECT_EQ(relationTarget(loaded_v3.relations.front()).id, 1);

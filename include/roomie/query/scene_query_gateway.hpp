@@ -157,11 +157,25 @@ struct QueryObjectView {
   std::string semantic_document_hash;
   std::optional<std::string> indexed_document_hash;
   std::string snapshot_set_hash;
+  // Present when this canonical object also has a furniture role. The role
+  // projects the same object id; it is not a copied furniture object.
+  std::optional<FurnitureRole> furniture_role;
   ObjectFreshness freshness;
 };
 
 using QueryObjectList =
     std::vector<QueryObjectView, Eigen::aligned_allocator<QueryObjectView>>;
+
+struct QueryFurnitureView {
+  EIGEN_MAKE_ALIGNED_OPERATOR_NEW
+
+  FurnitureRole role;
+  QueryObjectView object;
+};
+
+using QueryFurnitureList =
+    std::vector<QueryFurnitureView,
+                Eigen::aligned_allocator<QueryFurnitureView>>;
 
 struct ObjectsNearRequest {
   EIGEN_MAKE_ALIGNED_OPERATOR_NEW
@@ -206,6 +220,7 @@ struct CanonicalRoom {
   std::optional<SceneObjectId> room_object_id;
   std::map<std::string, std::string> attributes;
   std::vector<SceneObjectId> object_ids;
+  std::vector<SceneObjectId> furniture_ids;
 };
 
 struct SnapshotAssetInspection {
@@ -354,6 +369,8 @@ class SceneQueryGateway {
       const SceneReadToken& token, SceneObjectId object_id) const;
   QueryResult<QueryObjectList> getObjectsNear(
       const SceneReadToken& token, const ObjectsNearRequest& request) const;
+  QueryResult<QueryFurnitureList> furniture(
+      const SceneReadToken& token) const;
   QueryResult<std::vector<CanonicalRoom>> rooms(
       const SceneReadToken& token) const;
   QueryResult<std::vector<CanonicalRelation>> relations(
@@ -413,6 +430,7 @@ class LocalSceneQueryHandlers {
   QueryResult<QueryObjectView> getObject(SceneObjectId object_id) const;
   QueryResult<QueryObjectList> getObjectsNear(
       const ObjectsNearRequest& request) const;
+  QueryResult<QueryFurnitureList> furniture() const;
   QueryResult<std::vector<CanonicalRoom>> rooms() const;
   QueryResult<std::vector<CanonicalRelation>> relations(
       const RelationRequest& request = RelationRequest{}) const;

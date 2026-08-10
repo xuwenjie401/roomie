@@ -117,13 +117,34 @@ def write_fixture(root: Path) -> Path:
                 "max_xy": [6.0, 1.0],
             },
         ],
+        "furniture": [
+            {
+                "object_id": 3,
+                "classification_label": "bed",
+                "revision": 2,
+            }
+        ],
         "relations": [
             {
                 "relation_type": "room_contains_object",
                 "source": {"type": "room", "id": 10},
                 "target": {"type": "object", "id": 1},
                 "confidence": 1.0,
-            }
+            },
+            {
+                "relation_type": "room_contains_furniture",
+                "source": {"type": "room", "id": 11},
+                "target": {"type": "furniture", "id": 3},
+                "confidence": 1.0,
+                "derived": True,
+            },
+            {
+                "relation_type": "on",
+                "source": {"type": "object", "id": 1},
+                "target": {"type": "furniture", "id": 3},
+                "confidence": 0.8,
+                "derived": True,
+            },
         ],
         "snapshot_images": [
             {
@@ -173,6 +194,11 @@ class SceneQaToolTests(unittest.TestCase):
         self.assertTrue(self.graph.snapshot_metadata(bottle)["image_available"])
 
     def test_scene_qa_config_loads_json(self) -> None:
+        self.assertEqual(
+            SceneQaConfig().doubao_model,
+            "doubao-seed-2-0-lite-260428",
+        )
+        self.assertEqual(SceneQaConfig().doubao_thinking_type, "disabled")
         prompt_dir = Path(self.tmp.name) / "prompts"
         prompt_dir.mkdir()
         prompt_path = prompt_dir / "system.txt"
@@ -185,6 +211,7 @@ class SceneQaToolTests(unittest.TestCase):
                     "gemini_model": "gemini-test-model",
                     "doubao_model": "doubao-test-model",
                     "doubao_base_url": "https://ark.example.test/api/v3/",
+                    "doubao_thinking_type": "auto",
                     "embedding_model": "/tmp/fake_embedding",
                     "embedding_backend": "lexical",
                     "device": "cpu",
@@ -204,6 +231,7 @@ class SceneQaToolTests(unittest.TestCase):
         self.assertEqual(config.gemini_model, "gemini-test-model")
         self.assertEqual(config.doubao_model, "doubao-test-model")
         self.assertEqual(config.doubao_base_url, "https://ark.example.test/api/v3")
+        self.assertEqual(config.doubao_thinking_type, "auto")
         self.assertEqual(config.embedding_backend, "lexical")
         self.assertEqual(config.top_k, 3)
         self.assertEqual(config.snapshot_bbox_pad_px, 5)
@@ -240,6 +268,67 @@ class SceneQaToolTests(unittest.TestCase):
         nearby_ids = [obj["object_id"] for obj in nearby.response["objects"]]
         self.assertEqual(nearby_ids, [1, 2])
 
+    def test_qa_visibility_uses_publishable_objects_regardless_of_active(self) -> None:
+        raw_root = dict(self.graph.raw_root)
+        raw_root["objects"] = [
+            {
+                **item,
+                "active": False if item["object_id"] == 1 else True,
+                "publishable": False if item["object_id"] == 2 else True,
+            }
+            for item in self.graph.raw_root["objects"]
+        ]
+        graph = GraphStore(self.json_path, raw_root)
+        search = ObjectSearchIndex(
+            graph,
+            model_path=self.config.embedding_model,
+            backend="lexical",
+        )
+        registry = create_default_tool_registry(graph, search, self.config)
+
+        found = registry.call_tool(
+            "search_objects", {"description": "yellow bottle", "top_k": 10}
+        )
+        self.assertEqual(found.response["objects"][0]["object_id"], 1)
+        self.assertFalse(found.response["objects"][0]["active"])
+        self.assertNotIn(
+            2, [item["object_id"] for item in found.response["objects"]]
+        )
+
+        nearby = registry.call_tool(
+            "get_objects_near", {"object_id": 1, "radius_m": 0.6, "top_k": 10}
+        )
+        self.assertEqual(
+            [item["object_id"] for item in nearby.response["objects"]], [1]
+        )
+
+    def test_furniture_and_relation_tools_use_same_object_id(self) -> None:
+        self.assertEqual(self.graph.furniture_count, 1)
+        furniture = self.registry.call_tool("list_furniture", {})
+        self.assertEqual(furniture.response["count"], 1)
+        item = furniture.response["furniture"][0]
+        self.assertEqual(item["role"]["object_id"], 3)
+        self.assertEqual(item["object"]["object_id"], 3)
+        self.assertEqual(item["role"]["classification_label"], "bed")
+        self.assertEqual(self.graph.get_object(3).object_id, 3)
+
+        relations = self.registry.call_tool(
+            "get_relations",
+            {"object_id": 3, "relation_type": "on", "direction": "incoming"},
+        )
+        self.assertEqual(relations.response["count"], 1)
+        relation = relations.response["relations"][0]
+        self.assertEqual(relation["target"], {"type": "furniture", "id": 3})
+
+        related = self.registry.call_tool(
+            "get_objects_related", {"furniture_id": 3}
+        )
+        self.assertEqual(related.response["furniture_id"], 3)
+        self.assertEqual(related.response["count"], 1)
+        self.assertEqual(related.response["objects"][0]["object_id"], 1)
+        self.assertEqual(related.response["objects"][0]["relation"], "on")
+        self.assertNotIn("relation_confidence", related.response["objects"][0])
+
     def test_list_rooms_treats_missing_hierarchy_as_one_implicit_room(self) -> None:
         raw_root = dict(self.graph.raw_root)
         raw_root["rooms"] = []
@@ -260,9 +349,18 @@ class SceneQaToolTests(unittest.TestCase):
 
         self.assertEqual(result.response["count"], 1)
         self.assertFalse(result.response["room_hierarchy_available"])
-        self.assertEqual(result.response["message"], "当前仅有一个房间")
+        self.assertIn("room-0", result.response["message"])
         self.assertTrue(result.response["rooms"][0]["implicit"])
-        self.assertNotIn("room_id", result.response["rooms"][0])
+        self.assertEqual(result.response["rooms"][0]["room_id"], "room-0")
+        self.assertEqual(result.response["rooms"][0]["object_ids"], [1, 2, 3])
+
+        contents = registry.call_tool(
+            "get_objects_in_room", {"room_id": "room-0", "top_k": 10}
+        )
+        self.assertEqual(
+            [item["object_id"] for item in contents.response["objects"]],
+            [1, 2, 3],
+        )
 
     def test_inspect_snapshot_returns_media_attachment(self) -> None:
         result = self.registry.call_tool(
@@ -588,6 +686,10 @@ class SceneQaToolTests(unittest.TestCase):
         first_tool = fake_client.calls[0]["json"]["tools"][0]
         self.assertEqual(first_tool["type"], "function")
         self.assertIn("parameters", first_tool)
+        self.assertEqual(
+            fake_client.calls[0]["json"]["thinking"],
+            {"type": "disabled"},
+        )
         continuation = fake_client.calls[1]["json"]
         self.assertEqual(continuation["previous_response_id"], "resp-tool")
         self.assertEqual(continuation["input"][0]["type"], "function_call_output")
@@ -717,13 +819,62 @@ class FakeLiveQueryTransport:
                     }
                 ]
             elif method == "get_object":
-                result = self.object_result(
-                    int(params["object_id"]), "yellow bottle", [1.0, 0.0, 0.5]
+                object_id = int(params["object_id"])
+                result = (
+                    self.object_result(
+                        3,
+                        "bed",
+                        [3.0, 0.0, 0.5],
+                        furniture_role={
+                            "object_id": 3,
+                            "classification_label": "bed",
+                            "revision": 2,
+                        },
+                    )
+                    if object_id == 3
+                    else self.object_result(
+                        object_id, "yellow bottle", [1.0, 0.0, 0.5]
+                    )
                 )
             elif method == "get_objects_near":
                 result = [self.object_result(1, "yellow bottle", [1.0, 0.0, 0.5])]
             elif method == "rooms":
                 result = self.rooms_result
+            elif method == "furniture":
+                result = [
+                    {
+                        "role": {
+                            "object_id": 3,
+                            "classification_label": "bed",
+                            "revision": 2,
+                        },
+                        "object": self.object_result(
+                            3,
+                            "bed",
+                            [3.0, 0.0, 0.5],
+                            furniture_role={
+                                "object_id": 3,
+                                "classification_label": "bed",
+                                "revision": 2,
+                            },
+                        ),
+                    }
+                ]
+            elif method == "relations":
+                result = [
+                    {
+                        "source": {"type": "object", "id": 1},
+                        "target": {"type": "furniture", "id": 3},
+                        "relation_type": "on",
+                        "confidence": 0.8,
+                    },
+                    {
+                        "source": {"type": "object", "id": 2},
+                        "target": {"type": "furniture", "id": 3},
+                        "relation_type": "in",
+                        "confidence": 0.7,
+                    },
+                ]
             elif method == "inspect_snapshot":
                 result = {
                     "object": self.object_result(1, "yellow bottle", [1.0, 0.0, 0.5]),
@@ -755,11 +906,20 @@ class FakeLiveQueryTransport:
             raise AssertionError("tool call did not carry pinned revision")
 
     @staticmethod
-    def object_result(object_id: int, label: str, center: list[float]) -> dict:
+    def object_result(
+        object_id: int,
+        label: str,
+        center: list[float],
+        *,
+        furniture_role: dict | None = None,
+    ) -> dict:
         return {
             "object_id": object_id,
             "label": label,
             "display_description": label,
+            "active": False,
+            "publishable": True,
+            "furniture_role": furniture_role,
             "geometry": {
                 "center_world": center,
                 "size_m": [0.1, 0.1, 0.2],
@@ -799,12 +959,43 @@ class LiveSceneQaTests(unittest.TestCase):
         )
         self.assertEqual(search.response["objects"][0]["object_id"], 1)
         self.assertEqual(search.response["objects"][0]["semantic_score"], 0.96)
+        search_params = self.transport.requests[-1]["calls"][0]["params"]
+        self.assertTrue(search_params["include_inactive"])
+        self.assertFalse(search_params["include_unpublishable"])
         nearby = registry.call_tool(
             "get_objects_near", {"object_id": 1, "radius_m": 1.0}
         )
         self.assertEqual(nearby.response["objects"][0]["object_id"], 1)
+        near_params = self.transport.requests[-1]["calls"][0]["params"]
+        self.assertTrue(near_params["include_inactive"])
+        self.assertFalse(near_params["include_unpublishable"])
         registry.end_answer()
         self.assertIsNone(self.client.session_id)
+
+    def test_live_get_objects_related_combines_in_and_on_memberships(self) -> None:
+        registry = create_live_tool_registry(self.client, self.config)
+        registry.begin_answer()
+
+        result = registry.call_tool(
+            "get_objects_related", {"furniture_id": 3}
+        )
+
+        self.assertEqual(result.response["furniture_id"], 3)
+        self.assertEqual(result.response["count"], 2)
+        self.assertEqual(
+            [
+                (item["object_id"], item["relation"])
+                for item in result.response["objects"]
+            ],
+            [(1, "on"), (2, "in")],
+        )
+        self.assertTrue(
+            all(
+                "relation_confidence" not in item
+                for item in result.response["objects"]
+            )
+        )
+        registry.end_answer()
 
     def test_live_list_rooms_treats_missing_hierarchy_as_one_room(self) -> None:
         self.transport.rooms_result = []
@@ -815,8 +1006,9 @@ class LiveSceneQaTests(unittest.TestCase):
 
         self.assertEqual(result.response["count"], 1)
         self.assertFalse(result.response["room_hierarchy_available"])
-        self.assertEqual(result.response["message"], "当前仅有一个房间")
+        self.assertIn("room-0", result.response["message"])
         self.assertTrue(result.response["rooms"][0]["implicit"])
+        self.assertEqual(result.response["rooms"][0]["room_id"], "room-0")
         registry.end_answer()
 
     def test_live_registry_propagates_nonrecoverable_transport_error(self) -> None:

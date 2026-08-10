@@ -2,8 +2,10 @@
 #include <memory>
 #include <utility>
 
+#include <nlohmann/json.hpp>
 #include <rclcpp/executors/multi_threaded_executor.hpp>
 #include <rclcpp/rclcpp.hpp>
+#include <std_srvs/srv/trigger.hpp>
 
 #include "roomie/pipeline/pipeline.hpp"
 #include "roomie/pipeline/pipeline_config.hpp"
@@ -14,11 +16,36 @@
 #include "roomie/utils/run_logger.hpp"
 
 namespace roomie {
+namespace {
+
+const char* mutationStatusName(SceneMutationStatus status) {
+  switch (status) {
+    case SceneMutationStatus::kCommitted:
+      return "committed";
+    case SceneMutationStatus::kNoOp:
+      return "no_op";
+    case SceneMutationStatus::kStale:
+      return "stale";
+    case SceneMutationStatus::kRejected:
+      return "rejected";
+    case SceneMutationStatus::kTimeout:
+      return "timeout";
+    case SceneMutationStatus::kCommittedNotDurable:
+      return "committed_not_durable";
+    case SceneMutationStatus::kUnavailable:
+      return "unavailable";
+  }
+  return "unknown";
+}
+
+}  // namespace
 
 class RoomiePipelineNode : public rclcpp::Node {
  public:
   RoomiePipelineNode() : Node("roomie_pipeline_node") {
     PipelineConfig config = PipelineConfig::declareAndLoad(*this);
+    furniture_rebuild_timeout_ =
+        std::chrono::milliseconds(config.furniture_rebuild_timeout_ms);
     pipeline_ = std::make_unique<RoomiePipeline>(*this, std::move(config));
     pipeline_->start();
     query_adapter_ = std::make_unique<SceneQueryJsonAdapter>(
@@ -89,9 +116,43 @@ class RoomiePipelineNode : public rclcpp::Node {
                   std::to_string(result.response_json.size()) +
                   " latency_ms=" + std::to_string(latency_ms));
         });
+    rebuild_furniture_service_ = create_service<std_srvs::srv::Trigger>(
+        "/roomie/rebuild_furniture_graph",
+        [this](const std::shared_ptr<std_srvs::srv::Trigger::Request>,
+               std::shared_ptr<std_srvs::srv::Trigger::Response> response) {
+          const FurnitureGraphRebuildResult result =
+              pipeline_->rebuildFurnitureGraph(furniture_rebuild_timeout_);
+          const SceneMutationSubmitResult& submission = result.submission;
+          response->success = submission.accepted();
+          response->message =
+              nlohmann::json{
+                  {"status", mutationStatusName(submission.status)},
+                  {"message", submission.message},
+                  {"latest_scene_revision",
+                   submission.latest_scene_revision},
+                  {"committed_scene_revision",
+                   submission.committed_scene_revision
+                       ? nlohmann::json(*submission.committed_scene_revision)
+                       : nlohmann::json(nullptr)},
+                  {"durable_scene_revision",
+                   submission.durable_scene_revision},
+                  {"furniture_count", result.furniture_count},
+                  {"in_relation_count", result.in_relation_count},
+                  {"on_relation_count", result.on_relation_count},
+                  {"room_relation_count", result.room_relation_count}}
+                  .dump();
+          RunLogger::logGlobal(
+              "furniture_graph",
+              "rebuild_completed status=" +
+                  std::string(mutationStatusName(submission.status)) +
+                  " furniture_count=" +
+                  std::to_string(result.furniture_count) +
+                  " latest_scene_revision=" +
+                  std::to_string(submission.latest_scene_revision));
+        });
     RCLCPP_INFO(get_logger(),
                 "roomie pipeline started; live services: /roomie/query_scene, "
-                "/roomie/mutate_scene");
+                "/roomie/mutate_scene, /roomie/rebuild_furniture_graph");
   }
 
   ~RoomiePipelineNode() override {
@@ -104,8 +165,11 @@ class RoomiePipelineNode : public rclcpp::Node {
   std::unique_ptr<RoomiePipeline> pipeline_;
   std::unique_ptr<SceneQueryJsonAdapter> query_adapter_;
   std::unique_ptr<SceneMutationJsonAdapter> mutation_adapter_;
+  std::chrono::milliseconds furniture_rebuild_timeout_{5000};
   rclcpp::Service<roomie::srv::QueryScene>::SharedPtr query_scene_service_;
   rclcpp::Service<roomie::srv::MutateScene>::SharedPtr mutate_scene_service_;
+  rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr
+      rebuild_furniture_service_;
 };
 
 }  // namespace roomie

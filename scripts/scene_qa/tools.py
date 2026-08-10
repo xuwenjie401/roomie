@@ -17,7 +17,10 @@ from .graph_store import GraphStore, _as_vec3, _round
 from .live_query import LiveSceneQueryClient
 
 
-SINGLE_IMPLICIT_ROOM_MESSAGE = "当前仅有一个房间"
+IMPLICIT_ROOM_ID = "room-0"
+IMPLICIT_ROOM_MESSAGE = (
+    "No explicit room is defined; all stable scene objects belong to room-0."
+)
 
 # These failures cannot be corrected by asking the model to choose another
 # argument. Feeding them back as ordinary tool output makes a tool-calling VLM
@@ -129,21 +132,77 @@ class ToolRegistry:
         return self._answer_metadata() if self._answer_metadata is not None else None
 
 
-def _list_rooms_response(rooms: list[dict[str, Any]]) -> dict[str, Any]:
-    if rooms:
-        return {"count": len(rooms), "rooms": rooms}
+def _implicit_room(
+    object_ids: list[int] | None = None,
+    furniture_ids: list[int] | None = None,
+) -> dict[str, Any]:
     return {
-        "count": 1,
-        "rooms": [
-            {
-                "name": "当前房间",
-                "label": "当前房间",
-                "implicit": True,
-            }
-        ],
-        "room_hierarchy_available": False,
-        "message": SINGLE_IMPLICIT_ROOM_MESSAGE,
+        "room_id": IMPLICIT_ROOM_ID,
+        "name": IMPLICIT_ROOM_ID,
+        "label": IMPLICIT_ROOM_ID,
+        "implicit": True,
+        "attributes": {"implicit": "true"},
+        "object_ids": sorted(set(object_ids or [])),
+        "furniture_ids": sorted(set(furniture_ids or [])),
     }
+
+
+def _is_implicit_room(room: dict[str, Any]) -> bool:
+    attributes = room.get("attributes")
+    implicit_attribute = (
+        attributes.get("implicit") if isinstance(attributes, dict) else None
+    )
+    return bool(room.get("implicit")) or (
+        str(room.get("room_id")) == IMPLICIT_ROOM_ID
+        and str(implicit_attribute).lower() == "true"
+    )
+
+
+def _list_rooms_response(
+    rooms: list[dict[str, Any]],
+    *,
+    object_ids: list[int] | None = None,
+    furniture_ids: list[int] | None = None,
+) -> dict[str, Any]:
+    normalized = [dict(room) for room in rooms if isinstance(room, dict)]
+    if not normalized:
+        normalized = [_implicit_room(object_ids, furniture_ids)]
+    for room in normalized:
+        if _is_implicit_room(room):
+            room["implicit"] = True
+            room.setdefault("label", room.get("name") or IMPLICIT_ROOM_ID)
+    response: dict[str, Any] = {
+        "count": len(normalized),
+        "rooms": normalized,
+    }
+    if len(normalized) == 1 and _is_implicit_room(normalized[0]):
+        response["room_hierarchy_available"] = False
+        response["message"] = IMPLICIT_ROOM_MESSAGE
+    return response
+
+
+def _furniture_child_memberships(
+    relations: list[dict[str, Any]], furniture_id: int
+) -> list[tuple[int, str]]:
+    memberships: set[tuple[int, str]] = set()
+    for relation in relations:
+        relation_type = str(relation.get("relation_type") or "").strip().lower()
+        source = relation.get("source")
+        target = relation.get("target")
+        if (
+            relation_type not in {"in", "on"}
+            or not isinstance(source, dict)
+            or source.get("type") not in {"object", "furniture"}
+            or not isinstance(source.get("id"), int)
+            or not isinstance(target, dict)
+            or target.get("type") != "furniture"
+            or target.get("id") != furniture_id
+        ):
+            continue
+        source_id = int(source["id"])
+        if source_id != furniture_id:
+            memberships.add((source_id, relation_type))
+    return sorted(memberships)
 
 
 def create_default_tool_registry(
@@ -153,13 +212,29 @@ def create_default_tool_registry(
 ) -> ToolRegistry:
     registry = ToolRegistry()
 
+    def room_to_dict(room_id: int) -> dict[str, Any]:
+        data = graph.room_to_dict(graph.get_room(room_id))
+        data["room_id"] = str(data["room_id"])
+        return data
+
+    def resolve_room_id(
+        room_id: str | int | None,
+    ) -> tuple[int | None, str | None]:
+        if room_id is None:
+            return None, None
+        if graph.room_count == 0 and str(room_id) == IMPLICIT_ROOM_ID:
+            return None, IMPLICIT_ROOM_ID
+        numeric_id = _integer(room_id, -1)
+        graph.get_room(numeric_id)
+        return numeric_id, str(numeric_id)
+
     def search_objects(
         description: str,
         top_k: int | None = None,
-        room_id: int | None = None,
+        room_id: str | int | None = None,
     ) -> ToolResult:
         k = _integer(top_k, config.top_k)
-        rid = None if room_id is None else _integer(room_id, room_id)
+        rid, response_room_id = resolve_room_id(room_id)
         results = search_index.search(description, top_k=k, room_id=rid)
         objects = []
         for result in results:
@@ -169,7 +244,7 @@ def create_default_tool_registry(
         return ToolResult(
             {
                 "query": description,
-                "room_id": rid,
+                "room_id": response_room_id,
                 "count": len(objects),
                 "objects": objects,
             }
@@ -194,8 +269,8 @@ def create_default_tool_registry(
                         "description": "Maximum number of candidates to return.",
                     },
                     "room_id": {
-                        "type": "integer",
-                        "description": "Optional room id to restrict the search.",
+                        "type": "string",
+                        "description": "Optional room id returned by list_rooms.",
                     },
                 },
                 "required": ["description"],
@@ -243,17 +318,30 @@ def create_default_tool_registry(
     )
 
     def list_rooms() -> ToolResult:
-        rooms = [graph.room_to_dict(room) for room in graph.room_records()]
-        return ToolResult(_list_rooms_response(rooms))
+        rooms = [room_to_dict(room.room_id) for room in graph.room_records()]
+        stable_objects = [
+            record.object_id for record in graph.object_records() if record.publishable
+        ]
+        stable_furniture = [
+            record.object_id
+            for record in graph.furniture_records()
+            if record.object.publishable
+        ]
+        return ToolResult(
+            _list_rooms_response(
+                rooms,
+                object_ids=stable_objects,
+                furniture_ids=stable_furniture,
+            )
+        )
 
     registry.register(
         ToolSpec(
             name="list_rooms",
             description=(
                 "List all manually annotated rooms/regions with bounds, object counts, "
-                "and representative objects. If no explicit room hierarchy exists, "
-                "the result identifies the whole current scene as one implicit room; "
-                "answer from that result without calling a room-scoped tool."
+                "and representative objects. If no explicit room exists, all stable "
+                "scene objects are assigned to the queryable room-0."
             ),
             parameters_json_schema={"type": "object", "properties": {}},
             handler=list_rooms,
@@ -261,12 +349,12 @@ def create_default_tool_registry(
     )
 
     def get_objects_in_room(
-        room_id: int,
+        room_id: str | int,
         description: str | None = None,
         top_k: int | None = None,
     ) -> ToolResult:
-        rid = _integer(room_id, -1)
-        graph.get_room(rid)
+        rid, response_room_id = resolve_room_id(room_id)
+        implicit = response_room_id == IMPLICIT_ROOM_ID
         k = _integer(top_k, config.top_k)
         if description:
             matches = search_index.search(description, top_k=k, room_id=rid)
@@ -278,11 +366,31 @@ def create_default_tool_registry(
                 for match in matches
             ]
         else:
-            records = graph.objects_in_room(rid)[: max(0, k)]
+            records = (
+                [record for record in graph.object_records() if record.publishable]
+                if implicit
+                else graph.objects_in_room(rid if rid is not None else -1)
+            )[: max(0, k)]
             objects = [graph.object_to_dict(record) for record in records]
+        room = (
+            _implicit_room(
+                [
+                    record.object_id
+                    for record in graph.object_records()
+                    if record.publishable
+                ],
+                [
+                    record.object_id
+                    for record in graph.furniture_records()
+                    if record.object.publishable
+                ],
+            )
+            if implicit
+            else room_to_dict(rid if rid is not None else -1)
+        )
         return ToolResult(
             {
-                "room": graph.room_to_dict(graph.get_room(rid)),
+                "room": room,
                 "description": description,
                 "count": len(objects),
                 "objects": objects,
@@ -299,7 +407,10 @@ def create_default_tool_registry(
             parameters_json_schema={
                 "type": "object",
                 "properties": {
-                    "room_id": {"type": "integer", "description": "Room id to inspect."},
+                    "room_id": {
+                        "type": "string",
+                        "description": "Room id returned by list_rooms.",
+                    },
                     "description": {
                         "type": "string",
                         "description": "Optional object description to search for inside the room.",
@@ -381,6 +492,132 @@ def create_default_tool_registry(
                 "required": ["radius_m"],
             },
             handler=get_objects_near,
+        )
+    )
+
+    def list_furniture(classification_label: str | None = None) -> ToolResult:
+        records = [
+            record for record in graph.furniture_records() if record.object.publishable
+        ]
+        if classification_label:
+            records = [
+                record
+                for record in records
+                if record.classification_label == classification_label
+            ]
+        furniture = [graph.furniture_to_dict(record) for record in records]
+        return ToolResult(
+            {
+                "classification_label": classification_label,
+                "count": len(furniture),
+                "furniture": furniture,
+            }
+        )
+
+    registry.register(
+        ToolSpec(
+            name="list_furniture",
+            description=(
+                "List canonical furniture roles and their underlying object metadata. "
+                "Use for questions about desks, tables, sofas, chairs, shelves, beds, "
+                "cabinets, nightstands, or drawers."
+            ),
+            parameters_json_schema={
+                "type": "object",
+                "properties": {
+                    "classification_label": {
+                        "type": "string",
+                        "description": "Optional exact normalized furniture class.",
+                    }
+                },
+            },
+            handler=list_furniture,
+        )
+    )
+
+    def get_objects_related(furniture_id: int) -> ToolResult:
+        fid = _integer(furniture_id, -1)
+        furniture = graph.get_furniture(fid)
+        if not furniture.object.publishable:
+            return ToolResult({"error": f"furniture {fid} is not query-visible"})
+        relations = graph.relations_for_object(fid, direction="incoming")
+        objects = []
+        for object_id, relation_type in _furniture_child_memberships(relations, fid):
+            obj = graph.get_object(object_id)
+            if not obj.publishable:
+                continue
+            item = graph.object_to_dict(obj)
+            item["relation"] = relation_type
+            objects.append(item)
+        return ToolResult(
+            {
+                "furniture_id": fid,
+                "furniture": graph.furniture_to_dict(furniture),
+                "count": len(objects),
+                "objects": objects,
+            }
+        )
+
+    registry.register(
+        ToolSpec(
+            name="get_objects_related",
+            description=(
+                "Return all stable objects canonically classified as in or on one "
+                "furniture object. Each object includes relation='in' or relation='on'; "
+                "this is a containment/support query, not a proximity query."
+            ),
+            parameters_json_schema={
+                "type": "object",
+                "properties": {
+                    "furniture_id": {
+                        "type": "integer",
+                        "description": "Same-id furniture object from list_furniture.",
+                    }
+                },
+                "required": ["furniture_id"],
+            },
+            handler=get_objects_related,
+        )
+    )
+
+    def get_relations(
+        object_id: int | None = None,
+        relation_type: str | None = None,
+        direction: str = "either",
+    ) -> ToolResult:
+        oid = None if object_id is None else _integer(object_id, -1)
+        relations = graph.relations_for_object(
+            oid, relation_type=relation_type, direction=direction
+        )
+        return ToolResult(
+            {
+                "object_id": oid,
+                "relation_type": relation_type,
+                "direction": direction,
+                "count": len(relations),
+                "relations": relations,
+            }
+        )
+
+    registry.register(
+        ToolSpec(
+            name="get_relations",
+            description=(
+                "Return canonical scene relations, including object/furniture 'in' and "
+                "'on' relations and room containment."
+            ),
+            parameters_json_schema={
+                "type": "object",
+                "properties": {
+                    "object_id": {"type": "integer"},
+                    "relation_type": {"type": "string"},
+                    "direction": {
+                        "type": "string",
+                        "enum": ["either", "outgoing", "incoming"],
+                    },
+                },
+            },
+            handler=get_relations,
         )
     )
 
@@ -514,7 +751,12 @@ def create_live_tool_registry(
         room_id: str | int | None = None,
     ) -> ToolResult:
         k = max(1, _integer(top_k, config.top_k))
-        params: dict[str, Any] = {"query": description, "limit": k}
+        params: dict[str, Any] = {
+            "query": description,
+            "limit": k,
+            "include_inactive": True,
+            "include_unpublishable": False,
+        }
         if room_id is not None:
             params["room_id"] = str(room_id)
         matches = client.call("search_objects", params)
@@ -533,7 +775,8 @@ def create_live_tool_registry(
             name="search_objects",
             description=(
                 "Find objects by semantic description in the live Roomie scene. "
-                "Results are pinned to this answer's scene revision."
+                "The QA-visible set contains stable publishable objects regardless "
+                "of active state. Results are pinned to this answer's scene revision."
             ),
             parameters_json_schema={
                 "type": "object",
@@ -561,7 +804,13 @@ def create_live_tool_registry(
             if isinstance(center, list) and len(center) == 3:
                 neighbors = client.call(
                     "get_objects_near",
-                    {"center_world": center, "radius_m": 1.0, "limit": 12},
+                    {
+                        "center_world": center,
+                        "radius_m": 1.0,
+                        "limit": 12,
+                        "include_inactive": True,
+                        "include_unpublishable": False,
+                    },
                 )
                 data["nearby_objects_1m"] = [
                     _live_object(item)
@@ -598,9 +847,7 @@ def create_live_tool_registry(
             name="list_rooms",
             description=(
                 "List canonical rooms and their live object ids. If no explicit room "
-                "hierarchy exists, the result identifies the whole current scene as "
-                "one implicit room; answer from that result without calling a "
-                "room-scoped tool."
+                "exists, all stable scene objects are assigned to the queryable room-0."
             ),
             parameters_json_schema={"type": "object", "properties": {}},
             handler=list_rooms,
@@ -619,12 +866,20 @@ def create_live_tool_registry(
             (item for item in rooms if str(item.get("room_id")) == room_key),
             None,
         )
+        if room is None and not rooms and room_key == IMPLICIT_ROOM_ID:
+            room = _implicit_room()
         if room is None:
             return ToolResult({"error": f"unknown room_id: {room_key}"})
         if description:
             matches = client.call(
                 "search_objects",
-                {"query": description, "room_id": room_key, "limit": k},
+                {
+                    "query": description,
+                    "room_id": room_key,
+                    "limit": k,
+                    "include_inactive": True,
+                    "include_unpublishable": False,
+                },
             )
             objects = [_live_search_match(match) for match in matches or []]
         else:
@@ -688,7 +943,13 @@ def create_live_tool_registry(
         k = max(1, _integer(top_k, config.top_k))
         values = client.call(
             "get_objects_near",
-            {"center_world": center_list, "radius_m": radius, "limit": k},
+            {
+                "center_world": center_list,
+                "radius_m": radius,
+                "limit": k,
+                "include_inactive": True,
+                "include_unpublishable": False,
+            },
         )
         objects = []
         for value in values or []:
@@ -730,6 +991,172 @@ def create_live_tool_registry(
                 "required": ["radius_m"],
             },
             handler=get_objects_near,
+        )
+    )
+
+    def list_furniture(classification_label: str | None = None) -> ToolResult:
+        values = client.call("furniture", {}) or []
+        furniture = []
+        for value in values:
+            if not isinstance(value, dict):
+                continue
+            role = (
+                value.get("role")
+                if isinstance(value.get("role"), dict)
+                else {}
+            )
+            if (
+                classification_label
+                and role.get("classification_label") != classification_label
+            ):
+                continue
+            object_value = _live_object(value.get("object"))
+            if object_value.get("publishable") is False:
+                continue
+            furniture.append(
+                {"role": role, "object": object_value}
+            )
+        return ToolResult(
+            {
+                "classification_label": classification_label,
+                "count": len(furniture),
+                "furniture": furniture,
+            }
+        )
+
+    registry.register(
+        ToolSpec(
+            name="list_furniture",
+            description=(
+                "List live canonical furniture roles and their same-id object metadata."
+            ),
+            parameters_json_schema={
+                "type": "object",
+                "properties": {
+                    "classification_label": {
+                        "type": "string",
+                        "description": "Optional exact normalized furniture class.",
+                    }
+                },
+            },
+            handler=list_furniture,
+        )
+    )
+
+    def get_objects_related(furniture_id: int) -> ToolResult:
+        fid = _integer(furniture_id, -1)
+        anchor_value, relation_values = client.call_many(
+            [
+                {"method": "get_object", "params": {"object_id": fid}},
+                {
+                    "method": "relations",
+                    "params": {"object_id": fid, "direction": "incoming"},
+                },
+            ]
+        )
+        anchor = _live_object(anchor_value)
+        role = anchor.get("furniture_role")
+        if not isinstance(role, dict) or role.get("object_id") != fid:
+            return ToolResult({"error": f"object {fid} has no furniture role"})
+        if anchor.get("publishable") is False:
+            return ToolResult({"error": f"furniture {fid} is not query-visible"})
+        relations = (
+            [value for value in relation_values if isinstance(value, dict)]
+            if isinstance(relation_values, list)
+            else []
+        )
+        memberships = _furniture_child_memberships(relations, fid)
+        object_ids = sorted({object_id for object_id, _ in memberships})
+        values = client.call_many(
+            [
+                {"method": "get_object", "params": {"object_id": object_id}}
+                for object_id in object_ids
+            ]
+        )
+        objects_by_id = {
+            int(value["object_id"]): _live_object(value)
+            for value in values
+            if isinstance(value, dict) and isinstance(value.get("object_id"), int)
+        }
+        objects = []
+        for object_id, relation_type in memberships:
+            obj = objects_by_id.get(object_id)
+            if obj is None or obj.get("publishable") is False:
+                continue
+            item = dict(obj)
+            item["relation"] = relation_type
+            objects.append(item)
+        return ToolResult(
+            {
+                "furniture_id": fid,
+                "furniture": {"role": role, "object": anchor},
+                "count": len(objects),
+                "objects": objects,
+            }
+        )
+
+    registry.register(
+        ToolSpec(
+            name="get_objects_related",
+            description=(
+                "Return all stable objects canonically classified as in or on one "
+                "furniture object. Each object includes relation='in' or relation='on'; "
+                "this is a containment/support query, not a proximity query."
+            ),
+            parameters_json_schema={
+                "type": "object",
+                "properties": {
+                    "furniture_id": {
+                        "type": "integer",
+                        "description": "Same-id furniture object from list_furniture.",
+                    }
+                },
+                "required": ["furniture_id"],
+            },
+            handler=get_objects_related,
+        )
+    )
+
+    def get_relations(
+        object_id: int | None = None,
+        relation_type: str | None = None,
+        direction: str = "either",
+    ) -> ToolResult:
+        params: dict[str, Any] = {"direction": direction}
+        if object_id is not None:
+            params["object_id"] = _integer(object_id, -1)
+        if relation_type:
+            params["relation_type"] = relation_type
+        relations = client.call("relations", params) or []
+        return ToolResult(
+            {
+                "object_id": params.get("object_id"),
+                "relation_type": relation_type,
+                "direction": direction,
+                "count": len(relations),
+                "relations": relations,
+            }
+        )
+
+    registry.register(
+        ToolSpec(
+            name="get_relations",
+            description=(
+                "Return live canonical object, furniture, and room relations from the "
+                "same pinned scene revision."
+            ),
+            parameters_json_schema={
+                "type": "object",
+                "properties": {
+                    "object_id": {"type": "integer"},
+                    "relation_type": {"type": "string"},
+                    "direction": {
+                        "type": "string",
+                        "enum": ["either", "outgoing", "incoming"],
+                    },
+                },
+            },
+            handler=get_relations,
         )
     )
 

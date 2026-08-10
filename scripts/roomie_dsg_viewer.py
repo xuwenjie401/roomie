@@ -119,6 +119,9 @@ def normalize_graph(raw: dict[str, Any]) -> dict[str, Any]:
     relations = raw.get("relations")
     if not isinstance(relations, list):
         relations = object_graph.get("relations", [])
+    furniture = raw.get("furniture")
+    if not isinstance(furniture, list):
+        furniture = object_graph.get("furniture", [])
     snapshot_images = raw.get("snapshot_images")
     if not isinstance(snapshot_images, list):
         snapshot_images = object_graph.get("snapshot_images", [])
@@ -129,6 +132,7 @@ def normalize_graph(raw: dict[str, Any]) -> dict[str, Any]:
         "saved_time_ns": raw.get("saved_time_ns", object_graph.get("saved_time_ns", 0)),
         "objects": objects,
         "relations": relations,
+        "furniture": furniture,
         "rooms": raw.get("rooms", []),
         "map": raw.get("map", {}),
         "snapshot_images": snapshot_images,

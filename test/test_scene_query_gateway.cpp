@@ -83,7 +83,8 @@ SceneSnapshot makeSnapshot(
     std::vector<ObjectRelation> relations = {},
     std::vector<ObjectAlias> aliases = {},
     std::vector<ObjectSnapshotImage> images = {},
-    std::vector<RoomNode, Eigen::aligned_allocator<RoomNode>> rooms = {}) {
+    std::vector<RoomNode, Eigen::aligned_allocator<RoomNode>> rooms = {},
+    std::vector<FurnitureRole> furniture = {}) {
   auto state = std::make_shared<SceneState>();
   state->latest_scene_revision = revision;
   state->durable_scene_revision = revision > 0 ? revision - 1 : 0;
@@ -104,6 +105,7 @@ SceneSnapshot makeSnapshot(
 
   auto graph = std::make_shared<SceneGraphMetadata>();
   graph->rooms = std::move(rooms);
+  graph->furniture = std::move(furniture);
   graph->relations = std::move(relations);
   graph->snapshot_images = std::move(images);
   state->graph = graph;
@@ -172,6 +174,111 @@ class FakeSnapshotAssetProvider final : public SnapshotAssetProvider {
     return current;
   }
 };
+
+TEST(SceneQueryGateway, FurnitureUsesSameObjectIdentityAndTypedRelations) {
+  const SceneObjectPtr table = makeObject(
+      1, "table", "wood table", Eigen::Vector3f(0.0f, 0.0f, 0.5f));
+  const SceneObjectPtr cup = makeObject(
+      2, "cup", "small cup", Eigen::Vector3f(0.0f, 0.0f, 1.0f));
+  RoomNode room;
+  room.room_id = 10;
+  room.label = "kitchen";
+
+  SceneRelation on;
+  setRelationEndpoints(
+      &on, SceneEntityRef{SceneEntityType::kObject, 2},
+      SceneEntityRef{SceneEntityType::kFurniture, 1});
+  on.relation_type = "on";
+  on.derived = true;
+  SceneRelation room_furniture;
+  setRelationEndpoints(
+      &room_furniture, SceneEntityRef{SceneEntityType::kRoom, 10},
+      SceneEntityRef{SceneEntityType::kFurniture, 1});
+  room_furniture.relation_type = "room_contains_furniture";
+  room_furniture.derived = true;
+  SceneRelation room_object;
+  setRelationEndpoints(
+      &room_object, SceneEntityRef{SceneEntityType::kRoom, 10},
+      SceneEntityRef{SceneEntityType::kObject, 1});
+  room_object.relation_type = "room_contains_object";
+  room_object.derived = true;
+
+  SceneSnapshot snapshot = makeSnapshot(
+      9, {{1, table}, {2, cup}}, {on, room_furniture, room_object}, {}, {},
+      {room}, {FurnitureRole{1, 3, "table"}});
+  SceneQueryGateway gateway([&snapshot]() { return snapshot; });
+  LocalSceneQueryHandlers handlers(gateway, gateway.pin());
+
+  const auto object = handlers.getObject(1);
+  ASSERT_TRUE(object.ok()) << object.message;
+  ASSERT_TRUE(object.value.furniture_role.has_value());
+  EXPECT_EQ(object.value.furniture_role->object_id, object.value.object_id);
+
+  const auto furniture = handlers.furniture();
+  ASSERT_TRUE(furniture.ok()) << furniture.message;
+  ASSERT_EQ(furniture.value.size(), 1U);
+  EXPECT_EQ(furniture.value.front().role.object_id,
+            furniture.value.front().object.object_id);
+
+  RelationRequest request;
+  request.object_id = 1;
+  const auto relations = handlers.relations(request);
+  ASSERT_TRUE(relations.ok()) << relations.message;
+  EXPECT_EQ(relations.value.size(), 3U);
+  const auto on_result = std::find_if(
+      relations.value.begin(), relations.value.end(), [](const auto& relation) {
+        return relation.relation_type == "on";
+      });
+  ASSERT_NE(on_result, relations.value.end());
+  EXPECT_EQ(on_result->target.type, SceneEntityType::kFurniture);
+  EXPECT_EQ(on_result->target_object_id, 1);
+
+  const auto rooms = handlers.rooms();
+  ASSERT_TRUE(rooms.ok()) << rooms.message;
+  ASSERT_EQ(rooms.value.size(), 1U);
+  EXPECT_EQ(rooms.value.front().furniture_ids,
+            std::vector<SceneObjectId>({1}));
+  EXPECT_EQ(rooms.value.front().object_ids,
+            std::vector<SceneObjectId>({1}));
+}
+
+TEST(SceneQueryGateway, MissingRoomDefaultsStableSceneToRoomZero) {
+  SceneObjectPtr inactive = makeObject(
+      1, "sofa", "gray sofa", Eigen::Vector3f(0.0f, 0.0f, 0.5f));
+  auto inactive_lifecycle =
+      std::make_shared<LifecycleComponent>(*inactive->lifecycle);
+  inactive_lifecycle->active = false;
+  auto inactive_object = std::make_shared<SceneObject>(*inactive);
+  inactive_object->lifecycle = std::move(inactive_lifecycle);
+  inactive = std::move(inactive_object);
+
+  SceneObjectPtr suppressed = makeObject(
+      2, "candidate", "unstable candidate",
+      Eigen::Vector3f(1.0f, 0.0f, 0.5f));
+  auto suppressed_lifecycle =
+      std::make_shared<LifecycleComponent>(*suppressed->lifecycle);
+  suppressed_lifecycle->publishable = false;
+  auto suppressed_object = std::make_shared<SceneObject>(*suppressed);
+  suppressed_object->lifecycle = std::move(suppressed_lifecycle);
+  suppressed = std::move(suppressed_object);
+
+  SceneSnapshot snapshot = makeSnapshot(
+      10, {{1, inactive}, {2, suppressed}}, {}, {}, {}, {},
+      {FurnitureRole{1, 4, "sofa"}});
+  SceneQueryGateway gateway([&snapshot]() { return snapshot; });
+
+  const auto rooms = gateway.rooms(gateway.pin());
+
+  ASSERT_TRUE(rooms.ok()) << rooms.message;
+  ASSERT_EQ(rooms.value.size(), 1U);
+  EXPECT_EQ(rooms.value.front().room_id, "room-0");
+  EXPECT_EQ(rooms.value.front().name, "room-0");
+  EXPECT_EQ(rooms.value.front().attributes.at("implicit"), "true");
+  EXPECT_EQ(rooms.value.front().object_ids,
+            std::vector<SceneObjectId>({1}));
+  EXPECT_EQ(rooms.value.front().furniture_ids,
+            std::vector<SceneObjectId>({1}));
+}
 
 struct FakeClocks {
   SceneReadToken::Clock::time_point steady =

@@ -9,6 +9,7 @@
 
 #include "roomie/pipeline/label_thresholds.hpp"
 #include "roomie/pipeline/types.hpp"
+#include "roomie/scene/furniture_graph.hpp"
 
 namespace roomie {
 
@@ -215,6 +216,10 @@ struct PipelineConfig {
   int embedding_request_timeout_ms = 120000;
   int embedding_shutdown_timeout_ms = 500;
   bool freeze_instances = false;
+  std::string furniture_config_file = "scene_qa/furniture.json";
+  FurnitureGraphConfig furniture_graph_config =
+      defaultFurnitureGraphConfig();
+  int furniture_rebuild_timeout_ms = 5000;
   bool save_scene_graph = true;
   std::string scene_graph_save_path;
   std::string save_dsg_service = "/roomie/save_dsg";

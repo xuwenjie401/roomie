@@ -34,8 +34,9 @@ Gemini 依次读取 `--api-key`、`GEMINI_API_KEY`、`GOOGLE_API_KEY`；Doubao �
 `--doubao-api-key`、`DOUBAO_API_KEY`、`doubao_api_key`、`ARK_API_KEY`。如果 key
 已经在 `.bashrc` 中通过 `export` 设置，打开新终端后 launch 会直接继承，不要再把它
 写到 launch 参数或命令历史里。在线问答还需要能够访问相应 API 并具有模型配额。
-Doubao 默认模型和地址为 `doubao-seed-2-1-pro-260628`、
-`https://ark.cn-beijing.volces.com/api/v3`，都可在
+Doubao 默认模型和地址为 `doubao-seed-2-0-lite-260428`、
+`https://ark.cn-beijing.volces.com/api/v3`，默认关闭 thinking；模型、地址和
+`doubao_thinking_type` 都可在
 `config/scene_qa/config.json` 中修改。ROS 2 Humble
 继续使用系统 Python 3.10；QA 程序会自动通过系统 Python 子进程访问
 `/roomie/query_scene`，不要求在 Conda 环境中重新安装 ROS。

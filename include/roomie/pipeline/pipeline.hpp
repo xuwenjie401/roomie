@@ -1,6 +1,7 @@
 #pragma once
 
 #include <chrono>
+#include <cstddef>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -38,6 +39,14 @@ struct RoomiePipelineRuntimeDependencies {
   SemanticQueryVectorEncoder query_encoder;
 };
 
+struct FurnitureGraphRebuildResult {
+  SceneMutationSubmitResult submission;
+  std::size_t furniture_count = 0;
+  std::size_t in_relation_count = 0;
+  std::size_t on_relation_count = 0;
+  std::size_t room_relation_count = 0;
+};
+
 class RoomiePipeline {
  public:
   RoomiePipeline(
@@ -60,6 +69,12 @@ class RoomiePipeline {
       ApplyHumanAnnotationCommand command,
       std::chrono::milliseconds timeout =
           SceneMutationJsonAdapter::kDefaultTimeout);
+
+  // Reclassifies furniture roles explicitly and atomically rebuilds all
+  // furniture-derived relations. Subsequent geometry/lifecycle changes keep
+  // those relations current without reclassifying new roles.
+  FurnitureGraphRebuildResult rebuildFurnitureGraph(
+      std::chrono::milliseconds timeout);
 
  private:
   void scheduleMissingEmbeddingJobs(std::vector<EmbeddingJob> jobs,

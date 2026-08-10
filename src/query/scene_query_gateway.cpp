@@ -198,7 +198,8 @@ bool relationMeansMemberToRoom(std::string_view relation_type) {
 bool relationMeansRoomContains(std::string_view relation_type) {
   const std::string key = normalizedKey(relation_type);
   return key == "contains" || key == "room_contains" ||
-         key == "room_contains_object";
+         key == "room_contains_object" ||
+         key == "room_contains_furniture";
 }
 
 std::optional<std::string> attribute(
@@ -531,6 +532,15 @@ QueryObjectView SceneQueryGateway::objectView(
   if (object.artifact) {
     view.snapshot_set_hash = object.artifact->snapshot_set_hash;
   }
+  const auto& furniture = token.snapshot_.graphMetadata().furniture;
+  const auto role = std::find_if(
+      furniture.begin(), furniture.end(),
+      [canonical_object_id](const FurnitureRole& candidate) {
+        return candidate.object_id == canonical_object_id;
+      });
+  if (role != furniture.end()) {
+    view.furniture_role = *role;
+  }
   view.semantic_document_hash = semanticDocumentHash(object);
 
   if (!object.geometry) {
@@ -700,6 +710,46 @@ QueryResult<QueryObjectList> SceneQueryGateway::getObjectsNear(
   return result;
 }
 
+QueryResult<QueryFurnitureList> SceneQueryGateway::furniture(
+    const SceneReadToken& token) const {
+  QueryMetadata metadata = metadataFor(token);
+  std::string message;
+  const QueryStatus validation = validateToken(token, &message);
+  if (validation != QueryStatus::kOk) {
+    return tokenFailure<QueryFurnitureList>(
+        validation, std::move(message), std::move(metadata));
+  }
+
+  QueryResult<QueryFurnitureList> result;
+  result.metadata = std::move(metadata);
+  std::set<SceneObjectId> emitted;
+  for (const FurnitureRole& role : token.snapshot_.graphMetadata().furniture) {
+    const auto canonical = token.snapshot_.resolveCanonicalId(role.object_id);
+    if (!canonical || token.snapshot_.isTombstoned(*canonical) ||
+        !emitted.insert(*canonical).second) {
+      continue;
+    }
+    const SceneObjectPtr object = token.snapshot_.findExactObject(*canonical);
+    if (!object) {
+      continue;
+    }
+    QueryFurnitureView view;
+    view.role = role;
+    view.role.object_id = *canonical;
+    view.object = objectView(token, role.object_id, *canonical, *object);
+    view.object.furniture_role = view.role;
+    absorbFreshness(&result.metadata, view.object);
+    result.value.push_back(std::move(view));
+  }
+  std::sort(result.value.begin(), result.value.end(),
+            [](const QueryFurnitureView& lhs,
+               const QueryFurnitureView& rhs) {
+              return lhs.role.object_id < rhs.role.object_id;
+            });
+  finishMetadata(&result.metadata, !result.value.empty());
+  return result;
+}
+
 std::vector<CanonicalRelation> SceneQueryGateway::canonicalRelations(
     const SceneReadToken& token) const {
   using Key = std::tuple<int, int, int, int, std::string>;
@@ -708,6 +758,14 @@ std::vector<CanonicalRelation> SceneQueryGateway::canonicalRelations(
   for (const RoomNode& room : token.snapshot_.graphMetadata().rooms) {
     if (room.room_id >= 0) {
       room_ids.insert(room.room_id);
+    }
+  }
+  std::set<int> furniture_ids;
+  for (const FurnitureRole& role : token.snapshot_.graphMetadata().furniture) {
+    const auto canonical = token.snapshot_.resolveCanonicalId(role.object_id);
+    if (canonical && !token.snapshot_.isTombstoned(*canonical) &&
+        token.snapshot_.findExactObject(*canonical)) {
+      furniture_ids.insert(*canonical);
     }
   }
   for (const ObjectRelation& relation :
@@ -732,6 +790,10 @@ std::vector<CanonicalRelation> SceneQueryGateway::canonicalRelations(
       }
       *resolved_alias = *canonical != endpoint->id;
       endpoint->id = *canonical;
+      if (endpoint->type == SceneEntityType::kFurniture &&
+          furniture_ids.count(endpoint->id) == 0U) {
+        return false;
+      }
       return true;
     };
     if (!canonicalize(&source, &source_resolved_alias) ||
@@ -741,10 +803,8 @@ std::vector<CanonicalRelation> SceneQueryGateway::canonicalRelations(
     CanonicalRelation current;
     current.source = source;
     current.target = target;
-    current.source_object_id =
-        source.type == SceneEntityType::kObject ? source.id : -1;
-    current.target_object_id =
-        target.type == SceneEntityType::kObject ? target.id : -1;
+    current.source_object_id = entityBackedByObject(source) ? source.id : -1;
+    current.target_object_id = entityBackedByObject(target) ? target.id : -1;
     current.relation_type = relation.relation_type;
     current.confidence = relation.confidence;
     current.description = relation.description;
@@ -815,32 +875,32 @@ QueryResult<std::vector<CanonicalRelation>> SceneQueryGateway::relations(
       continue;
     }
     if (canonical_filter) {
+      const auto matches_object = [canonical_filter](
+                                      const SceneEntityRef& endpoint) {
+        return entityBackedByObject(endpoint) &&
+               endpoint.id == *canonical_filter;
+      };
       bool matches = false;
       switch (request.direction) {
         case RelationDirection::kEither:
-          matches =
-              (relation.source.type == SceneEntityType::kObject &&
-               relation.source.id == *canonical_filter) ||
-              (relation.target.type == SceneEntityType::kObject &&
-               relation.target.id == *canonical_filter);
+          matches = matches_object(relation.source) ||
+                    matches_object(relation.target);
           break;
         case RelationDirection::kOutgoing:
-          matches = relation.source.type == SceneEntityType::kObject &&
-                    relation.source.id == *canonical_filter;
+          matches = matches_object(relation.source);
           break;
         case RelationDirection::kIncoming:
-          matches = relation.target.type == SceneEntityType::kObject &&
-                    relation.target.id == *canonical_filter;
+          matches = matches_object(relation.target);
           break;
       }
       if (!matches) {
         continue;
       }
     }
-    if (relation.source.type == SceneEntityType::kObject) {
+    if (entityBackedByObject(relation.source)) {
       involved_objects.insert(relation.source.id);
     }
-    if (relation.target.type == SceneEntityType::kObject) {
+    if (entityBackedByObject(relation.target)) {
       involved_objects.insert(relation.target.id);
     }
     result.value.push_back(std::move(relation));
@@ -963,21 +1023,56 @@ std::vector<CanonicalRoom> SceneQueryGateway::canonicalRooms(
         }
       }
     } else if (relationMeansRoomContains(relation.relation_type) &&
-               relation.target.type == SceneEntityType::kObject) {
+               entityBackedByObject(relation.target)) {
+      const bool furniture_member =
+          relation.target.type == SceneEntityType::kFurniture ||
+          normalizedKey(relation.relation_type) ==
+              "room_contains_furniture";
+      const auto append_member = [&](CanonicalRoom* room) {
+        if (furniture_member) {
+          room->furniture_ids.push_back(relation.target.id);
+        } else {
+          room->object_ids.push_back(relation.target.id);
+        }
+      };
       if (relation.source.type == SceneEntityType::kRoom) {
         const auto source = room_node_to_id.find(relation.source.id);
         if (source != room_node_to_id.end()) {
-          rooms_by_id[source->second].object_ids.push_back(
-              relation.target.id);
+          append_member(&rooms_by_id[source->second]);
         }
       } else {
         const auto source = room_object_to_id.find(relation.source.id);
         if (source != room_object_to_id.end()) {
-          rooms_by_id[source->second].object_ids.push_back(
-              relation.target.id);
+          append_member(&rooms_by_id[source->second]);
         }
       }
     }
+  }
+
+  if (rooms_by_id.empty()) {
+    CanonicalRoom room;
+    room.room_id = "room-0";
+    room.name = room.room_id;
+    room.attributes["implicit"] = "true";
+    std::set<SceneObjectId> stable_object_ids;
+    for (const auto& entry : token.snapshot_.objects()) {
+      if (!entry.second || token.snapshot_.isTombstoned(entry.first) ||
+          isRoomObject(*entry.second) ||
+          !objectVisible(*entry.second, /*include_inactive=*/true,
+                         /*include_unpublishable=*/false)) {
+        continue;
+      }
+      stable_object_ids.insert(entry.first);
+      room.object_ids.push_back(entry.first);
+    }
+    for (const FurnitureRole& role :
+         token.snapshot_.graphMetadata().furniture) {
+      const auto canonical = token.snapshot_.resolveCanonicalId(role.object_id);
+      if (canonical && stable_object_ids.count(*canonical) != 0U) {
+        room.furniture_ids.push_back(*canonical);
+      }
+    }
+    rooms_by_id.emplace(room.room_id, std::move(room));
   }
 
   std::vector<CanonicalRoom> result;
@@ -988,6 +1083,10 @@ std::vector<CanonicalRoom> SceneQueryGateway::canonicalRooms(
     room.object_ids.erase(
         std::unique(room.object_ids.begin(), room.object_ids.end()),
         room.object_ids.end());
+    std::sort(room.furniture_ids.begin(), room.furniture_ids.end());
+    room.furniture_ids.erase(
+        std::unique(room.furniture_ids.begin(), room.furniture_ids.end()),
+        room.furniture_ids.end());
     result.push_back(std::move(room));
   }
   return result;
@@ -1285,6 +1384,10 @@ QueryResult<QueryObjectView> LocalSceneQueryHandlers::getObject(
 QueryResult<QueryObjectList> LocalSceneQueryHandlers::getObjectsNear(
     const ObjectsNearRequest& request) const {
   return gateway_->getObjectsNear(token_, request);
+}
+
+QueryResult<QueryFurnitureList> LocalSceneQueryHandlers::furniture() const {
+  return gateway_->furniture(token_);
 }
 
 QueryResult<std::vector<CanonicalRoom>> LocalSceneQueryHandlers::rooms() const {

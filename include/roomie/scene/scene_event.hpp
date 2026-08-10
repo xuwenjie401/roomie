@@ -132,6 +132,14 @@ struct RelationCommitted {
   ObjectRelation relation;
 };
 
+struct FurnitureGraphRebuilt {
+  SceneRevision revision = 0;
+  std::size_t furniture_count = 0;
+  std::size_t in_relation_count = 0;
+  std::size_t on_relation_count = 0;
+  std::size_t room_relation_count = 0;
+};
+
 struct DurabilityWatermarkAdvanced {
   SceneRevision latest_scene_revision = 0;
   SceneRevision durable_scene_revision = 0;
@@ -152,7 +160,8 @@ using SceneEvent =
                  DescriptionInvalidated, DescriptionCommitted,
                  HumanAnnotationCommitted, RoomUpdated, RoomRemoved,
                  RelationInvalidated,
-                 RelationCommitted, DurabilityWatermarkAdvanced,
+                 RelationCommitted, FurnitureGraphRebuilt,
+                 DurabilityWatermarkAdvanced,
                  ShutdownAccepted>;
 
 }  // namespace roomie

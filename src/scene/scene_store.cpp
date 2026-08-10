@@ -947,8 +947,13 @@ InstanceTrack trackFromJson(const Json& value) {
 
 Json graphMetadataToJson(const SceneGraphMetadata& graph) {
   const auto entity_to_json = [](SceneEntityRef entity) {
-    return Json{{"type", entity.type == SceneEntityType::kRoom ? "room"
-                                                               : "object"},
+    const char* type = "object";
+    if (entity.type == SceneEntityType::kRoom) {
+      type = "room";
+    } else if (entity.type == SceneEntityType::kFurniture) {
+      type = "furniture";
+    }
+    return Json{{"type", type},
                 {"id", entity.id}};
   };
   Json rooms = Json::array();
@@ -979,6 +984,13 @@ Json graphMetadataToJson(const SceneGraphMetadata& graph) {
              {"revision", relation.revision},
              {"derived", relation.derived}});
   }
+  Json furniture = Json::array();
+  for (const FurnitureRole& role : graph.furniture) {
+    furniture.push_back(
+        Json{{"object_id", role.object_id},
+             {"revision", role.revision},
+             {"classification_label", role.classification_label}});
+  }
   Json images = Json::array();
   for (const ObjectSnapshotImage& image : graph.snapshot_images) {
     images.push_back(
@@ -992,6 +1004,7 @@ Json graphMetadataToJson(const SceneGraphMetadata& graph) {
              {"source_path", image.source_path}});
   }
   return Json{{"rooms", std::move(rooms)},
+              {"furniture", std::move(furniture)},
               {"relations", std::move(relations)},
               {"snapshot_images", std::move(images)},
               {"import_warnings", graph.import_warnings},
@@ -1012,9 +1025,15 @@ std::shared_ptr<const SceneGraphMetadata> graphMetadataFromJson(
     if (entity_id < -1) {
       throw StoreError("stored scene entity id is invalid");
     }
-    return SceneEntityRef{
-        type == "room" ? SceneEntityType::kRoom : SceneEntityType::kObject,
-        entity_id};
+    SceneEntityType entity_type = SceneEntityType::kObject;
+    if (type == "room") {
+      entity_type = SceneEntityType::kRoom;
+    } else if (type == "furniture") {
+      entity_type = SceneEntityType::kFurniture;
+    } else if (type != "object") {
+      throw StoreError("stored scene entity type is invalid");
+    }
+    return SceneEntityRef{entity_type, entity_id};
   };
   for (const Json& room_json : value.value("rooms", Json::array())) {
     RoomNode room;
@@ -1036,6 +1055,21 @@ std::shared_ptr<const SceneGraphMetadata> graphMetadataFromJson(
     room.attributes = room_json.value(
         "attributes", std::map<std::string, std::string>{});
     graph->rooms.push_back(std::move(room));
+  }
+  for (const Json& role_json :
+       value.value("furniture", Json::array())) {
+    FurnitureRole role;
+    role.object_id = jsonIntOr(role_json, "object_id", -1);
+    if (role.object_id < 0) {
+      throw StoreError("stored furniture object id is invalid");
+    }
+    role.revision = jsonUnsignedOr(role_json, "revision", 0);
+    role.classification_label =
+        role_json.value("classification_label", std::string());
+    if (role.classification_label.empty()) {
+      throw StoreError("stored furniture classification label is empty");
+    }
+    graph->furniture.push_back(std::move(role));
   }
   for (const Json& relation_json :
        value.value("relations", Json::array())) {
@@ -1247,6 +1281,33 @@ SceneSnapshot deserializeSnapshot(const std::string& payload,
   }
   state->tracks = std::make_shared<const SceneTrackTable>(std::move(tracks));
   state->graph = graphMetadataFromJson(value.at("graph"));
+  std::set<int> furniture_ids;
+  for (const FurnitureRole& role : state->graph->furniture) {
+    if (state->objects->count(role.object_id) == 0U ||
+        !furniture_ids.insert(role.object_id).second) {
+      throw StoreError(
+          "stored furniture roles do not reference unique live objects");
+    }
+  }
+  std::set<int> room_ids;
+  for (const RoomNode& room : state->graph->rooms) {
+    room_ids.insert(room.room_id);
+  }
+  const auto valid_endpoint = [&](SceneEntityRef endpoint) {
+    if (endpoint.type == SceneEntityType::kRoom) {
+      return room_ids.count(endpoint.id) != 0U;
+    }
+    if (endpoint.type == SceneEntityType::kFurniture) {
+      return furniture_ids.count(endpoint.id) != 0U;
+    }
+    return state->objects->count(endpoint.id) != 0U;
+  };
+  for (const SceneRelation& relation : state->graph->relations) {
+    if (!valid_endpoint(relationSource(relation)) ||
+        !valid_endpoint(relationTarget(relation))) {
+      throw StoreError("stored relation references a missing scene entity");
+    }
+  }
   return SceneSnapshot(std::move(state));
 }
 

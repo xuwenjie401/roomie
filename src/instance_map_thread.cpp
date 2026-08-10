@@ -1257,6 +1257,7 @@ InstanceMapThread::InstanceMapThread(ThreadSafeQueue<InferenceResponse>& respons
       map_projector_(map_projector),
       config_(std::move(config)),
       snapshot_remaker_(snapshotRemakerConfigFromPipeline(config_)),
+      reducer_(config_.furniture_graph_config),
       published_scene_state_(reducer_.snapshot().statePtr()),
       pending_snapshot_controls_(config_.snapshot_control_queue_size) {}
 

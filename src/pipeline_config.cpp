@@ -2,7 +2,10 @@
 
 #include <algorithm>
 #include <cmath>
+#include <filesystem>
 #include <stdexcept>
+
+#include <ament_index_cpp/get_package_share_directory.hpp>
 
 namespace roomie {
 
@@ -537,6 +540,23 @@ PipelineConfig PipelineConfig::declareAndLoad(rclcpp::Node& node) {
           "persistence.scene_store_terminal_failure_timeout_ms",
           config.scene_store_terminal_failure_timeout_ms),
       config.scene_store_terminal_failure_timeout_ms);
+  config.furniture_config_file = node.declare_parameter<std::string>(
+      "scene_graph.furniture_config_file", config.furniture_config_file);
+  config.furniture_rebuild_timeout_ms = positiveIntOrDefault(
+      node.declare_parameter<int>("scene_graph.furniture_rebuild_timeout_ms",
+                                  config.furniture_rebuild_timeout_ms),
+      config.furniture_rebuild_timeout_ms);
+  std::filesystem::path furniture_config_path(
+      config.furniture_config_file);
+  if (furniture_config_path.is_relative()) {
+    furniture_config_path = std::filesystem::path(
+                                ament_index_cpp::get_package_share_directory(
+                                    "roomie")) /
+                            "config" / furniture_config_path;
+  }
+  config.furniture_config_file = furniture_config_path.string();
+  config.furniture_graph_config =
+      loadFurnitureGraphConfig(furniture_config_path);
   config.online_snapshot_enabled = node.declare_parameter<bool>(
       "artifacts.snapshot_enabled", config.online_snapshot_enabled);
   config.asset_store_root = node.declare_parameter<std::string>(

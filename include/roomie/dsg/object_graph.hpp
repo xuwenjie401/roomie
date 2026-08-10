@@ -125,41 +125,47 @@ struct InstanceTrack {
   std::map<int, float> semantic_weights;
 };
 
-struct ObjectRelation {
+enum class SceneEntityType {
+  kObject,
+  kRoom,
+  // Furniture is a typed projection of the canonical object with the same id;
+  // it is not a second copy of object geometry or semantics.
+  kFurniture,
+};
+
+struct SceneEntityRef {
+  SceneEntityType type = SceneEntityType::kObject;
+  int id = -1;
+
+  bool valid() const { return id >= 0; }
+  bool operator==(const SceneEntityRef& other) const {
+    return type == other.type && id == other.id;
+  }
+  bool operator!=(const SceneEntityRef& other) const {
+    return !(*this == other);
+  }
+};
+
+struct SceneRelation {
   // Legacy object-object endpoints. They remain populated for v1/v2 readers,
-  // while source/target below are authoritative for schema v3 and can also
-  // address rooms.
+  // while source/target below are authoritative for schema v3+ and can also
+  // address rooms and furniture.
   int source_object_id = -1;
   int target_object_id = -1;
   std::string relation_type;
   float confidence = 0.0f;
   std::string description;
-  enum class EntityType {
-    kObject,
-    kRoom,
-  };
-  struct EntityRef {
-    EntityType type = EntityType::kObject;
-    int id = -1;
-
-    bool valid() const { return id >= 0; }
-    bool operator==(const EntityRef& other) const {
-      return type == other.type && id == other.id;
-    }
-    bool operator!=(const EntityRef& other) const {
-      return !(*this == other);
-    }
-  };
-  EntityRef source;
-  EntityRef target;
+  SceneEntityRef source;
+  SceneEntityRef target;
   std::uint64_t revision = 0;
   bool derived = false;
 };
 
-using SceneEntityType = ObjectRelation::EntityType;
-using SceneEntityRef = ObjectRelation::EntityRef;
+// Compatibility name retained for the existing C++ call sites. New code uses
+// SceneRelation because endpoints can address rooms and furniture as well.
+using ObjectRelation = SceneRelation;
 
-inline SceneEntityRef relationSource(const ObjectRelation& relation) {
+inline SceneEntityRef relationSource(const SceneRelation& relation) {
   if (relation.source.valid()) {
     return relation.source;
   }
@@ -167,7 +173,7 @@ inline SceneEntityRef relationSource(const ObjectRelation& relation) {
                         relation.source_object_id};
 }
 
-inline SceneEntityRef relationTarget(const ObjectRelation& relation) {
+inline SceneEntityRef relationTarget(const SceneRelation& relation) {
   if (relation.target.valid()) {
     return relation.target;
   }
@@ -175,7 +181,7 @@ inline SceneEntityRef relationTarget(const ObjectRelation& relation) {
                         relation.target_object_id};
 }
 
-inline void setRelationEndpoints(ObjectRelation* relation,
+inline void setRelationEndpoints(SceneRelation* relation,
                                  SceneEntityRef source,
                                  SceneEntityRef target) {
   if (relation == nullptr) {
@@ -183,11 +189,30 @@ inline void setRelationEndpoints(ObjectRelation* relation,
   }
   relation->source = source;
   relation->target = target;
-  relation->source_object_id =
-      source.type == SceneEntityType::kObject ? source.id : -1;
-  relation->target_object_id =
-      target.type == SceneEntityType::kObject ? target.id : -1;
+  // Furniture ids are canonical object ids, so legacy object-only readers can
+  // still identify the physical endpoints even though they cannot represent
+  // the furniture role itself.
+  relation->source_object_id = source.type == SceneEntityType::kRoom
+                                   ? -1
+                                   : source.id;
+  relation->target_object_id = target.type == SceneEntityType::kRoom
+                                   ? -1
+                                   : target.id;
 }
+
+inline bool entityBackedByObject(SceneEntityRef entity) {
+  return entity.type == SceneEntityType::kObject ||
+         entity.type == SceneEntityType::kFurniture;
+}
+
+struct FurnitureRole {
+  // object_id is also the id used by kFurniture relation endpoints.
+  int object_id = -1;
+  std::uint64_t revision = 0;
+  // The normalized class that selected this role. It remains stable until the
+  // next explicit furniture rebuild, even if the object's label later changes.
+  std::string classification_label;
+};
 
 struct RoomNode {
   EIGEN_MAKE_ALIGNED_OPERATOR_NEW
@@ -253,11 +278,12 @@ struct ObjectNode {
 };
 
 struct ObjectGraphSnapshot {
-  int schema_version = 3;
+  int schema_version = 4;
   int next_object_id = 0;
   std::vector<ObjectNode, Eigen::aligned_allocator<ObjectNode>> objects;
   std::vector<RoomNode, Eigen::aligned_allocator<RoomNode>> rooms;
-  std::vector<ObjectRelation> relations;
+  std::vector<FurnitureRole> furniture;
+  std::vector<SceneRelation> relations;
   std::vector<ObjectSnapshotImage> snapshot_images;
   std::vector<std::string> import_warnings;
   bool has_scene_graph_envelope = false;
@@ -285,7 +311,8 @@ class ObjectGraph {
   int next_object_id_ = 0;
   std::vector<ObjectNode, Eigen::aligned_allocator<ObjectNode>> objects_;
   std::vector<RoomNode, Eigen::aligned_allocator<RoomNode>> rooms_;
-  std::vector<ObjectRelation> relations_;
+  std::vector<FurnitureRole> furniture_;
+  std::vector<SceneRelation> relations_;
   std::vector<ObjectSnapshotImage> snapshot_images_;
   std::vector<std::string> import_warnings_;
   bool has_scene_graph_envelope_ = false;

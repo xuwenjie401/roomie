@@ -508,6 +508,101 @@ bool relationKeyEqual(const ObjectRelation& lhs,
          lhs.relation_type == rhs.relation_type;
 }
 
+bool relationValueEqual(const SceneRelation& lhs,
+                        const SceneRelation& rhs) {
+  return relationKeyEqual(lhs, rhs) &&
+         std::abs(lhs.confidence - rhs.confidence) <= 1.0e-6f &&
+         lhs.description == rhs.description && lhs.derived == rhs.derived;
+}
+
+bool furnitureRolesEqual(const std::vector<FurnitureRole>& lhs,
+                         const std::vector<FurnitureRole>& rhs) {
+  return lhs.size() == rhs.size() &&
+         std::equal(lhs.begin(), lhs.end(), rhs.begin(),
+                    [](const FurnitureRole& a, const FurnitureRole& b) {
+                      return a.object_id == b.object_id &&
+                             a.revision == b.revision &&
+                             a.classification_label ==
+                                 b.classification_label;
+                    });
+}
+
+bool refreshFurnitureRelations(const SceneObjectTable& objects,
+                               SceneGraphMetadata* graph,
+                               const FurnitureGraphConfig& config,
+                               SceneRevision revision,
+                               std::vector<SceneEvent>* events) {
+  std::vector<SceneRelation> existing;
+  std::vector<SceneRelation> retained;
+  retained.reserve(graph->relations.size());
+  for (const SceneRelation& relation : graph->relations) {
+    if (isDerivedFurnitureRelation(relation)) {
+      existing.push_back(relation);
+    } else {
+      retained.push_back(relation);
+    }
+  }
+
+  std::vector<SceneRelation> desired = deriveFurnitureRelations(
+      objects, graph->rooms, graph->furniture, config, revision);
+  bool changed = existing.size() != desired.size();
+  for (SceneRelation& relation : desired) {
+    const auto same_key = std::find_if(
+        existing.begin(), existing.end(), [&](const SceneRelation& current) {
+          return relationKeyEqual(current, relation);
+        });
+    if (same_key != existing.end() && relationValueEqual(*same_key, relation)) {
+      relation = *same_key;
+      continue;
+    }
+    changed = true;
+    if (events != nullptr) {
+      events->push_back(RelationCommitted{revision, relation});
+    }
+  }
+  for (const SceneRelation& relation : existing) {
+    const auto same_value = std::find_if(
+        desired.begin(), desired.end(), [&](const SceneRelation& candidate) {
+          return relationValueEqual(relation, candidate);
+        });
+    if (same_value != desired.end()) {
+      continue;
+    }
+    changed = true;
+    if (events != nullptr) {
+      const SceneEntityRef source = relationSource(relation);
+      events->push_back(RelationInvalidated{
+          revision, entityBackedByObject(source) ? source.id : -1, source});
+    }
+  }
+  if (!changed) {
+    return false;
+  }
+  retained.insert(retained.end(), desired.begin(), desired.end());
+  graph->relations = std::move(retained);
+  return true;
+}
+
+FurnitureGraphRebuilt furnitureGraphStats(const SceneGraphMetadata& graph,
+                                          SceneRevision revision) {
+  FurnitureGraphRebuilt result;
+  result.revision = revision;
+  result.furniture_count = graph.furniture.size();
+  for (const SceneRelation& relation : graph.relations) {
+    if (!isDerivedFurnitureRelation(relation)) {
+      continue;
+    }
+    if (relation.relation_type == "in") {
+      ++result.in_relation_count;
+    } else if (relation.relation_type == "on") {
+      ++result.on_relation_count;
+    } else if (relation.relation_type == "room_contains_furniture") {
+      ++result.room_relation_count;
+    }
+  }
+  return result;
+}
+
 bool relationTouches(const ObjectRelation& relation,
                      SceneEntityRef endpoint) {
   return relationSource(relation) == endpoint ||
@@ -851,9 +946,10 @@ std::optional<ObjectRelation> deriveRoomContainmentRelation(
 
 ObjectGraphSnapshot SceneSnapshot::materializeObjectGraph() const {
   ObjectGraphSnapshot graph;
-  graph.schema_version = 3;
+  graph.schema_version = 4;
   graph.next_object_id = nextObjectId();
   graph.rooms = graphMetadata().rooms;
+  graph.furniture = graphMetadata().furniture;
   graph.relations = graphMetadata().relations;
   graph.snapshot_images = graphMetadata().snapshot_images;
   graph.import_warnings = graphMetadata().import_warnings;
@@ -926,10 +1022,22 @@ ObjectGraphSnapshot SceneSnapshot::materializeObjectGraph() const {
 }
 
 ReducerCore::ReducerCore()
-    : state_(std::make_shared<const SceneState>()) {}
+    : state_(std::make_shared<const SceneState>()),
+      furniture_config_(defaultFurnitureGraphConfig()) {}
+
+ReducerCore::ReducerCore(FurnitureGraphConfig furniture_config)
+    : state_(std::make_shared<const SceneState>()),
+      furniture_config_(std::move(furniture_config)) {}
 
 ReducerCore::ReducerCore(ObservationAssociator associator)
     : state_(std::make_shared<const SceneState>()),
+      furniture_config_(defaultFurnitureGraphConfig()),
+      observation_associator_(std::move(associator)) {}
+
+ReducerCore::ReducerCore(ObservationAssociator associator,
+                         FurnitureGraphConfig furniture_config)
+    : state_(std::make_shared<const SceneState>()),
+      furniture_config_(std::move(furniture_config)),
       observation_associator_(std::move(associator)) {}
 
 SceneSnapshot ReducerCore::snapshot() const { return SceneSnapshot(state_); }
@@ -1208,15 +1316,40 @@ SceneApplyResult ReducerCore::applyCommand(const LoadSceneCommand& command) {
       return reject("load contains invalid room geometry: " + room_error);
     }
   }
+  std::set<int> furniture_ids;
+  graph_metadata->furniture = command.graph.furniture;
+  for (FurnitureRole& role : graph_metadata->furniture) {
+    role.classification_label =
+        normalizeFurnitureLabel(role.classification_label);
+    if (role.object_id < 0 ||
+        next.objects->count(role.object_id) == 0U ||
+        !furniture_ids.insert(role.object_id).second ||
+        role.classification_label.empty() ||
+        furniture_config_.classes.count(role.classification_label) == 0U) {
+      return reject("load contains an invalid furniture role");
+    }
+    if (role.revision == 0) {
+      role.revision = 1;
+    }
+  }
+  std::sort(graph_metadata->furniture.begin(),
+            graph_metadata->furniture.end(),
+            [](const FurnitureRole& lhs, const FurnitureRole& rhs) {
+              return lhs.object_id < rhs.object_id;
+            });
   std::vector<ObjectRelation> relations;
   for (ObjectRelation relation : command.graph.relations) {
     normalizeRelation(&relation, revision);
     const SceneEntityRef source = relationSource(relation);
     const SceneEntityRef target = relationTarget(relation);
     const auto endpoint_exists = [&](SceneEntityRef endpoint) {
-      return endpoint.type == SceneEntityType::kRoom
-                 ? room_ids.count(endpoint.id) != 0
-                 : next.objects->count(endpoint.id) != 0;
+      if (endpoint.type == SceneEntityType::kRoom) {
+        return room_ids.count(endpoint.id) != 0U;
+      }
+      if (endpoint.type == SceneEntityType::kFurniture) {
+        return furniture_ids.count(endpoint.id) != 0U;
+      }
+      return next.objects->count(endpoint.id) != 0U;
     };
     if (!source.valid() || !target.valid() || relation.relation_type.empty() ||
         !endpoint_exists(source) || !endpoint_exists(target)) {
@@ -1231,14 +1364,20 @@ SceneApplyResult ReducerCore::applyCommand(const LoadSceneCommand& command) {
   }
   // Containment is derived from the canonical room and geometry components,
   // never from duplicated parent_room_ids in a manual JSON envelope.
-  relations.erase(
-      std::remove_if(relations.begin(), relations.end(), isRoomContainment),
-      relations.end());
+  relations.erase(std::remove_if(
+                      relations.begin(), relations.end(),
+                      [](const SceneRelation& relation) {
+                        return isRoomContainment(relation) ||
+                               isDerivedFurnitureRelation(relation);
+                      }),
+                  relations.end());
   graph_metadata->relations = std::move(relations);
   for (const auto& [object_id, object] : *next.objects) {
     recomputeContainmentForObject(object_id, object, graph_metadata.get(),
                                   revision, nullptr);
   }
+  refreshFurnitureRelations(*next.objects, graph_metadata.get(),
+                            furniture_config_, revision, nullptr);
   graph_metadata->snapshot_images = command.graph.snapshot_images;
   graph_metadata->import_warnings = command.graph.import_warnings;
   graph_metadata->has_scene_graph_envelope =
@@ -1290,6 +1429,7 @@ SceneApplyResult ReducerCore::applyCommand(
   SceneTrackTable tracks = *state_->tracks;
   SceneGraphMetadata graph = *state_->graph;
   bool graph_changed = false;
+  bool furniture_relations_dirty = false;
   std::set<SceneObjectId> containment_dirty_objects;
   const SceneRevision revision = nextSceneRevision(state_->latest_scene_revision);
   std::vector<SceneEvent> events;
@@ -1337,6 +1477,7 @@ SceneApplyResult ReducerCore::applyCommand(
                   revision, requested_id,
                   objects[requested_id]->geometry->obb_revision});
               containment_dirty_objects.insert(requested_id);
+              furniture_relations_dirty = !graph.furniture.empty();
             } else {
               SceneObjectPtr updated;
               bool obb_changed = false;
@@ -1348,6 +1489,7 @@ SceneApplyResult ReducerCore::applyCommand(
                 events.push_back(ObjectUpdated{
                     revision, requested_id,
                     objects[requested_id]->revisions()});
+                furniture_relations_dirty = !graph.furniture.empty();
               }
               if (obb_changed) {
                 const std::uint64_t obb_revision =
@@ -1357,6 +1499,7 @@ SceneApplyResult ReducerCore::applyCommand(
                 events.push_back(GeometryInvalidated{
                     revision, requested_id, obb_revision});
                 containment_dirty_objects.insert(requested_id);
+                furniture_relations_dirty = !graph.furniture.empty();
               }
             }
             if (track.track_id >= 0) {
@@ -1452,6 +1595,32 @@ SceneApplyResult ReducerCore::applyCommand(
               }
             }
             aliases[*source] = ObjectAlias{*source, *target, revision};
+            auto source_role = std::find_if(
+                graph.furniture.begin(), graph.furniture.end(),
+                [&](const FurnitureRole& role) {
+                  return role.object_id == *source;
+                });
+            auto target_role = std::find_if(
+                graph.furniture.begin(), graph.furniture.end(),
+                [&](const FurnitureRole& role) {
+                  return role.object_id == *target;
+                });
+            if (source_role != graph.furniture.end()) {
+              if (target_role == graph.furniture.end()) {
+                source_role->object_id = *target;
+                source_role->revision =
+                    nextComponentRevision(source_role->revision);
+              } else {
+                graph.furniture.erase(source_role);
+              }
+              std::sort(graph.furniture.begin(), graph.furniture.end(),
+                        [](const FurnitureRole& lhs,
+                           const FurnitureRole& rhs) {
+                          return lhs.object_id < rhs.object_id;
+                        });
+              graph_changed = true;
+              furniture_relations_dirty = true;
+            }
             for (auto& [track_id, track_ptr] : tracks) {
               (void)track_id;
               if (track_ptr && track_ptr->object_id == *source) {
@@ -1464,12 +1633,12 @@ SceneApplyResult ReducerCore::applyCommand(
             for (ObjectRelation& relation : graph.relations) {
               SceneEntityRef relation_source = relationSource(relation);
               SceneEntityRef relation_target = relationTarget(relation);
-              if (relation_source.type == SceneEntityType::kObject &&
+              if (entityBackedByObject(relation_source) &&
                   relation_source.id == *source) {
                 relation_source.id = *target;
                 graph_changed = true;
               }
-              if (relation_target.type == SceneEntityType::kObject &&
+              if (entityBackedByObject(relation_target) &&
                   relation_target.id == *source) {
                 relation_target.id = *target;
                 graph_changed = true;
@@ -1504,6 +1673,8 @@ SceneApplyResult ReducerCore::applyCommand(
                 revision, *target,
                 SceneEntityRef{SceneEntityType::kObject, *target}});
             containment_dirty_objects.insert(*target);
+            furniture_relations_dirty = furniture_relations_dirty ||
+                                        !graph.furniture.empty();
           } else if constexpr (std::is_same_v<Mutation,
                                                TombstoneObjectMutation>) {
             const auto canonical =
@@ -1519,6 +1690,16 @@ SceneApplyResult ReducerCore::applyCommand(
             }
             tombstones[*canonical] = ObjectTombstone{
                 *canonical, revision, typed_mutation.reason};
+            const auto role_end = std::remove_if(
+                graph.furniture.begin(), graph.furniture.end(),
+                [&](const FurnitureRole& role) {
+                  return role.object_id == *canonical;
+                });
+            if (role_end != graph.furniture.end()) {
+              graph.furniture.erase(role_end, graph.furniture.end());
+              graph_changed = true;
+              furniture_relations_dirty = true;
+            }
             for (auto track_it = tracks.begin(); track_it != tracks.end();) {
               if (track_it->second &&
                   track_it->second->object_id == *canonical) {
@@ -1530,9 +1711,12 @@ SceneApplyResult ReducerCore::applyCommand(
             const auto relation_end = std::remove_if(
                 graph.relations.begin(), graph.relations.end(),
                 [&](const ObjectRelation& relation) {
-                  return relationTouches(
-                      relation,
-                      SceneEntityRef{SceneEntityType::kObject, *canonical});
+                  const SceneEntityRef source = relationSource(relation);
+                  const SceneEntityRef target = relationTarget(relation);
+                  return (entityBackedByObject(source) &&
+                          source.id == *canonical) ||
+                         (entityBackedByObject(target) &&
+                          target.id == *canonical);
                 });
             if (relation_end != graph.relations.end()) {
               graph.relations.erase(relation_end, graph.relations.end());
@@ -1554,6 +1738,10 @@ SceneApplyResult ReducerCore::applyCommand(
       graph_changed |= recomputeContainmentForObject(
           object_id, object_it->second, &graph, revision, &events);
     }
+  }
+  if (furniture_relations_dirty) {
+    graph_changed |= refreshFurnitureRelations(
+        objects, &graph, furniture_config_, revision, &events);
   }
 
   next.objects = std::make_shared<const SceneObjectTable>(std::move(objects));
@@ -2003,6 +2191,10 @@ SceneApplyResult ReducerCore::applyCommand(
     }
     recomputeContainmentForRoom(target.id, *state_->objects, &graph,
                                 revision, &events);
+    if (!graph.furniture.empty()) {
+      refreshFurnitureRelations(*state_->objects, &graph,
+                                furniture_config_, revision, &events);
+    }
     if (command.expected_room_memberships &&
         !derivedRoomMembershipsMatch(
             graph, target, *command.expected_room_memberships)) {
@@ -2112,6 +2304,31 @@ SceneApplyResult ReducerCore::applyCommand(
       semantic_document_changed});
   events.push_back(ObjectUpdated{
       revision, *canonical, next.objects->at(*canonical)->revisions()});
+  return commit(std::move(next), revision, std::move(events));
+}
+
+SceneApplyResult ReducerCore::applyCommand(
+    const RebuildFurnitureGraphCommand& command) {
+  (void)command;
+  SceneState next = *state_;
+  SceneGraphMetadata graph = *state_->graph;
+  const SceneRevision revision =
+      nextSceneRevision(state_->latest_scene_revision);
+  const std::vector<FurnitureRole> roles = classifyFurnitureRoles(
+      *state_->objects, graph.furniture, furniture_config_);
+  const bool roles_changed = !furnitureRolesEqual(graph.furniture, roles);
+  if (roles_changed) {
+    graph.furniture = roles;
+  }
+  std::vector<SceneEvent> events;
+  const bool relations_changed = refreshFurnitureRelations(
+      *state_->objects, &graph, furniture_config_, revision, &events);
+  if (!roles_changed && !relations_changed) {
+    return noOp("furniture graph is already current");
+  }
+  events.push_back(furnitureGraphStats(graph, revision));
+  next.graph =
+      std::make_shared<const SceneGraphMetadata>(std::move(graph));
   return commit(std::move(next), revision, std::move(events));
 }
 

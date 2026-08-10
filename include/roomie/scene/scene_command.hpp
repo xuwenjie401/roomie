@@ -182,6 +182,11 @@ struct ApplyHumanAnnotationCommand {
   std::optional<RoomAnnotationPatch> room_patch;
 };
 
+// Explicitly reclassifies every current publishable object through the
+// configured furniture whitelist and atomically rebuilds all derived
+// furniture relations. Repeating it against unchanged state is a no-op.
+struct RebuildFurnitureGraphCommand {};
+
 struct PersistedThroughCommand {
   SceneRevision revision = 0;
 };
@@ -195,6 +200,7 @@ using SceneCommand =
                  AdvanceSurfaceCommand,
                  ApplyGeometryResultCommand, ApplySnapshotSetCommand,
                  ApplyDescriptionArtifactCommand, ApplyHumanAnnotationCommand,
+                 RebuildFurnitureGraphCommand,
                  PersistedThroughCommand, ShutdownCommand>;
 
 }  // namespace roomie
