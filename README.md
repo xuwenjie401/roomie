@@ -61,8 +61,9 @@ This keeps detection grounded in the map state rather than a single noisy frame.
 
 Roomie is organized around a small set of cooperating threads and interfaces:
 
-- `RosIoThread` assembles RGB-D, robot-mask, camera, and TF data into mapping and
-  detection frames.
+- `RosIoThread` assembles RGB-D, robot-mask, camera, TF, and odometry data into
+  mapping and detection frames. A bounded, threadless robot-state estimator
+  rejects frames captured while the base is rotating.
 - `MapThread` maintains the map backend and projects patch depth for inference.
 - `DetectionBridgeThread` prepares model inputs and handles coverage gating.
 - `PythonInferenceBackend` runs the current OWL and BoxerNet worker process.

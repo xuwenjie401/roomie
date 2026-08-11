@@ -13,6 +13,7 @@ roomie_pipeline_node:
       color_topic: /roomie/input/head_color/image_rect
       depth_topic: /roomie/input/head_color/depth_registered
       camera_info_topic: /roomie/input/head_color/camera_info
+      odom_topic: /odom
       tf_topic: /tf
       tf_static_topic: /tf_static
       tsdf_output_topic: /roomie/map_surface
@@ -36,6 +37,16 @@ roomie_pipeline_node:
       camera_config: G2/cameras.yaml
       reuse_translation_epsilon_m: 0.000005
       reuse_rotation_epsilon_rad: 0.000005
+
+    robot_state:
+      enabled: true
+      odom_history_sec: 5.0
+      odom_stale_timeout_sec: 0.25
+      rotation_window_sec: 0.10
+      rotation_enter_rad_s: 0.05
+      rotation_exit_rad_s: 0.02
+      rotation_exit_hold_sec: 0.30
+      drop_frames_when_unknown: true
 
     input_filter:
       depth_min_m: 0.1
@@ -110,6 +121,10 @@ roomie_pipeline_node:
       presence_window_sec: 2.0
       presence_min_positive_frames: 2
       presence_max_positive_interruptions: 1
+      presence_viewpoint_baseline_ratio: 0.15
+      presence_viewpoint_baseline_min_m: 0.08
+      presence_viewpoint_baseline_max_m: 0.20
+      presence_viewpoint_min_angle_deg: 6.0
       presence_min_negative_frames: 3
       presence_min_depth_samples: 32
       presence_min_valid_depth_coverage: 0.50

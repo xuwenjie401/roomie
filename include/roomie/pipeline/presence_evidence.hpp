@@ -13,6 +13,10 @@ struct PresenceEvidenceConfig {
   TimeNanoseconds evidence_window_ns = 2'000'000'000LL;
   int min_positive_frames = 2;
   int max_positive_interruptions = 1;
+  float viewpoint_baseline_ratio = 0.15f;
+  float viewpoint_baseline_min_m = 0.08f;
+  float viewpoint_baseline_max_m = 0.20f;
+  float viewpoint_min_angle_deg = 6.0f;
   int min_negative_frames = 3;
   int min_depth_samples = 32;
   float min_valid_depth_coverage = 0.50f;

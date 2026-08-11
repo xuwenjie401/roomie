@@ -20,6 +20,7 @@ struct PipelineConfig {
   std::string rgb_topic = "/roomie/input/head_color/image_rect";
   std::string depth_topic = "/roomie/input/head_color/depth_registered";
   std::string camera_info_topic = "/roomie/input/head_color/camera_info";
+  std::string odom_topic = "/odom";
   std::string tf_topic = "/tf";
   std::string tf_static_topic = "/tf_static";
   std::string tsdf_output_topic = "/roomie/map_surface";
@@ -39,6 +40,15 @@ struct PipelineConfig {
   std::string robot_mask_camera_config = "G2/cameras.yaml";
   double robot_mask_reuse_translation_epsilon_m = 5.0e-6;
   double robot_mask_reuse_rotation_epsilon_rad = 5.0e-6;
+
+  bool robot_state_enabled = true;
+  double robot_state_odom_history_sec = 5.0;
+  double robot_state_odom_stale_timeout_sec = 0.25;
+  double robot_state_rotation_window_sec = 0.10;
+  double robot_state_rotation_enter_rad_s = 0.05;
+  double robot_state_rotation_exit_rad_s = 0.02;
+  double robot_state_rotation_exit_hold_sec = 0.30;
+  bool robot_state_drop_frames_when_unknown = true;
 
   float depth_min_m = 0.1f;
   float depth_max_m = 10.0f;
@@ -113,6 +123,10 @@ struct PipelineConfig {
   double instance_presence_window_sec = 2.0;
   int instance_presence_min_positive_frames = 2;
   int instance_presence_max_positive_interruptions = 1;
+  float instance_presence_viewpoint_baseline_ratio = 0.15f;
+  float instance_presence_viewpoint_baseline_min_m = 0.08f;
+  float instance_presence_viewpoint_baseline_max_m = 0.20f;
+  float instance_presence_viewpoint_min_angle_deg = 6.0f;
   int instance_presence_min_negative_frames = 3;
   int instance_presence_min_depth_samples = 32;
   float instance_presence_min_valid_depth_coverage = 0.50f;

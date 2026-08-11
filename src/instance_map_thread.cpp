@@ -117,6 +117,14 @@ PresenceEvidenceConfig presenceEvidenceConfig(const PipelineConfig& config) {
   result.min_positive_frames = config.instance_presence_min_positive_frames;
   result.max_positive_interruptions =
       config.instance_presence_max_positive_interruptions;
+  result.viewpoint_baseline_ratio =
+      config.instance_presence_viewpoint_baseline_ratio;
+  result.viewpoint_baseline_min_m =
+      config.instance_presence_viewpoint_baseline_min_m;
+  result.viewpoint_baseline_max_m =
+      config.instance_presence_viewpoint_baseline_max_m;
+  result.viewpoint_min_angle_deg =
+      config.instance_presence_viewpoint_min_angle_deg;
   result.min_negative_frames = config.instance_presence_min_negative_frames;
   result.min_depth_samples = config.instance_presence_min_depth_samples;
   result.min_valid_depth_coverage =
@@ -2820,6 +2828,13 @@ std::optional<InstanceObservation> InstanceMapThread::makeObservation(
   InstanceObservation observation;
   observation.time_ns = response.time_ns;
   observation.camera_id = response.camera_id;
+  observation.has_camera_pose =
+      response.has_camera_pose &&
+      response.T_world_camera.translation().allFinite();
+  if (observation.has_camera_pose) {
+    observation.camera_position_world =
+        response.T_world_camera.translation();
+  }
   observation.detection = detection;
   observation.confidence = rawDetectionConfidence(detection);
 
@@ -3245,6 +3260,19 @@ std::size_t InstanceMapThread::mergeDuplicateStableTracks(
         for (TimeNanoseconds time_ns :
              loser.positive_evidence_timestamps_ns) {
           appendUnique(&winner.positive_evidence_timestamps_ns, time_ns);
+        }
+        for (const PositivePresenceEvidenceSample& sample :
+             loser.positive_presence_evidence_history) {
+          const auto existing = std::find_if(
+              winner.positive_presence_evidence_history.begin(),
+              winner.positive_presence_evidence_history.end(),
+              [&sample](const PositivePresenceEvidenceSample& candidate) {
+                return candidate.time_ns == sample.time_ns &&
+                       candidate.camera_id == sample.camera_id;
+              });
+          if (existing == winner.positive_presence_evidence_history.end()) {
+            winner.positive_presence_evidence_history.push_back(sample);
+          }
         }
         for (TimeNanoseconds time_ns :
              loser.negative_evidence_timestamps_ns) {

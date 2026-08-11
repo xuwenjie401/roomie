@@ -14,6 +14,7 @@
   <depend>ament_index_cpp</depend>
   <depend>ego_shade</depend>
   <depend>geometry_msgs</depend>
+  <depend>nav_msgs</depend>
   <depend>rclcpp</depend>
   <exec_depend>rosidl_default_runtime</exec_depend>
   <depend>sensor_msgs</depend>

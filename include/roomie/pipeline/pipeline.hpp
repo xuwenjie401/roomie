@@ -94,6 +94,7 @@ class RoomiePipeline {
   ThreadSafeQueue<FrameBundlePtr> detection_queue_;
   ThreadSafeQueue<InferenceResponse> inference_response_queue_;
 
+  std::shared_ptr<RobotStateEstimator> robot_state_estimator_;
   RosIoThread ros_io_thread_;
   MapThread map_thread_;
   PythonInferenceBackend python_backend_;

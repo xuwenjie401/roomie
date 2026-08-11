@@ -468,6 +468,47 @@ TEST(SceneStore, OrderedCommitsAdvanceLatestThenDurableWatermarks) {
             SceneStore::kCurrentSchemaVersion);
 }
 
+TEST(SceneStore, PositivePresenceViewpointsSurviveRestore) {
+  TemporaryDatabase database;
+  SceneStore store(database.path());
+  ASSERT_TRUE(store.open());
+
+  ReducerCore reducer;
+  UpsertTrackMutation create;
+  create.track.track_id = 42;
+  create.track.state = InstanceTrackState::kStable;
+  create.track.label = "backpack";
+  create.track.positive_evidence_timestamps_ns = {100, 200};
+  PositivePresenceEvidenceSample first;
+  first.time_ns = 100;
+  first.camera_id = "head";
+  first.camera_position_world = {0.0f, 0.0f, 0.0f};
+  PositivePresenceEvidenceSample second = first;
+  second.time_ns = 200;
+  second.camera_position_world = {0.12f, 0.0f, 0.0f};
+  create.track.positive_presence_evidence_history = {first, second};
+  const SceneApplyResult applied =
+      reducer.apply(SceneCommand{storeMutation(create)});
+  ASSERT_TRUE(applied.committedRevision()) << applied.reason;
+  ASSERT_TRUE(store.enqueueCommit(applied.snapshot));
+  ASSERT_TRUE(store.flush());
+
+  const SceneRestoreResult restored = store.restoreLatest();
+  ASSERT_TRUE(restored.status) << restored.status.error;
+  ASSERT_TRUE(restored.found);
+  const auto track = restored.snapshot.tracks().find(42);
+  ASSERT_NE(track, restored.snapshot.tracks().end());
+  ASSERT_TRUE(track->second);
+  EXPECT_EQ(track->second->positive_presence_evidence_history,
+            create.track.positive_presence_evidence_history);
+  const SceneObjectPtr object =
+      restored.snapshot.findObject(track->second->object_id);
+  ASSERT_TRUE(object);
+  ASSERT_TRUE(object->lifecycle);
+  EXPECT_EQ(object->lifecycle->positive_presence_evidence_history,
+            create.track.positive_presence_evidence_history);
+}
+
 TEST(SceneStore, MapCheckpointManifestIsAlignedIdempotentAndRestorable) {
   TemporaryDatabase database;
   ReducerCore reducer;

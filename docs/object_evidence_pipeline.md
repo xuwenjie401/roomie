@@ -42,8 +42,14 @@ evaluation, but has zero decision weight.
 ## Presence
 
 Positive evidence comes from an assigned physical observation. A tentative or
-archived track needs two distinct successful frames within two seconds before
-becoming active. Unknown frames do not decay evidence.
+archived track needs two successful frames from distinct camera viewpoints
+within two seconds before becoming active. By default, viewpoints are distinct
+when their camera origins differ by at least `clamp(0.15 * object_diagonal,
+0.08 m, 0.20 m)` or their object-relative viewing directions differ by at
+least 6 degrees. Repeated detections from the same viewpoint still update
+existence log-odds and `last_seen`, but do not advance confirmation. Pure
+camera rotation without optical-center motion does not create parallax and is
+therefore not an independent viewpoint. Unknown frames do not decay evidence.
 
 For an unmatched active object, the admitted frame's registered raw depth is
 tested against projected ray/OBB entry and exit distances:

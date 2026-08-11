@@ -60,6 +60,8 @@ struct InstanceObservation {
 
   TimeNanoseconds time_ns = 0;
   std::string camera_id;
+  bool has_camera_pose = false;
+  Eigen::Vector3f camera_position_world = Eigen::Vector3f::Zero();
   RawDetection detection;
   float confidence = 0.0f;
   float bbox_quality = 0.0f;
@@ -81,6 +83,31 @@ struct ObservationQualitySample {
   float camera_distance_m = 0.0f;
   bool high_quality = false;
 };
+
+struct PositivePresenceEvidenceSample {
+  EIGEN_MAKE_ALIGNED_OPERATOR_NEW
+
+  TimeNanoseconds time_ns = 0;
+  std::string camera_id;
+  Eigen::Vector3f camera_position_world = Eigen::Vector3f::Zero();
+};
+
+inline bool operator==(const PositivePresenceEvidenceSample& lhs,
+                       const PositivePresenceEvidenceSample& rhs) {
+  return lhs.time_ns == rhs.time_ns && lhs.camera_id == rhs.camera_id &&
+         (lhs.camera_position_world.array() ==
+          rhs.camera_position_world.array())
+             .all();
+}
+
+inline bool operator!=(const PositivePresenceEvidenceSample& lhs,
+                       const PositivePresenceEvidenceSample& rhs) {
+  return !(lhs == rhs);
+}
+
+using PositivePresenceEvidenceHistory =
+    std::vector<PositivePresenceEvidenceSample,
+                Eigen::aligned_allocator<PositivePresenceEvidenceSample>>;
 
 struct InstanceTrack {
   EIGEN_MAKE_ALIGNED_OPERATOR_NEW
@@ -114,6 +141,7 @@ struct InstanceTrack {
   bool publishable = true;
   float existence_log_odds = 0.0f;
   std::vector<TimeNanoseconds> positive_evidence_timestamps_ns;
+  PositivePresenceEvidenceHistory positive_presence_evidence_history;
   std::vector<TimeNanoseconds> negative_evidence_timestamps_ns;
   int positive_window_interruptions = 0;
   TimeNanoseconds last_presence_evidence_ns = 0;

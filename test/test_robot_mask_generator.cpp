@@ -1,10 +1,12 @@
 #include <chrono>
 #include <cmath>
 #include <filesystem>
+#include <functional>
 #include <string>
 #include <thread>
 
 #include <gtest/gtest.h>
+#include <nav_msgs/msg/odometry.hpp>
 #include <rclcpp/executors/single_threaded_executor.hpp>
 #include <rclcpp/rclcpp.hpp>
 #include <sensor_msgs/msg/image.hpp>
@@ -73,6 +75,42 @@ sensor_msgs::msg::Image depthImage(std::int32_t stamp_seconds) {
   image.step = image.width * 2;
   image.data.resize(static_cast<std::size_t>(image.step) * image.height);
   return image;
+}
+
+template <typename Message>
+void setStamp(Message* message, double stamp_seconds) {
+  const auto whole_seconds = static_cast<std::int32_t>(std::floor(stamp_seconds));
+  message->header.stamp.sec = whole_seconds;
+  message->header.stamp.nanosec = static_cast<std::uint32_t>(std::llround(
+      (stamp_seconds - static_cast<double>(whole_seconds)) * 1.0e9));
+}
+
+sensor_msgs::msg::Image rgbImageAt(double stamp_seconds) {
+  sensor_msgs::msg::Image image =
+      rgbImage(static_cast<std::int32_t>(std::floor(stamp_seconds)));
+  setStamp(&image, stamp_seconds);
+  return image;
+}
+
+sensor_msgs::msg::Image depthImageAt(double stamp_seconds) {
+  sensor_msgs::msg::Image image =
+      depthImage(static_cast<std::int32_t>(std::floor(stamp_seconds)));
+  setStamp(&image, stamp_seconds);
+  return image;
+}
+
+nav_msgs::msg::Odometry odometryAt(double stamp_seconds, double yaw_rad) {
+  nav_msgs::msg::Odometry odometry;
+  setStamp(&odometry, stamp_seconds);
+  odometry.header.frame_id = "base_link";
+  odometry.child_frame_id = "map";
+  const Eigen::Quaterniond orientation(
+      Eigen::AngleAxisd(yaw_rad, Eigen::Vector3d::UnitZ()));
+  odometry.pose.pose.orientation.x = orientation.x();
+  odometry.pose.pose.orientation.y = orientation.y();
+  odometry.pose.pose.orientation.z = orientation.z();
+  odometry.pose.pose.orientation.w = orientation.w();
+  return odometry;
 }
 
 template <typename Predicate>
@@ -424,6 +462,190 @@ TEST(RobotMaskGeneratorTest,
   EXPECT_EQ(mapping_frame->provenance.frame_id,
             first_detection->provenance.frame_id);
   EXPECT_EQ(mapping_frame->sync.rgb_depth_delta_ns, 0);
+
+  executor.remove_node(publisher_node);
+  executor.remove_node(io_node);
+}
+
+TEST(RobotMaskGeneratorTest,
+     RosIoRobotStateGateDropsUnknownAndRotatingFramesWithoutPurgingQueues) {
+  ScopedRclcppInit rclcpp_init;
+  auto io_node =
+      std::make_shared<rclcpp::Node>("roomie_robot_state_io_test");
+  auto publisher_node =
+      std::make_shared<rclcpp::Node>("roomie_robot_state_publisher_test");
+
+  ThreadSafeQueue<FrameBundlePtr> mapping_queue(4);
+  ThreadSafeQueue<FrameBundlePtr> detection_queue(4);
+  RosIoThread ros_io(mapping_queue, detection_queue);
+  auto generator = std::make_shared<RobotMaskGenerator>(generatorConfig());
+  auto estimator = std::make_shared<RobotStateEstimator>();
+
+  RosIoSubscriptionConfig config;
+  config.world_frame = "map";
+  config.odom_topic = "/roomie/test/robot_state/odom";
+  config.tf_topic.clear();
+  config.tf_static_topic = "/roomie/test/robot_state/tf_static";
+  config.map_mode = MapMode::kOnline;
+  config.max_perception_fps = 0.0;
+  config.robot_mask_generator = generator;
+  config.odometry_observer =
+      [estimator](const OdometryObservation& observation) {
+        return estimator->observeOdometry(observation);
+      };
+  config.robot_frame_admission =
+      [estimator](const std::string&, TimeNanoseconds time_ns) {
+        RobotFrameAdmissionDecision decision;
+        decision.state = estimator->snapshotAt(time_ns);
+        if (decision.state.rotating.value == RobotActivityValue::kActive) {
+          decision.allow_mapping = false;
+          decision.allow_detection = false;
+          decision.reason = RobotFrameAdmissionReason::kRotating;
+        } else if (decision.state.rotating.value ==
+                   RobotActivityValue::kUnknown) {
+          decision.allow_mapping = false;
+          decision.allow_detection = false;
+          decision.reason = RobotFrameAdmissionReason::kStateUnknown;
+        }
+        return decision;
+      };
+  RosCameraSubscriptionConfig camera;
+  camera.camera_id = "head_color";
+  camera.camera_frame = "head_color";
+  camera.rgb_topic = "/roomie/test/robot_state/head_color";
+  camera.depth_topic = "/roomie/test/robot_state/head_depth";
+  camera.fallback_intrinsics =
+      CameraIntrinsics{640, 400, 305.2087402344f, 305.0057678223f,
+                       318.5672912598f, 204.0587768555f};
+  camera.enable_mapping = true;
+  camera.enable_detection = true;
+  config.cameras.push_back(camera);
+  ros_io.configure(config);
+  ros_io.attachNode(*io_node);
+
+  const auto image_publisher =
+      publisher_node->create_publisher<sensor_msgs::msg::Image>(
+          camera.rgb_topic, rclcpp::QoS(4).best_effort().durability_volatile());
+  const auto depth_publisher =
+      publisher_node->create_publisher<sensor_msgs::msg::Image>(
+          camera.depth_topic,
+          rclcpp::QoS(4).best_effort().durability_volatile());
+  const auto odom_publisher =
+      publisher_node->create_publisher<nav_msgs::msg::Odometry>(
+          config.odom_topic,
+          rclcpp::QoS(30).best_effort().durability_volatile());
+  const auto tf_publisher =
+      publisher_node->create_publisher<tf2_msgs::msg::TFMessage>(
+          config.tf_static_topic,
+          rclcpp::QoS(100).transient_local().reliable());
+
+  rclcpp::executors::SingleThreadedExecutor executor;
+  executor.add_node(io_node);
+  executor.add_node(publisher_node);
+  ASSERT_TRUE(spinUntil(
+      &executor,
+      [&]() {
+        return image_publisher->get_subscription_count() == 1 &&
+               depth_publisher->get_subscription_count() == 1 &&
+               odom_publisher->get_subscription_count() == 1 &&
+               tf_publisher->get_subscription_count() == 1;
+      },
+      std::chrono::seconds(2)));
+
+  tf2_msgs::msg::TFMessage transforms;
+  transforms.transforms.push_back(identityTransform("map", "head_color"));
+  for (const std::string& frame : generator->requiredFrames()) {
+    transforms.transforms.push_back(
+        identityTransform(generator->rootFrame(), frame));
+  }
+  tf_publisher->publish(transforms);
+
+  // With no odometry yet, conservative admission rejects both consumers.
+  image_publisher->publish(rgbImageAt(10.0));
+  depth_publisher->publish(depthImageAt(10.0));
+  for (int spin = 0; spin < 30; ++spin) {
+    executor.spin_some();
+    std::this_thread::sleep_for(std::chrono::milliseconds(2));
+  }
+  FrameBundlePtr frame;
+  EXPECT_FALSE(mapping_queue.tryPop(&frame));
+  EXPECT_FALSE(detection_queue.tryPop(&frame));
+
+  const auto publish_odom_range =
+      [&](double first, double last, const std::function<double(double)>& yaw) {
+        for (double time = first; time <= last + 1.0e-9; time += 0.01) {
+          odom_publisher->publish(odometryAt(time, yaw(time)));
+          executor.spin_some();
+        }
+      };
+
+  publish_odom_range(10.0, 10.20, [](double) { return 0.0; });
+  ASSERT_TRUE(spinUntil(
+      &executor,
+      [&]() {
+        return estimator->snapshotAt(10200000000LL).rotating.value ==
+               RobotActivityValue::kInactive;
+      },
+      std::chrono::seconds(2)));
+  image_publisher->publish(rgbImageAt(10.20));
+  depth_publisher->publish(depthImageAt(10.20));
+  ASSERT_TRUE(spinUntil(
+      &executor,
+      [&]() { return !mapping_queue.empty() && !detection_queue.empty(); },
+      std::chrono::seconds(2)));
+
+  // The stable frame is deliberately left queued. Entering rotation must only
+  // reject the matching rotating frame, never purge earlier admitted work.
+  publish_odom_range(10.21, 10.60, [](double time) {
+    return 0.20 * (time - 10.20);
+  });
+  ASSERT_TRUE(spinUntil(
+      &executor,
+      [&]() {
+        return estimator->snapshotAt(10600000000LL).rotating.value ==
+               RobotActivityValue::kActive;
+      },
+      std::chrono::seconds(2)));
+  image_publisher->publish(rgbImageAt(10.60));
+  depth_publisher->publish(depthImageAt(10.60));
+  for (int spin = 0; spin < 30; ++spin) {
+    executor.spin_some();
+    std::this_thread::sleep_for(std::chrono::milliseconds(2));
+  }
+
+  FrameBundlePtr stable_mapping;
+  FrameBundlePtr stable_detection;
+  ASSERT_TRUE(mapping_queue.tryPop(&stable_mapping));
+  ASSERT_TRUE(detection_queue.tryPop(&stable_detection));
+  ASSERT_TRUE(stable_mapping);
+  ASSERT_TRUE(stable_detection);
+  EXPECT_EQ(stable_mapping->provenance.sensor_time_ns, 10200000000LL);
+  EXPECT_EQ(stable_detection->provenance.sensor_time_ns, 10200000000LL);
+  EXPECT_EQ(stable_mapping->robot_state.rotating.value,
+            RobotActivityValue::kInactive);
+  EXPECT_FALSE(mapping_queue.tryPop(&frame));
+  EXPECT_FALSE(detection_queue.tryPop(&frame));
+
+  const double stopped_yaw = 0.20 * (10.60 - 10.20);
+  publish_odom_range(10.61, 11.10,
+                     [stopped_yaw](double) { return stopped_yaw; });
+  ASSERT_TRUE(spinUntil(
+      &executor,
+      [&]() {
+        return estimator->snapshotAt(11100000000LL).rotating.value ==
+               RobotActivityValue::kInactive;
+      },
+      std::chrono::seconds(2)));
+  image_publisher->publish(rgbImageAt(11.10));
+  depth_publisher->publish(depthImageAt(11.10));
+  ASSERT_TRUE(spinUntil(
+      &executor,
+      [&]() { return !mapping_queue.empty() && !detection_queue.empty(); },
+      std::chrono::seconds(2)));
+  ASSERT_TRUE(mapping_queue.tryPop(&frame));
+  ASSERT_TRUE(frame);
+  EXPECT_EQ(frame->robot_state.rotating.value,
+            RobotActivityValue::kInactive);
 
   executor.remove_node(publisher_node);
   executor.remove_node(io_node);

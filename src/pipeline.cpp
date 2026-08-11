@@ -49,6 +49,20 @@ GeometrySchedulerConfig geometrySchedulerConfig(
   return result;
 }
 
+RobotStateEstimatorConfig robotStateEstimatorConfig(
+    const PipelineConfig& config) {
+  RobotStateEstimatorConfig result;
+  result.odom_history_sec = config.robot_state_odom_history_sec;
+  result.odom_stale_timeout_sec =
+      config.robot_state_odom_stale_timeout_sec;
+  result.rotation_window_sec = config.robot_state_rotation_window_sec;
+  result.rotation_enter_rad_s = config.robot_state_rotation_enter_rad_s;
+  result.rotation_exit_rad_s = config.robot_state_rotation_exit_rad_s;
+  result.rotation_exit_hold_sec =
+      config.robot_state_rotation_exit_hold_sec;
+  return result;
+}
+
 PersistenceActorConfig persistenceActorConfig(
     const PipelineConfig& config) {
   PersistenceActorConfig result;
@@ -521,6 +535,11 @@ RoomiePipeline::RoomiePipeline(
           }),
       inference_response_queue_(config_.inference_response_queue_size,
                                 ChannelPolicy::kReliableBlocking),
+      robot_state_estimator_(
+          config_.robot_state_enabled
+              ? std::make_shared<RobotStateEstimator>(
+                    robotStateEstimatorConfig(config_))
+              : nullptr),
       ros_io_thread_(mapping_queue_, detection_queue_),
       map_thread_(mapping_queue_, config_),
       python_backend_(config_),
@@ -1075,6 +1094,7 @@ RoomiePipeline::RoomiePipeline(
 
   RosIoSubscriptionConfig ros_io_config;
   ros_io_config.world_frame = config_.world_frame;
+  ros_io_config.odom_topic = config_.odom_topic;
   ros_io_config.tf_topic = config_.tf_topic;
   ros_io_config.tf_static_topic = config_.tf_static_topic;
   ros_io_config.max_image_stamp_delta_sec = config_.max_image_stamp_delta_sec;
@@ -1096,6 +1116,35 @@ RoomiePipeline::RoomiePipeline(
         detection_bridge_thread_.cancelPendingCandidate(frame, reason);
         map_thread_.cancelPerceptionCandidate(frame, reason);
       };
+  if (robot_state_estimator_) {
+    const std::shared_ptr<RobotStateEstimator> estimator =
+        robot_state_estimator_;
+    ros_io_config.odometry_observer =
+        [estimator](const OdometryObservation& observation) {
+          return estimator->observeOdometry(observation);
+        };
+    const bool drop_unknown = config_.robot_state_drop_frames_when_unknown;
+    ros_io_config.robot_frame_admission =
+        [estimator, drop_unknown](const std::string& camera_id,
+                                  TimeNanoseconds time_ns) {
+          (void)camera_id;
+          RobotFrameAdmissionDecision decision;
+          decision.state = estimator->snapshotAt(time_ns);
+          if (decision.state.rotating.value ==
+              RobotActivityValue::kActive) {
+            decision.allow_mapping = false;
+            decision.allow_detection = false;
+            decision.reason = RobotFrameAdmissionReason::kRotating;
+          } else if (drop_unknown &&
+                     decision.state.rotating.value ==
+                         RobotActivityValue::kUnknown) {
+            decision.allow_mapping = false;
+            decision.allow_detection = false;
+            decision.reason = RobotFrameAdmissionReason::kStateUnknown;
+          }
+          return decision;
+        };
+  }
   RobotMaskGeneratorConfig robot_mask_config;
   robot_mask_config.robot_config =
       resolveRobotMaskConfigPath(config_.robot_mask_robot_config);

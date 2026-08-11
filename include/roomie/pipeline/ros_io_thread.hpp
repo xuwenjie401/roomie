@@ -13,6 +13,7 @@
 #include <utility>
 #include <vector>
 
+#include <nav_msgs/msg/odometry.hpp>
 #include <rclcpp/rclcpp.hpp>
 #include <sensor_msgs/msg/camera_info.hpp>
 #include <sensor_msgs/msg/image.hpp>
@@ -20,6 +21,7 @@
 #include <tf2_msgs/msg/tf_message.hpp>
 
 #include "roomie/pipeline/robot_mask_generator.hpp"
+#include "roomie/pipeline/robot_state_estimator.hpp"
 #include "roomie/pipeline/thread_safe_queue.hpp"
 #include "roomie/pipeline/types.hpp"
 #include "roomie/pipeline/worker_thread.hpp"
@@ -40,8 +42,23 @@ struct RosCameraSubscriptionConfig {
   bool enable_detection = true;
 };
 
+enum class RobotFrameAdmissionReason : std::uint8_t {
+  kNone = 0,
+  kRotating = 1,
+  kStateUnknown = 2,
+  kPolicyError = 3,
+};
+
+struct RobotFrameAdmissionDecision {
+  bool allow_mapping = true;
+  bool allow_detection = true;
+  RobotFrameAdmissionReason reason = RobotFrameAdmissionReason::kNone;
+  RobotStateSnapshot state;
+};
+
 struct RosIoSubscriptionConfig {
   std::string world_frame = "world";
+  std::string odom_topic = "/odom";
   std::string tf_topic = "/tf";
   std::string tf_static_topic = "/tf_static";
   double max_image_stamp_delta_sec = 0.002;
@@ -55,6 +72,11 @@ struct RosIoSubscriptionConfig {
   std::function<bool()> perception_admission_allowed;
   std::function<void(const FrameBundlePtr&, const std::string&)>
       perception_candidate_cancelled;
+  std::function<RobotStateEstimatorUpdate(const OdometryObservation&)>
+      odometry_observer;
+  std::function<RobotFrameAdmissionDecision(const std::string&,
+                                            TimeNanoseconds)>
+      robot_frame_admission;
   std::shared_ptr<RobotMaskGenerator> robot_mask_generator;
   std::vector<RosCameraSubscriptionConfig> cameras;
 };
@@ -143,6 +165,7 @@ class RosIoThread : public WorkerThread {
   void handleDepth(const std::string& camera_id, const sensor_msgs::msg::Image::SharedPtr msg);
   void handleCameraInfo(const std::string& camera_id,
                         const sensor_msgs::msg::CameraInfo::SharedPtr msg);
+  void handleOdom(const nav_msgs::msg::Odometry::SharedPtr msg);
   void handleTf(const tf2_msgs::msg::TFMessage::SharedPtr msg, bool is_static);
   void tryAssembleCamera(const std::string& camera_id);
   void maybeLogStatusLocked();
@@ -175,12 +198,18 @@ class RosIoThread : public WorkerThread {
   std::vector<CameraSubscriptions> subscriptions_;
   rclcpp::Subscription<tf2_msgs::msg::TFMessage>::SharedPtr tf_subscription_;
   rclcpp::Subscription<tf2_msgs::msg::TFMessage>::SharedPtr tf_static_subscription_;
+  rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr odom_subscription_;
   rclcpp::Logger logger_;
   std::chrono::steady_clock::time_point last_status_log_time_ =
       std::chrono::steady_clock::now();
   std::uint64_t rgb_messages_ = 0;
   std::uint64_t depth_messages_ = 0;
   std::uint64_t camera_info_messages_ = 0;
+  std::uint64_t odom_messages_ = 0;
+  std::uint64_t odom_invalid_ = 0;
+  std::uint64_t odom_out_of_order_ = 0;
+  std::uint64_t odom_replaced_ = 0;
+  std::uint64_t odom_too_old_ = 0;
   std::uint64_t tf_messages_ = 0;
   std::uint64_t tf_static_messages_ = 0;
   std::uint64_t tf_set_failures_ = 0;
@@ -192,6 +221,11 @@ class RosIoThread : public WorkerThread {
   std::uint64_t detection_frames_emitted_ = 0;
   std::uint64_t perception_rate_skips_ = 0;
   std::uint64_t perception_backpressure_skips_ = 0;
+  std::uint64_t robot_rotation_mapping_drops_ = 0;
+  std::uint64_t robot_rotation_detection_drops_ = 0;
+  std::uint64_t robot_unknown_mapping_drops_ = 0;
+  std::uint64_t robot_unknown_detection_drops_ = 0;
+  std::uint64_t robot_policy_errors_ = 0;
   std::string last_tf_error_;
 };
 

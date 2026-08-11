@@ -103,6 +103,7 @@ struct LifecycleComponent {
   float last_presence_evidence_reliability = 0.0f;
   std::string last_presence_evidence_reason;
   std::vector<TimeNanoseconds> positive_evidence_timestamps_ns;
+  PositivePresenceEvidenceHistory positive_presence_evidence_history;
   std::vector<TimeNanoseconds> negative_evidence_timestamps_ns;
   int positive_window_interruptions = 0;
   TimeNanoseconds first_seen_ns = 0;

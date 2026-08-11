@@ -45,6 +45,8 @@ PipelineConfig PipelineConfig::declareAndLoad(rclcpp::Node& node) {
       node.declare_parameter<std::string>("topics.depth_topic", config.depth_topic);
   config.camera_info_topic = node.declare_parameter<std::string>(
       "topics.camera_info_topic", config.camera_info_topic);
+  config.odom_topic =
+      node.declare_parameter<std::string>("topics.odom_topic", config.odom_topic);
   config.tf_topic =
       node.declare_parameter<std::string>("topics.tf_topic", config.tf_topic);
   config.tf_static_topic =
@@ -100,6 +102,53 @@ PipelineConfig PipelineConfig::declareAndLoad(rclcpp::Node& node) {
       config.robot_mask_reuse_rotation_epsilon_rad < 0.0) {
     throw std::invalid_argument(
         "robot_mask reuse thresholds must be finite and non-negative");
+  }
+
+  config.robot_state_enabled = node.declare_parameter<bool>(
+      "robot_state.enabled", config.robot_state_enabled);
+  config.robot_state_odom_history_sec = node.declare_parameter<double>(
+      "robot_state.odom_history_sec", config.robot_state_odom_history_sec);
+  config.robot_state_odom_stale_timeout_sec = node.declare_parameter<double>(
+      "robot_state.odom_stale_timeout_sec",
+      config.robot_state_odom_stale_timeout_sec);
+  config.robot_state_rotation_window_sec = node.declare_parameter<double>(
+      "robot_state.rotation_window_sec",
+      config.robot_state_rotation_window_sec);
+  config.robot_state_rotation_enter_rad_s = node.declare_parameter<double>(
+      "robot_state.rotation_enter_rad_s",
+      config.robot_state_rotation_enter_rad_s);
+  config.robot_state_rotation_exit_rad_s = node.declare_parameter<double>(
+      "robot_state.rotation_exit_rad_s",
+      config.robot_state_rotation_exit_rad_s);
+  config.robot_state_rotation_exit_hold_sec = node.declare_parameter<double>(
+      "robot_state.rotation_exit_hold_sec",
+      config.robot_state_rotation_exit_hold_sec);
+  config.robot_state_drop_frames_when_unknown = node.declare_parameter<bool>(
+      "robot_state.drop_frames_when_unknown",
+      config.robot_state_drop_frames_when_unknown);
+  const bool valid_robot_state_config =
+      std::isfinite(config.robot_state_odom_history_sec) &&
+      std::isfinite(config.robot_state_odom_stale_timeout_sec) &&
+      std::isfinite(config.robot_state_rotation_window_sec) &&
+      std::isfinite(config.robot_state_rotation_enter_rad_s) &&
+      std::isfinite(config.robot_state_rotation_exit_rad_s) &&
+      std::isfinite(config.robot_state_rotation_exit_hold_sec) &&
+      config.robot_state_odom_history_sec > 0.0 &&
+      config.robot_state_odom_stale_timeout_sec > 0.0 &&
+      config.robot_state_rotation_window_sec > 0.0 &&
+      config.robot_state_rotation_enter_rad_s > 0.0 &&
+      config.robot_state_rotation_exit_rad_s >= 0.0 &&
+      config.robot_state_rotation_exit_hold_sec >= 0.0 &&
+      config.robot_state_rotation_enter_rad_s >=
+          config.robot_state_rotation_exit_rad_s &&
+      config.robot_state_odom_history_sec >=
+          config.robot_state_odom_stale_timeout_sec +
+              config.robot_state_rotation_window_sec +
+              config.robot_state_rotation_exit_hold_sec;
+  if (config.robot_state_enabled &&
+      (config.odom_topic.empty() || !valid_robot_state_config)) {
+    throw std::invalid_argument(
+        "enabled robot_state requires a non-empty odom topic and valid windows");
   }
 
   config.depth_min_m = positiveFloatOrDefault(
@@ -371,6 +420,28 @@ PipelineConfig PipelineConfig::declareAndLoad(rclcpp::Node& node) {
       0, static_cast<int>(node.declare_parameter<int>(
              "instance.presence_max_positive_interruptions",
              config.instance_presence_max_positive_interruptions)));
+  config.instance_presence_viewpoint_baseline_ratio = positiveFloatOrDefault(
+      node.declare_parameter<double>(
+          "instance.presence_viewpoint_baseline_ratio",
+          config.instance_presence_viewpoint_baseline_ratio),
+      config.instance_presence_viewpoint_baseline_ratio);
+  config.instance_presence_viewpoint_baseline_min_m = positiveFloatOrDefault(
+      node.declare_parameter<double>(
+          "instance.presence_viewpoint_baseline_min_m",
+          config.instance_presence_viewpoint_baseline_min_m),
+      config.instance_presence_viewpoint_baseline_min_m);
+  config.instance_presence_viewpoint_baseline_max_m = std::max(
+      config.instance_presence_viewpoint_baseline_min_m,
+      positiveFloatOrDefault(
+          node.declare_parameter<double>(
+              "instance.presence_viewpoint_baseline_max_m",
+              config.instance_presence_viewpoint_baseline_max_m),
+          config.instance_presence_viewpoint_baseline_max_m));
+  config.instance_presence_viewpoint_min_angle_deg = positiveFloatOrDefault(
+      node.declare_parameter<double>(
+          "instance.presence_viewpoint_min_angle_deg",
+          config.instance_presence_viewpoint_min_angle_deg),
+      config.instance_presence_viewpoint_min_angle_deg);
   config.instance_presence_min_negative_frames = positiveIntOrDefault(
       node.declare_parameter<int>("instance.presence_min_negative_frames",
                                   config.instance_presence_min_negative_frames),

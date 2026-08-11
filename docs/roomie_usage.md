@@ -92,6 +92,7 @@ topics:
   color_topic: /roomie/input/head_color/image_rect
   depth_topic: /roomie/input/head_color/depth_registered
   camera_info_topic: /roomie/input/head_color/camera_info
+  odom_topic: /odom
   tf_topic: /tf
 
 robot_mask:
@@ -99,6 +100,16 @@ robot_mask:
   camera_config: G2/cameras.yaml
   reuse_translation_epsilon_m: 0.000005
   reuse_rotation_epsilon_rad: 0.000005
+
+robot_state:
+  enabled: true
+  odom_history_sec: 5.0
+  odom_stale_timeout_sec: 0.25
+  rotation_window_sec: 0.10
+  rotation_enter_rad_s: 0.05
+  rotation_exit_rad_s: 0.02
+  rotation_exit_hold_sec: 0.30
+  drop_frames_when_unknown: true
 ```
 
 输入图像必须是与相机 profile 完全一致的 rectified pinhole 图像。Roomie 不再订阅
@@ -106,6 +117,13 @@ mask topic，而是在每个 RGB 时间戳上用 G2 内部 TF 直接生成 mask�
 缓存。精确时刻的内部 TF 不完整时，该帧会等待后续 TF，若期间 RGB 已更新则丢弃旧帧。
 后续增加 `hand_left_color` 或 `hand_right_color` 时，应为各自的 rectified 图像建立独立
 相机订阅，mask 生成与缓存仍按 camera id 隔离。
+
+机器人状态机使用 `/odom` pose 在图像时间戳上估算 yaw 角速度，不依赖当前 G2 数据中
+恒为零的 `twist.angular.z`。角速度达到 `rotation_enter_rad_s` 后，该时间段的 mapping 和
+detection 帧都会在入队前丢弃；只有连续 `rotation_exit_hold_sec` 低于退出阈值才恢复。
+启动阶段、odom 非法或超过 `odom_stale_timeout_sec` 时状态为 unknown，默认同样丢帧。
+可通过 `robot_state.enabled: false` 恢复旧的无状态过滤行为。当前版本尚不控制 DAM 或
+detection 线程，也尚未根据 body/arm TF 改变手部相机策略。
 
 还需要检查所有本机路径：
 

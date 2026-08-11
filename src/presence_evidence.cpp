@@ -4,11 +4,13 @@
 #include <array>
 #include <cmath>
 #include <limits>
+#include <tuple>
 
 namespace roomie {
 namespace {
 
 constexpr float kEpsilon = 1.0e-6f;
+constexpr float kPi = 3.14159265358979323846f;
 
 void retainWindow(std::vector<TimeNanoseconds>* values,
                   TimeNanoseconds now_ns,
@@ -19,6 +21,88 @@ void retainWindow(std::vector<TimeNanoseconds>* values,
                                         now_ns - value > window_ns;
                                }),
                 values->end());
+}
+
+void retainWindow(PositivePresenceEvidenceHistory* values,
+                  TimeNanoseconds now_ns,
+                  TimeNanoseconds window_ns) {
+  values->erase(
+      std::remove_if(
+          values->begin(), values->end(),
+          [now_ns, window_ns](const PositivePresenceEvidenceSample& value) {
+            return value.time_ns > now_ns ||
+                   now_ns - value.time_ns > window_ns;
+          }),
+      values->end());
+}
+
+float viewpointBaselineThreshold(const InstanceTrack& track,
+                                 const PresenceEvidenceConfig& config) {
+  const float minimum = std::max(0.0f, config.viewpoint_baseline_min_m);
+  const float maximum =
+      std::max(minimum, config.viewpoint_baseline_max_m);
+  return std::clamp(std::max(0.0f, config.viewpoint_baseline_ratio) *
+                        track.size_m.norm(),
+                    minimum, maximum);
+}
+
+bool viewpointsAreDistinct(const InstanceTrack& track,
+                           const PositivePresenceEvidenceSample& lhs,
+                           const PositivePresenceEvidenceSample& rhs,
+                           const PresenceEvidenceConfig& config) {
+  const float baseline =
+      (lhs.camera_position_world - rhs.camera_position_world).norm();
+  if (baseline + kEpsilon >= viewpointBaselineThreshold(track, config)) {
+    return true;
+  }
+
+  const Eigen::Vector3f lhs_view =
+      track.center_world - lhs.camera_position_world;
+  const Eigen::Vector3f rhs_view =
+      track.center_world - rhs.camera_position_world;
+  const float lhs_norm = lhs_view.norm();
+  const float rhs_norm = rhs_view.norm();
+  if (lhs_norm <= kEpsilon || rhs_norm <= kEpsilon) {
+    return false;
+  }
+  const float cosine = std::clamp(
+      lhs_view.dot(rhs_view) / (lhs_norm * rhs_norm), -1.0f, 1.0f);
+  const float angle_deg = std::acos(cosine) * 180.0f / kPi;
+  const float minimum_angle = config.viewpoint_min_angle_deg;
+  return minimum_angle > 0.0f && angle_deg + kEpsilon >= minimum_angle;
+}
+
+int distinctPositiveViewpointCount(const InstanceTrack& track,
+                                   TimeNanoseconds now_ns,
+                                   const PresenceEvidenceConfig& config) {
+  std::vector<const PositivePresenceEvidenceSample*> candidates;
+  candidates.reserve(track.positive_presence_evidence_history.size());
+  for (const PositivePresenceEvidenceSample& sample :
+       track.positive_presence_evidence_history) {
+    if (sample.time_ns <= now_ns &&
+        now_ns - sample.time_ns <= config.evidence_window_ns &&
+        sample.camera_position_world.allFinite()) {
+      candidates.push_back(&sample);
+    }
+  }
+  std::sort(candidates.begin(), candidates.end(), [](const auto* lhs,
+                                                     const auto* rhs) {
+    return std::tie(lhs->time_ns, lhs->camera_id) <
+           std::tie(rhs->time_ns, rhs->camera_id);
+  });
+
+  std::vector<const PositivePresenceEvidenceSample*> distinct;
+  for (const PositivePresenceEvidenceSample* candidate : candidates) {
+    const bool independent = std::all_of(
+        distinct.begin(), distinct.end(),
+        [&track, candidate, &config](const auto* accepted) {
+          return viewpointsAreDistinct(track, *accepted, *candidate, config);
+        });
+    if (independent) {
+      distinct.push_back(candidate);
+    }
+  }
+  return static_cast<int>(distinct.size());
 }
 
 bool masked(const VisibilityContext& context, int x, int y) {
@@ -237,12 +321,44 @@ void addPositivePresenceEvidence(InstanceTrack* track,
       track->positive_evidence_timestamps_ns.back() != observation.time_ns) {
     track->positive_evidence_timestamps_ns.push_back(observation.time_ns);
   }
+  retainWindow(&track->positive_presence_evidence_history,
+               observation.time_ns, config.evidence_window_ns);
+  bool distinct_viewpoint = false;
+  if (observation.has_camera_pose &&
+      observation.camera_position_world.allFinite()) {
+    const auto duplicate = std::find_if(
+        track->positive_presence_evidence_history.begin(),
+        track->positive_presence_evidence_history.end(),
+        [&observation](const PositivePresenceEvidenceSample& sample) {
+          return sample.time_ns == observation.time_ns &&
+                 sample.camera_id == observation.camera_id;
+        });
+    if (duplicate == track->positive_presence_evidence_history.end()) {
+      PositivePresenceEvidenceSample sample;
+      sample.time_ns = observation.time_ns;
+      sample.camera_id = observation.camera_id;
+      sample.camera_position_world = observation.camera_position_world;
+      distinct_viewpoint = std::any_of(
+          track->positive_presence_evidence_history.begin(),
+          track->positive_presence_evidence_history.end(),
+          [track, &sample, &config](const auto& previous) {
+            return viewpointsAreDistinct(*track, previous, sample, config);
+          });
+      track->positive_presence_evidence_history.push_back(std::move(sample));
+    }
+  }
   retainWindow(&track->negative_evidence_timestamps_ns, observation.time_ns,
                config.evidence_window_ns);
   track->positive_window_interruptions = 0;
   track->last_presence_evidence_ns = observation.time_ns;
   track->last_presence_evidence_reliability = quality;
-  track->last_presence_evidence_reason = "matched_detection";
+  track->last_presence_evidence_reason =
+      !observation.has_camera_pose
+          ? "matched_detection_missing_viewpoint"
+          : (track->positive_presence_evidence_history.size() > 1 &&
+                     !distinct_viewpoint
+                 ? "matched_detection_same_viewpoint"
+                 : "matched_detection");
 }
 
 void addFreeSpacePresenceEvidence(InstanceTrack* track,
@@ -265,9 +381,12 @@ void addFreeSpacePresenceEvidence(InstanceTrack* track,
   }
   retainWindow(&track->positive_evidence_timestamps_ns, time_ns,
                config.evidence_window_ns);
+  retainWindow(&track->positive_presence_evidence_history, time_ns,
+               config.evidence_window_ns);
   ++track->positive_window_interruptions;
   if (track->positive_window_interruptions > config.max_positive_interruptions) {
     track->positive_evidence_timestamps_ns.clear();
+    track->positive_presence_evidence_history.clear();
   }
   track->last_presence_evidence_ns = time_ns;
   track->last_presence_evidence_reliability = reliability;
@@ -283,7 +402,11 @@ bool hasPositivePresenceConfirmation(const InstanceTrack& track,
       [now_ns, &config](TimeNanoseconds time_ns) {
         return time_ns <= now_ns && now_ns - time_ns <= config.evidence_window_ns;
       });
-  return count >= config.min_positive_frames &&
+  const int required_frames = std::max(1, config.min_positive_frames);
+  const bool viewpoint_confirmed =
+      required_frames == 1 ||
+      distinctPositiveViewpointCount(track, now_ns, config) >= required_frames;
+  return count >= required_frames && viewpoint_confirmed &&
          track.positive_window_interruptions <= config.max_positive_interruptions &&
          track.existence_log_odds >= config.active_threshold;
 }

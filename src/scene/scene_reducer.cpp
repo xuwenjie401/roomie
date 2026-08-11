@@ -248,6 +248,8 @@ SceneObjectPtr objectFromTrack(const InstanceTrack& track,
       track.last_presence_evidence_reason;
   lifecycle->positive_evidence_timestamps_ns =
       track.positive_evidence_timestamps_ns;
+  lifecycle->positive_presence_evidence_history =
+      track.positive_presence_evidence_history;
   lifecycle->negative_evidence_timestamps_ns =
       track.negative_evidence_timestamps_ns;
   lifecycle->positive_window_interruptions =
@@ -360,6 +362,8 @@ bool updateObjectFromTrack(const InstanceTrack& track,
             track.last_presence_evidence_reason ||
         old.positive_evidence_timestamps_ns !=
             track.positive_evidence_timestamps_ns ||
+        old.positive_presence_evidence_history !=
+            track.positive_presence_evidence_history ||
         old.negative_evidence_timestamps_ns !=
             track.negative_evidence_timestamps_ns ||
         old.positive_window_interruptions !=
@@ -382,6 +386,8 @@ bool updateObjectFromTrack(const InstanceTrack& track,
           track.last_presence_evidence_reason;
       component->positive_evidence_timestamps_ns =
           track.positive_evidence_timestamps_ns;
+      component->positive_presence_evidence_history =
+          track.positive_presence_evidence_history;
       component->negative_evidence_timestamps_ns =
           track.negative_evidence_timestamps_ns;
       component->positive_window_interruptions =

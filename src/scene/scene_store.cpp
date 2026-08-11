@@ -187,6 +187,38 @@ Eigen::Vector3f vector3FromJson(const Json& value) {
                          value.at(2).get<float>());
 }
 
+Json positivePresenceEvidenceHistoryToJson(
+    const PositivePresenceEvidenceHistory& history) {
+  Json result = Json::array();
+  for (const PositivePresenceEvidenceSample& sample : history) {
+    result.push_back(
+        Json{{"time_ns", sample.time_ns},
+             {"camera_id", sample.camera_id},
+             {"camera_position_world",
+              vector3ToJson(sample.camera_position_world)}});
+  }
+  return result;
+}
+
+PositivePresenceEvidenceHistory positivePresenceEvidenceHistoryFromJson(
+    const Json& value) {
+  if (!value.is_array()) {
+    throw StoreError("stored positive presence evidence is not an array");
+  }
+  PositivePresenceEvidenceHistory result;
+  result.reserve(value.size());
+  for (const Json& sample_json : value) {
+    PositivePresenceEvidenceSample sample;
+    sample.time_ns = static_cast<TimeNanoseconds>(
+        jsonInt64(sample_json, "time_ns", true));
+    sample.camera_id = sample_json.at("camera_id").get<std::string>();
+    sample.camera_position_world =
+        vector3FromJson(sample_json.at("camera_position_world"));
+    result.push_back(std::move(sample));
+  }
+  return result;
+}
+
 Json vector3iToJson(const Eigen::Vector3i& value) {
   return Json::array({value.x(), value.y(), value.z()});
 }
@@ -468,6 +500,9 @@ Json objectToJson(const SceneObject& object) {
              lifecycle.last_presence_evidence_reason},
             {"positive_evidence_timestamps_ns",
              lifecycle.positive_evidence_timestamps_ns},
+            {"positive_presence_evidence_history",
+             positivePresenceEvidenceHistoryToJson(
+                 lifecycle.positive_presence_evidence_history)},
             {"negative_evidence_timestamps_ns",
              lifecycle.negative_evidence_timestamps_ns},
             {"positive_window_interruptions",
@@ -596,6 +631,11 @@ SceneObjectPtr objectFromJson(const Json& value) {
       "last_presence_evidence_reason", std::string("legacy_restore"));
   lifecycle->positive_evidence_timestamps_ns = lifecycle_json.value(
       "positive_evidence_timestamps_ns", std::vector<TimeNanoseconds>());
+  if (lifecycle_json.contains("positive_presence_evidence_history")) {
+    lifecycle->positive_presence_evidence_history =
+        positivePresenceEvidenceHistoryFromJson(
+            lifecycle_json.at("positive_presence_evidence_history"));
+  }
   lifecycle->negative_evidence_timestamps_ns = lifecycle_json.value(
       "negative_evidence_timestamps_ns", std::vector<TimeNanoseconds>());
   lifecycle->positive_window_interruptions = lifecycle_json.value(
@@ -851,6 +891,9 @@ Json trackToJson(const InstanceTrack& track) {
       {"existence_log_odds", track.existence_log_odds},
       {"positive_evidence_timestamps_ns",
        track.positive_evidence_timestamps_ns},
+      {"positive_presence_evidence_history",
+       positivePresenceEvidenceHistoryToJson(
+           track.positive_presence_evidence_history)},
       {"negative_evidence_timestamps_ns",
        track.negative_evidence_timestamps_ns},
       {"positive_window_interruptions",
@@ -936,6 +979,11 @@ InstanceTrack trackFromJson(const Json& value) {
                                                           : 0.0f));
   track.positive_evidence_timestamps_ns = value.value(
       "positive_evidence_timestamps_ns", std::vector<TimeNanoseconds>());
+  if (value.contains("positive_presence_evidence_history")) {
+    track.positive_presence_evidence_history =
+        positivePresenceEvidenceHistoryFromJson(
+            value.at("positive_presence_evidence_history"));
+  }
   track.negative_evidence_timestamps_ns = value.value(
       "negative_evidence_timestamps_ns", std::vector<TimeNanoseconds>());
   track.positive_window_interruptions =

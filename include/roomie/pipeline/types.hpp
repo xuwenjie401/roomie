@@ -9,6 +9,7 @@
 #include <iomanip>
 #include <map>
 #include <memory>
+#include <optional>
 #include <random>
 #include <sstream>
 #include <string>
@@ -19,6 +20,35 @@
 namespace roomie {
 
 using TimeNanoseconds = std::int64_t;
+
+enum class RobotActivityValue : std::uint8_t {
+  kUnknown = 0,
+  kInactive = 1,
+  kActive = 2,
+};
+
+struct RobotActivityStatus {
+  RobotActivityValue value = RobotActivityValue::kUnknown;
+  TimeNanoseconds observed_at_ns = 0;
+  TimeNanoseconds since_ns = 0;
+
+  bool known() const { return value != RobotActivityValue::kUnknown; }
+  bool active() const { return value == RobotActivityValue::kActive; }
+};
+
+// A timestamped, process-local view of robot activity. Only rotating is
+// estimated today. The remaining independent facets deliberately stay unknown
+// until their odometry/TF estimators are implemented, while allowing frame and
+// GPU scheduling policies to depend on one stable interface.
+struct RobotStateSnapshot {
+  RobotActivityStatus rotating;
+  RobotActivityStatus near_stationary;
+  RobotActivityStatus body_bent;
+  RobotActivityStatus left_arm_active;
+  RobotActivityStatus right_arm_active;
+  TimeNanoseconds source_time_ns = 0;
+  std::optional<double> yaw_rate_rad_s;
+};
 
 struct RunId {
   std::uint64_t high = 0;
@@ -244,6 +274,7 @@ struct FrameBundle {
   Eigen::Isometry3f T_world_camera = Eigen::Isometry3f::Identity();
   std::uint64_t calibration_revision = 0;
   SyncDiagnostics sync;
+  RobotStateSnapshot robot_state;
   // True only when detection requires this exact frame's include-current map
   // commit. RGB-independent detection leaves this false and uses the latest
   // already-published surface.

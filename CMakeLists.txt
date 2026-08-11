@@ -42,6 +42,7 @@ find_package(Eigen3 REQUIRED)
 find_package(ego_shade REQUIRED)
 find_package(geometry_msgs REQUIRED)
 find_package(nlohmann_json REQUIRED)
+find_package(nav_msgs REQUIRED)
 find_package(rclcpp REQUIRED)
 find_package(sensor_msgs REQUIRED)
 find_package(std_msgs REQUIRED)
@@ -99,6 +100,7 @@ add_library(
   src/publisher_persistence_thread.cpp
   src/python_inference_backend.cpp
   src/robot_mask_generator.cpp
+  src/robot_state_estimator.cpp
   src/query/scene_mutation_json_adapter.cpp
   src/query/scene_query_json_adapter.cpp
   src/query/scene_query_gateway.cpp
@@ -163,6 +165,7 @@ ament_target_dependencies(
   roomie_pipeline
   ament_index_cpp
   geometry_msgs
+  nav_msgs
   rclcpp
   sensor_msgs
   std_msgs
@@ -235,6 +238,9 @@ if(BUILD_TESTING)
   target_compile_definitions(
     test_robot_mask_generator
     PRIVATE "ROOMIE_SOURCE_DIR=\"${CMAKE_CURRENT_SOURCE_DIR}\"")
+  ament_add_gtest(test_robot_state_estimator
+                  test/test_robot_state_estimator.cpp)
+  target_link_libraries(test_robot_state_estimator roomie_pipeline)
   ament_add_gtest(test_python_inference_backend
                   test/test_python_inference_backend.cpp)
   target_link_libraries(test_python_inference_backend roomie_pipeline)
@@ -357,6 +363,7 @@ ament_export_dependencies(
   ament_index_cpp
   ego_shade
   geometry_msgs
+  nav_msgs
   nlohmann_json
   OpenCV
   PNG

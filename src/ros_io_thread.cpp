@@ -275,6 +275,32 @@ const char* mapModeName(MapMode mode) {
   return mode == MapMode::kFrozen ? "frozen" : "online";
 }
 
+const char* robotActivityName(RobotActivityValue value) {
+  switch (value) {
+    case RobotActivityValue::kUnknown:
+      return "unknown";
+    case RobotActivityValue::kInactive:
+      return "inactive";
+    case RobotActivityValue::kActive:
+      return "active";
+  }
+  return "unknown";
+}
+
+const char* robotFrameAdmissionReasonName(RobotFrameAdmissionReason reason) {
+  switch (reason) {
+    case RobotFrameAdmissionReason::kNone:
+      return "none";
+    case RobotFrameAdmissionReason::kRotating:
+      return "robot_rotating";
+    case RobotFrameAdmissionReason::kStateUnknown:
+      return "robot_state_unknown";
+    case RobotFrameAdmissionReason::kPolicyError:
+      return "robot_state_policy_error";
+  }
+  return "robot_state_policy_error";
+}
+
 }  // namespace
 
 RosIoThread::RosIoThread(ThreadSafeQueue<FrameBundlePtr>& mapping_queue,
@@ -337,6 +363,7 @@ void RosIoThread::attachNode(rclcpp::Node& node) {
   subscriptions_.clear();
   tf_subscription_.reset();
   tf_static_subscription_.reset();
+  odom_subscription_.reset();
   tf_buffer_ = std::make_shared<tf2::BufferCore>(
       tf2::durationFromSec(config_.tf_buffer_duration_sec));
   const auto sensor_qos =
@@ -347,6 +374,15 @@ void RosIoThread::attachNode(rclcpp::Node& node) {
       rclcpp::QoS(static_cast<std::size_t>(std::max<std::size_t>(1, config_.input_queue_size)))
           .reliable()
           .durability_volatile();
+
+  if (!config_.odom_topic.empty() && config_.odometry_observer) {
+    odom_subscription_ = node.create_subscription<nav_msgs::msg::Odometry>(
+        config_.odom_topic,
+        sensor_qos,
+        [this](nav_msgs::msg::Odometry::SharedPtr msg) {
+          handleOdom(std::move(msg));
+        });
+  }
 
   if (!config_.tf_topic.empty()) {
     tf_subscription_ = node.create_subscription<tf2_msgs::msg::TFMessage>(
@@ -691,6 +727,81 @@ void RosIoThread::handleCameraInfo(const std::string& camera_id,
     maybeLogStatusLocked();
   }
   tryAssembleCamera(camera_id);
+}
+
+void RosIoThread::handleOdom(const nav_msgs::msg::Odometry::SharedPtr msg) {
+  if (!msg) {
+    return;
+  }
+  std::function<RobotStateEstimatorUpdate(const OdometryObservation&)> observer;
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    ++odom_messages_;
+    observer = config_.odometry_observer;
+  }
+  if (!observer) {
+    return;
+  }
+
+  OdometryObservation observation;
+  observation.time_ns = toNanoseconds(msg->header.stamp);
+  observation.position = Eigen::Vector3d(msg->pose.pose.position.x,
+                                         msg->pose.pose.position.y,
+                                         msg->pose.pose.position.z);
+  observation.orientation = Eigen::Quaterniond(
+      msg->pose.pose.orientation.w,
+      msg->pose.pose.orientation.x,
+      msg->pose.pose.orientation.y,
+      msg->pose.pose.orientation.z);
+
+  RobotStateEstimatorUpdate update;
+  try {
+    update = observer(observation);
+  } catch (const std::exception& error) {
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      ++odom_invalid_;
+    }
+    RunLogger::logGlobal("robot_state",
+                         "odom_observer_error error='" +
+                             std::string(error.what()) + "'");
+    return;
+  } catch (...) {
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      ++odom_invalid_;
+    }
+    RunLogger::logGlobal("robot_state",
+                         "odom_observer_error error=unknown");
+    return;
+  }
+
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (update.out_of_order) {
+      ++odom_out_of_order_;
+    }
+    if (update.outcome == OdometryObservationOutcome::kInvalid) {
+      ++odom_invalid_;
+    } else if (update.outcome == OdometryObservationOutcome::kReplaced) {
+      ++odom_replaced_;
+    } else if (update.outcome == OdometryObservationOutcome::kTooOld) {
+      ++odom_too_old_;
+    }
+    maybeLogStatusLocked();
+  }
+  if (update.latest_state_changed) {
+    std::ostringstream stream;
+    stream << "state_transition activity=rotating from="
+           << robotActivityName(update.previous_latest_state)
+           << " to=" << robotActivityName(update.latest.rotating.value)
+           << " sensor_time_ns=" << update.latest.source_time_ns
+           << " since_ns=" << update.latest.rotating.since_ns;
+    if (update.latest.yaw_rate_rad_s) {
+      stream << " yaw_rate_rad_s=" << *update.latest.yaw_rate_rad_s;
+    }
+    RunLogger::logGlobal("robot_state", stream.str());
+  }
 }
 
 void RosIoThread::handleTf(const tf2_msgs::msg::TFMessage::SharedPtr msg, bool is_static) {
@@ -1091,7 +1202,7 @@ std::pair<FrameBundlePtr, FrameBundlePtr> RosIoThread::makeFrameBundlesLocked(
     return {};
   }
   BufferedRgbFrame& rgb_frame = rgb_it->second;
-  const bool mapping_pending =
+  bool mapping_pending =
       state.config.enable_mapping && !rgb_frame.mapping_consumed;
   bool detection_pending =
       state.config.enable_detection && !rgb_frame.detection_consumed;
@@ -1106,6 +1217,70 @@ std::pair<FrameBundlePtr, FrameBundlePtr> RosIoThread::makeFrameBundlesLocked(
       rgb_frame.robot_mask->height != rgb_frame.rgb->height ||
       rgb_frame.robot_mask->channels != 1) {
     return {};
+  }
+
+  RobotFrameAdmissionDecision robot_admission;
+  if (config_.robot_frame_admission) {
+    try {
+      robot_admission = config_.robot_frame_admission(camera_id, time_ns);
+    } catch (...) {
+      robot_admission.allow_mapping = false;
+      robot_admission.allow_detection = false;
+      robot_admission.reason = RobotFrameAdmissionReason::kPolicyError;
+    }
+  }
+  const bool mapping_state_blocked =
+      mapping_pending && !robot_admission.allow_mapping;
+  const bool detection_state_blocked =
+      detection_pending && !robot_admission.allow_detection;
+  if (mapping_state_blocked || detection_state_blocked) {
+    if (robot_admission.reason == RobotFrameAdmissionReason::kNone) {
+      robot_admission.reason = RobotFrameAdmissionReason::kPolicyError;
+    }
+    if (mapping_state_blocked) {
+      rgb_frame.mapping_consumed = true;
+      mapping_pending = false;
+      if (robot_admission.reason == RobotFrameAdmissionReason::kRotating) {
+        ++robot_rotation_mapping_drops_;
+      } else if (robot_admission.reason ==
+                 RobotFrameAdmissionReason::kStateUnknown) {
+        ++robot_unknown_mapping_drops_;
+      }
+    }
+    if (detection_state_blocked) {
+      rgb_frame.detection_consumed = true;
+      detection_pending = false;
+      if (robot_admission.reason == RobotFrameAdmissionReason::kRotating) {
+        ++robot_rotation_detection_drops_;
+      } else if (robot_admission.reason ==
+                 RobotFrameAdmissionReason::kStateUnknown) {
+        ++robot_unknown_detection_drops_;
+      }
+    }
+    if (robot_admission.reason == RobotFrameAdmissionReason::kPolicyError) {
+      ++robot_policy_errors_;
+    }
+    std::ostringstream stream;
+    stream << "frame_drop camera=" << camera_id
+           << " sensor_time_ns=" << time_ns
+           << " reason="
+           << robotFrameAdmissionReasonName(robot_admission.reason)
+           << " mapping=" << (mapping_state_blocked ? "true" : "false")
+           << " detection="
+           << (detection_state_blocked ? "true" : "false")
+           << " state_source_time_ns="
+           << robot_admission.state.source_time_ns;
+    if (robot_admission.state.yaw_rate_rad_s) {
+      stream << " yaw_rate_rad_s="
+             << *robot_admission.state.yaw_rate_rad_s;
+    }
+    RunLogger::logGlobal("ros_io", stream.str());
+
+    if (!mapping_pending && !detection_pending) {
+      state.logical_frames.erase(time_ns);
+      state.buffered_rgb_frames.erase(rgb_it);
+      return {};
+    }
   }
 
   const TimeNanoseconds max_image_delta_ns =
@@ -1206,6 +1381,7 @@ std::pair<FrameBundlePtr, FrameBundlePtr> RosIoThread::makeFrameBundlesLocked(
     mutable_bundle->sync.rgb_depth_delta_ns = rgb_depth_delta_ns;
     mutable_bundle->sync.tf_delta_ns =
         absoluteDelta(time_ns, state.latest_pose_time_ns);
+    mutable_bundle->robot_state = robot_admission.state;
     // Independent detections project the latest committed map and therefore do
     // not reserve an exact include-current map commit barrier.
     mutable_bundle->perception_candidate = false;
@@ -1291,6 +1467,11 @@ void RosIoThread::maybeLogStatusLocked() {
          << " rgb=" << rgb_messages_
          << " depth=" << depth_messages_
          << " camera_info=" << camera_info_messages_
+         << " odom=" << odom_messages_
+         << " odom_invalid=" << odom_invalid_
+         << " odom_out_of_order=" << odom_out_of_order_
+         << " odom_replaced=" << odom_replaced_
+         << " odom_too_old=" << odom_too_old_
          << " tf=" << tf_messages_
          << " tf_static=" << tf_static_messages_
          << " tf_set_failures=" << tf_set_failures_
@@ -1303,6 +1484,15 @@ void RosIoThread::maybeLogStatusLocked() {
          << " perception_rate_skips=" << perception_rate_skips_
          << " perception_backpressure_skips="
          << perception_backpressure_skips_
+         << " robot_rotation_mapping_drops="
+         << robot_rotation_mapping_drops_
+         << " robot_rotation_detection_drops="
+         << robot_rotation_detection_drops_
+         << " robot_unknown_mapping_drops="
+         << robot_unknown_mapping_drops_
+         << " robot_unknown_detection_drops="
+         << robot_unknown_detection_drops_
+         << " robot_policy_errors=" << robot_policy_errors_
          << " cameras=" << camera_states_.size();
   for (const auto& [camera_id, state] : camera_states_) {
     stream << " camera[" << camera_id << "]={rendered="

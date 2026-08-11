@@ -601,7 +601,7 @@ TEST(InstanceMapThread,
 
   const RunId run{100, 200};
   const auto make_response = [&](FrameId frame_id, bool detected,
-                                 bool with_depth) {
+                                 bool with_depth, float camera_x = 0.0f) {
     InferenceResponse response;
     response.ok = true;
     response.time_ns = static_cast<TimeNanoseconds>(frame_id) * 100'000'000LL;
@@ -612,6 +612,7 @@ TEST(InstanceMapThread,
     response.provenance.sensor_time_ns = response.time_ns;
     response.has_camera_pose = true;
     response.T_world_camera = Eigen::Isometry3f::Identity();
+    response.T_world_camera.translation().x() = camera_x;
     if (detected) {
       RawDetection detection;
       detection.label = "backpack";
@@ -644,7 +645,8 @@ TEST(InstanceMapThread,
   EXPECT_EQ(instance_map.snapshotTrackedInstances().front().presence_state,
             "tentative");
 
-  ASSERT_TRUE(instance_map.enqueueDetections(make_response(2, true, false)));
+  ASSERT_TRUE(
+      instance_map.enqueueDetections(make_response(2, true, false, 0.12f)));
   ASSERT_TRUE(instance_map.waitUntilIdle(std::chrono::seconds(1)));
   ASSERT_EQ(instance_map.snapshotInstances().size(), 1U);
   const int original_object_id =
@@ -664,7 +666,8 @@ TEST(InstanceMapThread,
   ASSERT_TRUE(instance_map.enqueueDetections(make_response(6, true, false)));
   ASSERT_TRUE(instance_map.waitUntilIdle(std::chrono::seconds(1)));
   EXPECT_TRUE(instance_map.snapshotInstances().empty());
-  ASSERT_TRUE(instance_map.enqueueDetections(make_response(7, true, false)));
+  ASSERT_TRUE(
+      instance_map.enqueueDetections(make_response(7, true, false, 0.12f)));
   ASSERT_TRUE(instance_map.waitUntilIdle(std::chrono::seconds(1)));
   ASSERT_EQ(instance_map.snapshotInstances().size(), 1U);
   EXPECT_EQ(instance_map.snapshotInstances().front().object_id,
