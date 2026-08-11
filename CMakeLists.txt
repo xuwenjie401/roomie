@@ -202,6 +202,7 @@ install(DIRECTORY config launch rviz DESTINATION share/${PROJECT_NAME}
         PATTERN "*.pyc" EXCLUDE)
 install(PROGRAMS
   scripts/roomie_agibot_head_rgbd_adapter.py
+  scripts/roomie_agibot_hand_color_adapter.py
   scripts/roomie_bag_replay_harness.py
   scripts/roomie_python_dam_worker.py
   scripts/roomie_python_inference_worker.py
@@ -241,6 +242,9 @@ if(BUILD_TESTING)
   ament_add_gtest(test_robot_state_estimator
                   test/test_robot_state_estimator.cpp)
   target_link_libraries(test_robot_state_estimator roomie_pipeline)
+  target_compile_definitions(
+    test_robot_state_estimator
+    PRIVATE "ROOMIE_SOURCE_DIR=\"${CMAKE_CURRENT_SOURCE_DIR}\"")
   ament_add_gtest(test_python_inference_backend
                   test/test_python_inference_backend.cpp)
   target_link_libraries(test_python_inference_backend roomie_pipeline)
@@ -327,6 +331,10 @@ if(BUILD_TESTING)
   ament_add_pytest_test(
     test_agibot_head_rgbd_adapter
     test/test_agibot_head_rgbd_adapter.py
+    TIMEOUT 60)
+  ament_add_pytest_test(
+    test_agibot_hand_color_adapter
+    test/test_agibot_hand_color_adapter.py
     TIMEOUT 60)
   ament_add_pytest_test(
     test_bag_replay_harness

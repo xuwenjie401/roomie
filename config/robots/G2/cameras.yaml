@@ -14,6 +14,7 @@ mask_defaults:
 cameras:
   head_color:
     topic: /roomie/input/head_color/image_rect
+    camera_info_topic: /roomie/input/head_color/camera_info
     frame: head_color
     mount_frame: head_link3
     resolution: [640, 400]
@@ -31,6 +32,7 @@ cameras:
 
   hand_left_color:
     topic: /roomie/input/hand_left_color/image_rect
+    camera_info_topic: /roomie/input/hand_left_color/camera_info
     frame: hand_left_color
     mount_frame: arm_l_end_link
     resolution: [1280, 1056]
@@ -42,12 +44,18 @@ cameras:
     distortion:
       model: plumb_bob
       coefficients: [0.0, 0.0, 0.0, 0.0, 0.0]
+    source:
+      topic: /live_connect/hand_left_color
+      distortion:
+        model: plumb_bob
+        coefficients: [-0.05106272985700188, -0.008499813364455603, 0.0004772174945820217, -0.000024258938684976506, 0.0016504611207111654]
     T_mount_camera:
       translation: [-0.0021854932704972454, -0.10183835278227006, 0.06161198714436397]
       quaternion_wxyz: [0.9323524643480819, -0.3614773384646618, 0.00017334838951529893, -0.0072791449290953705]
 
   hand_right_color:
     topic: /roomie/input/hand_right_color/image_rect
+    camera_info_topic: /roomie/input/hand_right_color/camera_info
     frame: hand_right_color
     mount_frame: arm_r_end_link
     resolution: [1280, 1056]
@@ -59,6 +67,11 @@ cameras:
     distortion:
       model: plumb_bob
       coefficients: [0.0, 0.0, 0.0, 0.0, 0.0]
+    source:
+      topic: /live_connect/hand_right_color
+      distortion:
+        model: plumb_bob
+        coefficients: [-0.05049513514065198, -0.009131142421459269, 0.000039640090414275994, -0.00019533030486648738, 0.00179206780204822]
     T_mount_camera:
       translation: [-0.003748882896472774, 0.0999005961443389, 0.06419498458836964]
       quaternion_wxyz: [-0.001851299397618152, 0.004960897456150953, -0.36740611541890345, 0.9300455411106283]

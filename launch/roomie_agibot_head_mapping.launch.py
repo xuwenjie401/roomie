@@ -3,7 +3,7 @@ from pathlib import Path
 from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument
 from launch.conditions import IfCondition
-from launch.substitutions import LaunchConfiguration
+from launch.substitutions import LaunchConfiguration, PythonExpression
 from launch_ros.actions import Node
 from launch_ros.parameter_descriptions import ParameterValue
 
@@ -23,13 +23,18 @@ def source_package_path(directory, filename):
 
 def generate_launch_description():
     adapter_config = LaunchConfiguration("adapter_config")
+    hand_adapter_config = LaunchConfiguration("hand_adapter_config")
+    hand_camera_config = LaunchConfiguration("hand_camera_config")
     pipeline_config = LaunchConfiguration("pipeline_config")
     calibration_file = LaunchConfiguration("calibration_file")
     color_topic = LaunchConfiguration("color_topic")
     depth_topic = LaunchConfiguration("depth_topic")
+    hand_left_color_topic = LaunchConfiguration("hand_left_color_topic")
+    hand_right_color_topic = LaunchConfiguration("hand_right_color_topic")
     tf_topic = LaunchConfiguration("tf_topic")
     publish_static_tf = LaunchConfiguration("publish_static_tf")
     enable_boxer = LaunchConfiguration("enable_boxer")
+    enable_hand_cameras = LaunchConfiguration("enable_hand_cameras")
     boxer_max_inference_fps = LaunchConfiguration("boxer_max_inference_fps")
     use_rviz = LaunchConfiguration("use_rviz")
     rviz_config = LaunchConfiguration("rviz_config")
@@ -43,6 +48,14 @@ def generate_launch_description():
         "config",
         "pipeline_agibot_head_mapping.yaml",
     )
+    default_hand_adapter_config = source_package_path(
+        "config",
+        "agibot_hand_color_adapter.yaml",
+    )
+    default_hand_camera_config = source_package_path(
+        "config/robots/G2",
+        "cameras.yaml",
+    )
     default_rviz_config = source_package_path("rviz", "roomie_pipeline.rviz")
 
     return LaunchDescription(
@@ -51,6 +64,16 @@ def generate_launch_description():
                 "adapter_config",
                 default_value=default_adapter_config,
                 description="AgiBot head RGB-D adapter parameter file.",
+            ),
+            DeclareLaunchArgument(
+                "hand_adapter_config",
+                default_value=default_hand_adapter_config,
+                description="AgiBot hand-color adapter parameter file.",
+            ),
+            DeclareLaunchArgument(
+                "hand_camera_config",
+                default_value=default_hand_camera_config,
+                description="Canonical hand camera geometry and raw distortion YAML.",
             ),
             DeclareLaunchArgument(
                 "pipeline_config",
@@ -76,6 +99,16 @@ def generate_launch_description():
                 description="Live depth image topic consumed by the adapter.",
             ),
             DeclareLaunchArgument(
+                "hand_left_color_topic",
+                default_value="/gdk/camera/hand_left_color",
+                description="Raw left-hand color image topic.",
+            ),
+            DeclareLaunchArgument(
+                "hand_right_color_topic",
+                default_value="/gdk/camera/hand_right_color",
+                description="Raw right-hand color image topic.",
+            ),
+            DeclareLaunchArgument(
                 "tf_topic",
                 default_value="/tf",
                 description=(
@@ -97,6 +130,13 @@ def generate_launch_description():
                 description=(
                     "Enable the OWLv2 + BoxerNet detection and instance-mapping "
                     "pipeline."
+                ),
+            ),
+            DeclareLaunchArgument(
+                "enable_hand_cameras",
+                default_value="true",
+                description=(
+                    "Rectify and admit both hand cameras when detection is enabled."
                 ),
             ),
             DeclareLaunchArgument(
@@ -137,6 +177,35 @@ def generate_launch_description():
                         "publish_static_tf": ParameterValue(
                             publish_static_tf,
                             value_type=bool,
+                        ),
+                    },
+                ],
+            ),
+            Node(
+                condition=IfCondition(
+                    PythonExpression(
+                        [
+                            "'",
+                            enable_boxer,
+                            "'.lower() == 'true' and '",
+                            enable_hand_cameras,
+                            "'.lower() == 'true'",
+                        ]
+                    )
+                ),
+                package="roomie",
+                executable="roomie_agibot_hand_color_adapter.py",
+                name="roomie_agibot_hand_color_adapter",
+                output="screen",
+                parameters=[
+                    hand_adapter_config,
+                    {
+                        "camera_config": hand_camera_config,
+                        "hand_left_input_topic": hand_left_color_topic,
+                        "hand_right_input_topic": hand_right_color_topic,
+                        "max_fps": ParameterValue(
+                            boxer_max_inference_fps,
+                            value_type=float,
                         ),
                     },
                 ],

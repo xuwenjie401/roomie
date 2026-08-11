@@ -297,6 +297,8 @@ const char* robotFrameAdmissionReasonName(RobotFrameAdmissionReason reason) {
       return "robot_state_unknown";
     case RobotFrameAdmissionReason::kPolicyError:
       return "robot_state_policy_error";
+    case RobotFrameAdmissionReason::kNavigationPosture:
+      return "navigation_posture_inactive";
   }
   return "robot_state_policy_error";
 }
@@ -364,6 +366,7 @@ void RosIoThread::attachNode(rclcpp::Node& node) {
   tf_subscription_.reset();
   tf_static_subscription_.reset();
   odom_subscription_.reset();
+  hand_camera_enable_publisher_.reset();
   tf_buffer_ = std::make_shared<tf2::BufferCore>(
       tf2::durationFromSec(config_.tf_buffer_duration_sec));
   const auto sensor_qos =
@@ -374,6 +377,16 @@ void RosIoThread::attachNode(rclcpp::Node& node) {
       rclcpp::QoS(static_cast<std::size_t>(std::max<std::size_t>(1, config_.input_queue_size)))
           .reliable()
           .durability_volatile();
+
+  if (!config_.hand_camera_enable_topic.empty()) {
+    hand_camera_enable_publisher_ =
+        node.create_publisher<std_msgs::msg::Bool>(
+            config_.hand_camera_enable_topic,
+            rclcpp::QoS(1).reliable().transient_local());
+    std_msgs::msg::Bool disabled;
+    disabled.data = false;
+    hand_camera_enable_publisher_->publish(disabled);
+  }
 
   if (!config_.odom_topic.empty() && config_.odometry_observer) {
     odom_subscription_ = node.create_subscription<nav_msgs::msg::Odometry>(
@@ -605,7 +618,63 @@ void RosIoThread::enqueueBundles(FrameBundlePtr mapping_bundle,
 
 void RosIoThread::handleRgb(const std::string& camera_id,
                             const sensor_msgs::msg::Image::SharedPtr msg) {
+  if (!msg) {
+    return;
+  }
   const auto ingest_time = std::chrono::steady_clock::now();
+  const TimeNanoseconds sensor_time_ns = toNanoseconds(msg->header.stamp);
+  bool detection_only = false;
+  std::function<RobotFrameAdmissionDecision(const std::string&,
+                                            TimeNanoseconds)>
+      robot_frame_admission;
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    ++rgb_messages_;
+    const auto state_it = camera_states_.find(camera_id);
+    if (state_it != camera_states_.end()) {
+      detection_only = !state_it->second.config.enable_mapping &&
+                       state_it->second.config.enable_detection;
+    }
+    robot_frame_admission = config_.robot_frame_admission;
+  }
+
+  // Detection-only cameras are admitted before decoding/copying the ROS
+  // image, looking up robot TF, or rendering the robot mask.  The later gate
+  // in makeFrameBundlesLocked remains authoritative across a state transition.
+  if (detection_only && robot_frame_admission) {
+    RobotFrameAdmissionDecision admission;
+    try {
+      admission = robot_frame_admission(camera_id, sensor_time_ns);
+    } catch (...) {
+      admission.allow_detection = false;
+      admission.reason = RobotFrameAdmissionReason::kPolicyError;
+    }
+    if (!admission.allow_detection) {
+      if (admission.reason == RobotFrameAdmissionReason::kNone) {
+        admission.reason = RobotFrameAdmissionReason::kPolicyError;
+      }
+      std::lock_guard<std::mutex> lock(mutex_);
+      const auto state_it = camera_states_.find(camera_id);
+      if (state_it != camera_states_.end()) {
+        ++state_it->second.preprocess_admission_drops;
+      }
+      if (admission.reason == RobotFrameAdmissionReason::kRotating) {
+        ++robot_rotation_detection_drops_;
+      } else if (admission.reason ==
+                 RobotFrameAdmissionReason::kStateUnknown) {
+        ++robot_unknown_detection_drops_;
+      } else if (admission.reason ==
+                 RobotFrameAdmissionReason::kNavigationPosture) {
+        ++robot_navigation_posture_detection_drops_;
+      } else if (admission.reason ==
+                 RobotFrameAdmissionReason::kPolicyError) {
+        ++robot_policy_errors_;
+      }
+      maybeLogStatusLocked();
+      return;
+    }
+  }
+
   auto rgb = imageBufferFromRos(*msg);
   if (!rgb) {
     RCLCPP_WARN(logger_,
@@ -618,7 +687,6 @@ void RosIoThread::handleRgb(const std::string& camera_id,
     std::lock_guard<std::mutex> lock(mutex_);
     auto& state = camera_states_[camera_id];
     state.config.camera_id = camera_id;
-    ++rgb_messages_;
     const RobotMaskCameraInfo expected =
         config_.robot_mask_generator->cameraInfo(camera_id);
     if (rgb->width != expected.width || rgb->height != expected.height) {
@@ -633,7 +701,6 @@ void RosIoThread::handleRgb(const std::string& camera_id,
       maybeLogStatusLocked();
       return;
     }
-    const TimeNanoseconds sensor_time_ns = toNanoseconds(msg->header.stamp);
     if (state.latest_rgb_time_ns != sensor_time_ns ||
         state.latest_rgb_ingest_time == std::chrono::steady_clock::time_point::min()) {
       state.latest_rgb_ingest_time = ingest_time;
@@ -805,13 +872,20 @@ void RosIoThread::handleOdom(const nav_msgs::msg::Odometry::SharedPtr msg) {
 }
 
 void RosIoThread::handleTf(const tf2_msgs::msg::TFMessage::SharedPtr msg, bool is_static) {
+  if (!msg) {
+    return;
+  }
   std::vector<std::string> cameras_to_retry;
+  std::function<RobotPostureEstimatorUpdate(const PostureObservation&)>
+      posture_observer;
+  PostureObservation posture_observation;
   {
     std::lock_guard<std::mutex> lock(mutex_);
     if (is_static) {
       ++tf_static_messages_;
     } else {
       ++tf_messages_;
+      posture_observer = config_.posture_observer;
     }
     for (const auto& transform_msg : msg->transforms) {
       geometry_msgs::msg::TransformStamped stored = transform_msg;
@@ -828,6 +902,25 @@ void RosIoThread::handleTf(const tf2_msgs::msg::TFMessage::SharedPtr msg, bool i
                     stored.header.frame_id.c_str(),
                     stored.child_frame_id.c_str());
         continue;
+      }
+
+      if (!is_static && posture_observer) {
+        LinkTransformObservation observation;
+        observation.parent_frame_id = stored.header.frame_id;
+        observation.child_frame_id = stored.child_frame_id;
+        observation.position = Eigen::Vector3d(
+            stored.transform.translation.x,
+            stored.transform.translation.y,
+            stored.transform.translation.z);
+        observation.orientation = Eigen::Quaterniond(
+            stored.transform.rotation.w,
+            stored.transform.rotation.x,
+            stored.transform.rotation.y,
+            stored.transform.rotation.z)
+                                      .normalized();
+        posture_observation.time_ns = std::max(
+            posture_observation.time_ns, toNanoseconds(stored.header.stamp));
+        posture_observation.transforms.push_back(std::move(observation));
       }
 
       if (!tf_buffer_) {
@@ -857,6 +950,50 @@ void RosIoThread::handleTf(const tf2_msgs::msg::TFMessage::SharedPtr msg, bool i
       cameras_to_retry.push_back(camera_id);
     }
     maybeLogStatusLocked();
+  }
+
+  if (posture_observer && posture_observation.time_ns > 0 &&
+      !posture_observation.transforms.empty()) {
+    try {
+      const RobotPostureEstimatorUpdate update =
+          posture_observer(posture_observation);
+      if (update.latest_state_changed) {
+        if (hand_camera_enable_publisher_) {
+          std_msgs::msg::Bool enabled;
+          enabled.data =
+              update.latest.navigation_posture_deviated.value ==
+              RobotActivityValue::kActive;
+          hand_camera_enable_publisher_->publish(enabled);
+        }
+        std::ostringstream stream;
+        stream << "state_transition activity=navigation_posture_deviated from="
+               << robotActivityName(update.previous_latest_state)
+               << " to="
+               << robotActivityName(
+                      update.latest.navigation_posture_deviated.value)
+               << " sensor_time_ns=" << update.latest.source_time_ns
+               << " since_ns="
+               << update.latest.navigation_posture_deviated.since_ns;
+        RunLogger::logGlobal("robot_state", stream.str());
+      }
+    } catch (const std::exception& error) {
+      if (hand_camera_enable_publisher_) {
+        std_msgs::msg::Bool disabled;
+        disabled.data = false;
+        hand_camera_enable_publisher_->publish(disabled);
+      }
+      RunLogger::logGlobal("robot_state",
+                           "posture_observer_error error='" +
+                               std::string(error.what()) + "'");
+    } catch (...) {
+      if (hand_camera_enable_publisher_) {
+        std_msgs::msg::Bool disabled;
+        disabled.data = false;
+        hand_camera_enable_publisher_->publish(disabled);
+      }
+      RunLogger::logGlobal("robot_state",
+                           "posture_observer_error error=unknown");
+    }
   }
 
   for (const std::string& camera_id : cameras_to_retry) {
@@ -1255,6 +1392,9 @@ std::pair<FrameBundlePtr, FrameBundlePtr> RosIoThread::makeFrameBundlesLocked(
       } else if (robot_admission.reason ==
                  RobotFrameAdmissionReason::kStateUnknown) {
         ++robot_unknown_detection_drops_;
+      } else if (robot_admission.reason ==
+                 RobotFrameAdmissionReason::kNavigationPosture) {
+        ++robot_navigation_posture_detection_drops_;
       }
     }
     if (robot_admission.reason == RobotFrameAdmissionReason::kPolicyError) {
@@ -1492,6 +1632,8 @@ void RosIoThread::maybeLogStatusLocked() {
          << robot_unknown_mapping_drops_
          << " robot_unknown_detection_drops="
          << robot_unknown_detection_drops_
+         << " robot_navigation_posture_detection_drops="
+         << robot_navigation_posture_detection_drops_
          << " robot_policy_errors=" << robot_policy_errors_
          << " cameras=" << camera_states_.size();
   for (const auto& [camera_id, state] : camera_states_) {
@@ -1502,6 +1644,7 @@ void RosIoThread::maybeLogStatusLocked() {
            << ",tf_waits=" << state.mask_tf_waits
            << ",failures=" << state.mask_generation_failures
            << ",geometry_rejections=" << state.mask_geometry_rejections
+           << ",preprocess_drops=" << state.preprocess_admission_drops
            << ",full_masks=" << state.full_masks
            << ",last_render_ms=" << state.last_mask_render_ms
            << ",last_pixels=" << state.last_mask_pixels;

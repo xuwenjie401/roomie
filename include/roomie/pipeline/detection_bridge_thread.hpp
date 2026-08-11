@@ -120,6 +120,10 @@ class DetectionBridgeThread : public WorkerThread {
   PipelineConfig config_;
   rclcpp::Logger logger_;
   rclcpp::Publisher<sensor_msgs::msg::Image>::SharedPtr detection_debug_pub_;
+  std::unordered_map<
+      std::string,
+      rclcpp::Publisher<sensor_msgs::msg::Image>::SharedPtr>
+      additional_detection_debug_pubs_;
   rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr raw_detection_pub_;
   std::unordered_map<RequestId, PendingDebugFrame> pending_debug_frames_;
   std::deque<RequestId> pending_debug_order_;

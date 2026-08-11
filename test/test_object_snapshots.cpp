@@ -621,7 +621,7 @@ TEST(InstanceMapThread,
       detection.size_m = {0.4f, 0.4f, 0.4f};
       detection.score_2d = 0.9f;
       detection.score_3d = 0.9f;
-      detection.box_xyxy = {40.0f, 40.0f, 60.0f, 60.0f};
+      detection.box_xyxy = {400.0f, 400.0f, 560.0f, 560.0f};
       response.detections.push_back(std::move(detection));
     }
     if (with_depth) {
@@ -645,8 +645,7 @@ TEST(InstanceMapThread,
   EXPECT_EQ(instance_map.snapshotTrackedInstances().front().presence_state,
             "tentative");
 
-  ASSERT_TRUE(
-      instance_map.enqueueDetections(make_response(2, true, false, 0.12f)));
+  ASSERT_TRUE(instance_map.enqueueDetections(make_response(2, true, false)));
   ASSERT_TRUE(instance_map.waitUntilIdle(std::chrono::seconds(1)));
   ASSERT_EQ(instance_map.snapshotInstances().size(), 1U);
   const int original_object_id =
@@ -666,8 +665,7 @@ TEST(InstanceMapThread,
   ASSERT_TRUE(instance_map.enqueueDetections(make_response(6, true, false)));
   ASSERT_TRUE(instance_map.waitUntilIdle(std::chrono::seconds(1)));
   EXPECT_TRUE(instance_map.snapshotInstances().empty());
-  ASSERT_TRUE(
-      instance_map.enqueueDetections(make_response(7, true, false, 0.12f)));
+  ASSERT_TRUE(instance_map.enqueueDetections(make_response(7, true, false)));
   ASSERT_TRUE(instance_map.waitUntilIdle(std::chrono::seconds(1)));
   ASSERT_EQ(instance_map.snapshotInstances().size(), 1U);
   EXPECT_EQ(instance_map.snapshotInstances().front().object_id,

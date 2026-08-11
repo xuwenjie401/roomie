@@ -22,7 +22,7 @@
 namespace roomie {
 namespace {
 
-std::filesystem::path resolveRobotMaskConfigPath(
+std::filesystem::path resolveRobotConfigPath(
     const std::string& configured_path) {
   std::filesystem::path path(configured_path);
   if (path.is_absolute()) {
@@ -31,6 +31,25 @@ std::filesystem::path resolveRobotMaskConfigPath(
   return std::filesystem::path(
              ament_index_cpp::get_package_share_directory("roomie")) /
          "config" / "robots" / path;
+}
+
+bool isHandColorCamera(const std::string& camera_id) {
+  return camera_id == "hand_left_color" ||
+         camera_id == "hand_right_color";
+}
+
+std::size_t detectionQueueCapacity(const PipelineConfig& config) {
+  if (!config.detection_enabled) {
+    return config.detection_queue_size;
+  }
+  std::size_t camera_count = config.mapping_camera_id.empty() ? 0U : 1U;
+  for (const std::string& camera_id :
+       config.additional_detection_camera_ids) {
+    if (!camera_id.empty() && camera_id != config.mapping_camera_id) {
+      ++camera_count;
+    }
+  }
+  return std::max(config.detection_queue_size, camera_count);
 }
 
 GeometrySchedulerConfig geometrySchedulerConfig(
@@ -60,6 +79,28 @@ RobotStateEstimatorConfig robotStateEstimatorConfig(
   result.rotation_exit_rad_s = config.robot_state_rotation_exit_rad_s;
   result.rotation_exit_hold_sec =
       config.robot_state_rotation_exit_hold_sec;
+  result.posture_stale_timeout_sec =
+      config.robot_state_posture_stale_timeout_sec;
+  result.posture_enter_hold_sec =
+      config.robot_state_posture_enter_hold_sec;
+  result.posture_exit_hold_sec =
+      config.robot_state_posture_exit_hold_sec;
+  result.body_translation_enter_m =
+      config.robot_state_body_translation_enter_m;
+  result.body_translation_exit_m =
+      config.robot_state_body_translation_exit_m;
+  result.body_rotation_enter_rad =
+      config.robot_state_body_rotation_enter_rad;
+  result.body_rotation_exit_rad =
+      config.robot_state_body_rotation_exit_rad;
+  result.arm_translation_enter_m =
+      config.robot_state_arm_translation_enter_m;
+  result.arm_translation_exit_m =
+      config.robot_state_arm_translation_exit_m;
+  result.arm_rotation_enter_rad = config.robot_state_arm_rotation_enter_rad;
+  result.arm_rotation_exit_rad = config.robot_state_arm_rotation_exit_rad;
+  result.navigation_posture = loadNavigationPosture(resolveRobotConfigPath(
+      config.robot_state_navigation_posture_config));
   return result;
 }
 
@@ -528,7 +569,7 @@ RoomiePipeline::RoomiePipeline(
       run_logger_(std::make_shared<RunLogger>(config_)),
       mapping_queue_(config_.mapping_queue_size, ChannelPolicy::kDropOldest),
       detection_queue_(
-          config_.detection_queue_size,
+          detectionQueueCapacity(config_),
           ChannelPolicy::kLatestByKey,
           [](const FrameBundlePtr& lhs, const FrameBundlePtr& rhs) {
             return lhs && rhs && lhs->camera_id == rhs->camera_id;
@@ -1123,16 +1164,18 @@ RoomiePipeline::RoomiePipeline(
         [estimator](const OdometryObservation& observation) {
           return estimator->observeOdometry(observation);
         };
+    ros_io_config.posture_observer =
+        [estimator](const PostureObservation& observation) {
+          return estimator->observePosture(observation);
+        };
     const bool drop_unknown = config_.robot_state_drop_frames_when_unknown;
     ros_io_config.robot_frame_admission =
         [estimator, drop_unknown](const std::string& camera_id,
                                   TimeNanoseconds time_ns) {
-          (void)camera_id;
           RobotFrameAdmissionDecision decision;
           decision.state = estimator->snapshotAt(time_ns);
           if (decision.state.rotating.value ==
               RobotActivityValue::kActive) {
-            decision.allow_mapping = false;
             decision.allow_detection = false;
             decision.reason = RobotFrameAdmissionReason::kRotating;
           } else if (drop_unknown &&
@@ -1141,22 +1184,66 @@ RoomiePipeline::RoomiePipeline(
             decision.allow_mapping = false;
             decision.allow_detection = false;
             decision.reason = RobotFrameAdmissionReason::kStateUnknown;
+          } else if (isHandColorCamera(camera_id) &&
+                     decision.state.navigation_posture_deviated.value !=
+                         RobotActivityValue::kActive) {
+            decision.allow_detection = false;
+            decision.reason =
+                decision.state.navigation_posture_deviated.value ==
+                        RobotActivityValue::kInactive
+                    ? RobotFrameAdmissionReason::kNavigationPosture
+                    : RobotFrameAdmissionReason::kStateUnknown;
           }
           return decision;
         };
   }
   RobotMaskGeneratorConfig robot_mask_config;
   robot_mask_config.robot_config =
-      resolveRobotMaskConfigPath(config_.robot_mask_robot_config);
+      resolveRobotConfigPath(config_.robot_mask_robot_config);
   robot_mask_config.camera_config =
-      resolveRobotMaskConfigPath(config_.robot_mask_camera_config);
+      resolveRobotConfigPath(config_.robot_mask_camera_config);
   robot_mask_config.reuse_translation_epsilon_m =
       config_.robot_mask_reuse_translation_epsilon_m;
   robot_mask_config.reuse_rotation_epsilon_rad =
       config_.robot_mask_reuse_rotation_epsilon_rad;
-  ros_io_config.robot_mask_generator =
+  const auto robot_mask_generator =
       std::make_shared<RobotMaskGenerator>(std::move(robot_mask_config));
+  ros_io_config.robot_mask_generator = robot_mask_generator;
   ros_io_config.cameras.push_back(std::move(mapping_camera));
+  if (config_.detection_enabled) {
+    for (const std::string& camera_id :
+         config_.additional_detection_camera_ids) {
+      if (camera_id == config_.mapping_camera_id) {
+        continue;
+      }
+      const RobotMaskCameraInfo profile =
+          robot_mask_generator->cameraInfo(camera_id);
+      if (profile.topic.empty() || profile.camera_info_topic.empty() ||
+          profile.frame.empty()) {
+        throw std::invalid_argument(
+            "additional detection camera '" + camera_id +
+            "' has incomplete ROS metadata in robot_mask.camera_config");
+      }
+      RosCameraSubscriptionConfig camera;
+      camera.camera_id = camera_id;
+      camera.camera_frame = profile.frame;
+      camera.rgb_topic = profile.topic;
+      camera.camera_info_topic = profile.camera_info_topic;
+      camera.fallback_intrinsics = CameraIntrinsics{
+          profile.width,
+          profile.height,
+          static_cast<float>(profile.fx),
+          static_cast<float>(profile.fy),
+          static_cast<float>(profile.cx),
+          static_cast<float>(profile.cy)};
+      camera.depth_scale = config_.depth_scale;
+      camera.depth_min_m = config_.depth_min_m;
+      camera.depth_max_m = config_.depth_max_m;
+      camera.enable_mapping = false;
+      camera.enable_detection = true;
+      ros_io_config.cameras.push_back(std::move(camera));
+    }
+  }
   ros_io_thread_.configure(std::move(ros_io_config));
   ros_io_thread_.attachNode(node);
 

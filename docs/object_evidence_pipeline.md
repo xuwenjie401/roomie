@@ -43,13 +43,19 @@ evaluation, but has zero decision weight.
 
 Positive evidence comes from an assigned physical observation. A tentative or
 archived track needs two successful frames from distinct camera viewpoints
-within two seconds before becoming active. By default, viewpoints are distinct
-when their camera origins differ by at least `clamp(0.15 * object_diagonal,
-0.08 m, 0.20 m)` or their object-relative viewing directions differ by at
-least 6 degrees. Repeated detections from the same viewpoint still update
-existence log-odds and `last_seen`, but do not advance confirmation. Pure
-camera rotation without optical-center motion does not create parallax and is
-therefore not an independent viewpoint. Unknown frames do not decay evidence.
+within 20 eligible inference frames before becoming active. The positive
+window advances only when InstanceMap processes a successful, admitted
+inference response, so frames rejected during robot rotation do not age the
+evidence. By default, viewpoints are distinct when their camera origins differ
+by at least `clamp(0.15 * object_diagonal, 0.08 m, 0.20 m)` or their
+object-relative viewing directions differ by at least 6 degrees.
+
+Two observations from the same viewpoint may also confirm an object when both
+are within 2.5 m, have raw confidence at least 0.85 and bbox quality at least
+0.80. Lower-quality same-viewpoint repeats still update existence log-odds
+and `last_seen`, but do not advance confirmation. Pure camera rotation without
+optical-center motion does not create parallax and is therefore not an
+independent viewpoint.
 
 For an unmatched active object, the admitted frame's registered raw depth is
 tested against projected ray/OBB entry and exit distances:

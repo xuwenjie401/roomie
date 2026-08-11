@@ -11,7 +11,10 @@
       "bottled_water": 0.15,
 
       "writing_board": 0.55,
-      "speaker": 0.6
+      "speaker": 0.6,
+      "chair": 0.4,
+      "mirror": 0.7,
+      "bed": 0.7
     }
   },
   "boxernet": {
@@ -26,7 +29,11 @@
       "bottled_water": 0.15,
 
       "writing_board": 0.55,
-      "speaker": 0.6
+      "speaker": 0.6,
+      "chair": 0.5,
+      "mirror": 0.8,
+      "bed": 0.8,
+      "bathhub": 0.9
     }
   },
   "instance": {
@@ -41,7 +48,11 @@
       "bottled_water": 0.25,
 
       "writing_board": 0.55,
-      "speaker": 0.6
+      "speaker": 0.6,
+      "chair": 0.5,
+      "mirror": 0.8,
+      "bed": 0.8,
+      "bathhub": 0.9
     }
   }
 }

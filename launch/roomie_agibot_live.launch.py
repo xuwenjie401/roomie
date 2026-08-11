@@ -15,6 +15,8 @@ def generate_launch_description():
     pipeline_config = LaunchConfiguration("pipeline_config")
     color_topic = LaunchConfiguration("color_topic")
     depth_topic = LaunchConfiguration("depth_topic")
+    hand_left_color_topic = LaunchConfiguration("hand_left_color_topic")
+    hand_right_color_topic = LaunchConfiguration("hand_right_color_topic")
 
     return LaunchDescription(
         [
@@ -33,12 +35,24 @@ def generate_launch_description():
                 default_value="/live_connect/head_depth",
                 description="live_connect depth image topic consumed by the adapter.",
             ),
+            DeclareLaunchArgument(
+                "hand_left_color_topic",
+                default_value="/live_connect/hand_left_color",
+                description="live_connect left-hand color image topic.",
+            ),
+            DeclareLaunchArgument(
+                "hand_right_color_topic",
+                default_value="/live_connect/hand_right_color",
+                description="live_connect right-hand color image topic.",
+            ),
             IncludeLaunchDescription(
                 PythonLaunchDescriptionSource(str(mapping_launch)),
                 launch_arguments={
                     "pipeline_config": pipeline_config,
                     "color_topic": color_topic,
                     "depth_topic": depth_topic,
+                    "hand_left_color_topic": hand_left_color_topic,
+                    "hand_right_color_topic": hand_right_color_topic,
                 }.items(),
             )
         ]

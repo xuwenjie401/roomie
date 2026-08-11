@@ -23,15 +23,30 @@ void retainWindow(std::vector<TimeNanoseconds>* values,
                 values->end());
 }
 
-void retainWindow(PositivePresenceEvidenceHistory* values,
-                  TimeNanoseconds now_ns,
-                  TimeNanoseconds window_ns) {
+void rebuildPositiveTimestamps(InstanceTrack* track) {
+  track->positive_evidence_timestamps_ns.clear();
+  for (const PositivePresenceEvidenceSample& sample :
+       track->positive_presence_evidence_history) {
+    if (track->positive_evidence_timestamps_ns.empty() ||
+        track->positive_evidence_timestamps_ns.back() != sample.time_ns) {
+      track->positive_evidence_timestamps_ns.push_back(sample.time_ns);
+    }
+  }
+}
+
+void retainEligibleFrameWindow(PositivePresenceEvidenceHistory* values,
+                               std::uint64_t eligible_frame_index,
+                               std::uint64_t window_frames) {
+  const std::uint64_t bounded_window = std::max<std::uint64_t>(1, window_frames);
   values->erase(
       std::remove_if(
           values->begin(), values->end(),
-          [now_ns, window_ns](const PositivePresenceEvidenceSample& value) {
-            return value.time_ns > now_ns ||
-                   now_ns - value.time_ns > window_ns;
+          [eligible_frame_index,
+           bounded_window](const PositivePresenceEvidenceSample& value) {
+            return value.eligible_frame_index == 0 ||
+                   value.eligible_frame_index > eligible_frame_index ||
+                   eligible_frame_index - value.eligible_frame_index >=
+                       bounded_window;
           }),
       values->end());
 }
@@ -73,22 +88,27 @@ bool viewpointsAreDistinct(const InstanceTrack& track,
 }
 
 int distinctPositiveViewpointCount(const InstanceTrack& track,
-                                   TimeNanoseconds now_ns,
+                                   std::uint64_t eligible_frame_index,
                                    const PresenceEvidenceConfig& config) {
   std::vector<const PositivePresenceEvidenceSample*> candidates;
   candidates.reserve(track.positive_presence_evidence_history.size());
   for (const PositivePresenceEvidenceSample& sample :
        track.positive_presence_evidence_history) {
-    if (sample.time_ns <= now_ns &&
-        now_ns - sample.time_ns <= config.evidence_window_ns &&
+    if (sample.eligible_frame_index > 0 &&
+        sample.eligible_frame_index <= eligible_frame_index &&
+        eligible_frame_index - sample.eligible_frame_index <
+            std::max<std::uint64_t>(
+                1, config.positive_window_eligible_frames) &&
         sample.camera_position_world.allFinite()) {
       candidates.push_back(&sample);
     }
   }
   std::sort(candidates.begin(), candidates.end(), [](const auto* lhs,
                                                      const auto* rhs) {
-    return std::tie(lhs->time_ns, lhs->camera_id) <
-           std::tie(rhs->time_ns, rhs->camera_id);
+    return std::tie(lhs->eligible_frame_index, lhs->camera_id,
+                    lhs->time_ns) <
+           std::tie(rhs->eligible_frame_index, rhs->camera_id,
+                    rhs->time_ns);
   });
 
   std::vector<const PositivePresenceEvidenceSample*> distinct;
@@ -103,6 +123,43 @@ int distinctPositiveViewpointCount(const InstanceTrack& track,
     }
   }
   return static_cast<int>(distinct.size());
+}
+
+bool qualifiesForSameViewpointConfirmation(
+    const PositivePresenceEvidenceSample& sample,
+    const PresenceEvidenceConfig& config) {
+  return sample.camera_distance_m > 0.0f &&
+         sample.camera_distance_m <= config.same_viewpoint_max_distance_m &&
+         sample.confidence >= config.same_viewpoint_min_confidence &&
+         sample.bbox_quality >= config.same_viewpoint_min_bbox_quality;
+}
+
+int sameViewpointHighQualityCount(const InstanceTrack& track,
+                                  std::uint64_t eligible_frame_index,
+                                  const PresenceEvidenceConfig& config) {
+  std::vector<const PositivePresenceEvidenceSample*> candidates;
+  for (const PositivePresenceEvidenceSample& sample :
+       track.positive_presence_evidence_history) {
+    if (sample.eligible_frame_index > 0 &&
+        sample.eligible_frame_index <= eligible_frame_index &&
+        eligible_frame_index - sample.eligible_frame_index <
+            std::max<std::uint64_t>(
+                1, config.positive_window_eligible_frames) &&
+        sample.camera_position_world.allFinite() &&
+        qualifiesForSameViewpointConfirmation(sample, config)) {
+      candidates.push_back(&sample);
+    }
+  }
+  int best_count = 0;
+  for (const PositivePresenceEvidenceSample* anchor : candidates) {
+    const int count = static_cast<int>(std::count_if(
+        candidates.begin(), candidates.end(),
+        [&track, anchor, &config](const auto* candidate) {
+          return !viewpointsAreDistinct(track, *anchor, *candidate, config);
+        }));
+    best_count = std::max(best_count, count);
+  }
+  return best_count;
 }
 
 bool masked(const VisibilityContext& context, int x, int y) {
@@ -304,6 +361,26 @@ VisibilityEvidence evaluateVisibility(const InstanceTrack& track,
   return evidence;
 }
 
+void advancePositivePresenceWindow(InstanceTrack* track,
+                                   std::uint64_t eligible_frame_index,
+                                   const PresenceEvidenceConfig& config) {
+  if (track == nullptr || eligible_frame_index == 0) {
+    return;
+  }
+  retainEligibleFrameWindow(&track->positive_presence_evidence_history,
+                            eligible_frame_index,
+                            config.positive_window_eligible_frames);
+  std::sort(track->positive_presence_evidence_history.begin(),
+            track->positive_presence_evidence_history.end(),
+            [](const auto& lhs, const auto& rhs) {
+              return std::tie(lhs.eligible_frame_index, lhs.camera_id,
+                              lhs.time_ns) <
+                     std::tie(rhs.eligible_frame_index, rhs.camera_id,
+                              rhs.time_ns);
+            });
+  rebuildPositiveTimestamps(track);
+}
+
 void addPositivePresenceEvidence(InstanceTrack* track,
                                  const InstanceObservation& observation,
                                  const PresenceEvidenceConfig& config) {
@@ -315,36 +392,49 @@ void addPositivePresenceEvidence(InstanceTrack* track,
   track->existence_log_odds = std::clamp(
       track->existence_log_odds + std::log(probability / (1.0f - probability)),
       -config.log_odds_cap, config.log_odds_cap);
-  retainWindow(&track->positive_evidence_timestamps_ns, observation.time_ns,
-               config.evidence_window_ns);
-  if (track->positive_evidence_timestamps_ns.empty() ||
-      track->positive_evidence_timestamps_ns.back() != observation.time_ns) {
-    track->positive_evidence_timestamps_ns.push_back(observation.time_ns);
-  }
-  retainWindow(&track->positive_presence_evidence_history,
-               observation.time_ns, config.evidence_window_ns);
+  advancePositivePresenceWindow(track, observation.eligible_frame_index,
+                                config);
   bool distinct_viewpoint = false;
+  bool same_viewpoint_high_quality = false;
   if (observation.has_camera_pose &&
+      observation.eligible_frame_index > 0 &&
       observation.camera_position_world.allFinite()) {
     const auto duplicate = std::find_if(
         track->positive_presence_evidence_history.begin(),
         track->positive_presence_evidence_history.end(),
         [&observation](const PositivePresenceEvidenceSample& sample) {
-          return sample.time_ns == observation.time_ns &&
+          return sample.eligible_frame_index ==
+                     observation.eligible_frame_index &&
                  sample.camera_id == observation.camera_id;
         });
     if (duplicate == track->positive_presence_evidence_history.end()) {
       PositivePresenceEvidenceSample sample;
       sample.time_ns = observation.time_ns;
       sample.camera_id = observation.camera_id;
+      sample.eligible_frame_index = observation.eligible_frame_index;
       sample.camera_position_world = observation.camera_position_world;
+      sample.confidence = observation.confidence;
+      sample.bbox_quality = observation.bbox_quality;
+      sample.camera_distance_m = observation.camera_distance_m;
       distinct_viewpoint = std::any_of(
           track->positive_presence_evidence_history.begin(),
           track->positive_presence_evidence_history.end(),
           [track, &sample, &config](const auto& previous) {
             return viewpointsAreDistinct(*track, previous, sample, config);
           });
+      same_viewpoint_high_quality =
+          qualifiesForSameViewpointConfirmation(sample, config) &&
+          std::any_of(
+              track->positive_presence_evidence_history.begin(),
+              track->positive_presence_evidence_history.end(),
+              [track, &sample, &config](const auto& previous) {
+                return qualifiesForSameViewpointConfirmation(previous,
+                                                             config) &&
+                       !viewpointsAreDistinct(*track, previous, sample,
+                                              config);
+              });
       track->positive_presence_evidence_history.push_back(std::move(sample));
+      rebuildPositiveTimestamps(track);
     }
   }
   retainWindow(&track->negative_evidence_timestamps_ns, observation.time_ns,
@@ -355,10 +445,12 @@ void addPositivePresenceEvidence(InstanceTrack* track,
   track->last_presence_evidence_reason =
       !observation.has_camera_pose
           ? "matched_detection_missing_viewpoint"
-          : (track->positive_presence_evidence_history.size() > 1 &&
-                     !distinct_viewpoint
-                 ? "matched_detection_same_viewpoint"
-                 : "matched_detection");
+          : (same_viewpoint_high_quality
+                 ? "matched_detection_same_viewpoint_high_quality"
+                 : (track->positive_presence_evidence_history.size() > 1 &&
+                            !distinct_viewpoint
+                        ? "matched_detection_same_viewpoint"
+                        : "matched_detection"));
 }
 
 void addFreeSpacePresenceEvidence(InstanceTrack* track,
@@ -379,10 +471,6 @@ void addFreeSpacePresenceEvidence(InstanceTrack* track,
       track->negative_evidence_timestamps_ns.back() != time_ns) {
     track->negative_evidence_timestamps_ns.push_back(time_ns);
   }
-  retainWindow(&track->positive_evidence_timestamps_ns, time_ns,
-               config.evidence_window_ns);
-  retainWindow(&track->positive_presence_evidence_history, time_ns,
-               config.evidence_window_ns);
   ++track->positive_window_interruptions;
   if (track->positive_window_interruptions > config.max_positive_interruptions) {
     track->positive_evidence_timestamps_ns.clear();
@@ -394,19 +482,30 @@ void addFreeSpacePresenceEvidence(InstanceTrack* track,
 }
 
 bool hasPositivePresenceConfirmation(const InstanceTrack& track,
-                                     TimeNanoseconds now_ns,
+                                     std::uint64_t eligible_frame_index,
                                      const PresenceEvidenceConfig& config) {
   const auto count = std::count_if(
-      track.positive_evidence_timestamps_ns.begin(),
-      track.positive_evidence_timestamps_ns.end(),
-      [now_ns, &config](TimeNanoseconds time_ns) {
-        return time_ns <= now_ns && now_ns - time_ns <= config.evidence_window_ns;
+      track.positive_presence_evidence_history.begin(),
+      track.positive_presence_evidence_history.end(),
+      [eligible_frame_index,
+       &config](const PositivePresenceEvidenceSample& sample) {
+        return sample.eligible_frame_index > 0 &&
+               sample.eligible_frame_index <= eligible_frame_index &&
+               eligible_frame_index - sample.eligible_frame_index <
+                   std::max<std::uint64_t>(
+                       1, config.positive_window_eligible_frames);
       });
   const int required_frames = std::max(1, config.min_positive_frames);
   const bool viewpoint_confirmed =
       required_frames == 1 ||
-      distinctPositiveViewpointCount(track, now_ns, config) >= required_frames;
-  return count >= required_frames && viewpoint_confirmed &&
+      distinctPositiveViewpointCount(track, eligible_frame_index, config) >=
+          required_frames;
+  const bool same_viewpoint_confirmed =
+      required_frames > 1 &&
+      sameViewpointHighQualityCount(track, eligible_frame_index, config) >=
+          required_frames;
+  return count >= required_frames &&
+         (viewpoint_confirmed || same_viewpoint_confirmed) &&
          track.positive_window_interruptions <= config.max_positive_interruptions &&
          track.existence_log_odds >= config.active_threshold;
 }

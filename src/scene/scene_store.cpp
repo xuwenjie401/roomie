@@ -194,8 +194,12 @@ Json positivePresenceEvidenceHistoryToJson(
     result.push_back(
         Json{{"time_ns", sample.time_ns},
              {"camera_id", sample.camera_id},
+             {"eligible_frame_index", sample.eligible_frame_index},
              {"camera_position_world",
-              vector3ToJson(sample.camera_position_world)}});
+              vector3ToJson(sample.camera_position_world)},
+             {"confidence", sample.confidence},
+             {"bbox_quality", sample.bbox_quality},
+             {"camera_distance_m", sample.camera_distance_m}});
   }
   return result;
 }
@@ -212,8 +216,14 @@ PositivePresenceEvidenceHistory positivePresenceEvidenceHistoryFromJson(
     sample.time_ns = static_cast<TimeNanoseconds>(
         jsonInt64(sample_json, "time_ns", true));
     sample.camera_id = sample_json.at("camera_id").get<std::string>();
+    sample.eligible_frame_index =
+        jsonUnsignedOr(sample_json, "eligible_frame_index", 0);
     sample.camera_position_world =
         vector3FromJson(sample_json.at("camera_position_world"));
+    sample.confidence = sample_json.value("confidence", 0.0f);
+    sample.bbox_quality = sample_json.value("bbox_quality", 0.0f);
+    sample.camera_distance_m =
+        sample_json.value("camera_distance_m", 0.0f);
     result.push_back(std::move(sample));
   }
   return result;

@@ -114,6 +114,8 @@ PresenceEvidenceConfig presenceEvidenceConfig(const PipelineConfig& config) {
   result.archive_threshold = config.instance_presence_archive_threshold;
   result.evidence_window_ns = static_cast<TimeNanoseconds>(
       config.instance_presence_window_sec * 1.0e9);
+  result.positive_window_eligible_frames = static_cast<std::uint64_t>(
+      config.instance_presence_positive_window_eligible_frames);
   result.min_positive_frames = config.instance_presence_min_positive_frames;
   result.max_positive_interruptions =
       config.instance_presence_max_positive_interruptions;
@@ -125,6 +127,12 @@ PresenceEvidenceConfig presenceEvidenceConfig(const PipelineConfig& config) {
       config.instance_presence_viewpoint_baseline_max_m;
   result.viewpoint_min_angle_deg =
       config.instance_presence_viewpoint_min_angle_deg;
+  result.same_viewpoint_max_distance_m =
+      config.instance_presence_same_viewpoint_max_distance_m;
+  result.same_viewpoint_min_confidence =
+      config.instance_presence_same_viewpoint_min_confidence;
+  result.same_viewpoint_min_bbox_quality =
+      config.instance_presence_same_viewpoint_min_bbox_quality;
   result.min_negative_frames = config.instance_presence_min_negative_frames;
   result.min_depth_samples = config.instance_presence_min_depth_samples;
   result.min_valid_depth_coverage =
@@ -1908,6 +1916,11 @@ void InstanceMapThread::refreshAssociationWorkingSet(
     next_track_id_ = std::max(next_track_id_, track_id + 1);
     highest_frame_index =
         std::max(highest_frame_index, track->last_seen_frame_index);
+    for (const PositivePresenceEvidenceSample& sample :
+         track->positive_presence_evidence_history) {
+      highest_frame_index =
+          std::max(highest_frame_index, sample.eligible_frame_index);
+    }
   }
   frame_index_ = highest_frame_index;
   pending_reducer_merges_.clear();
@@ -2292,6 +2305,13 @@ void InstanceMapThread::applyDetections(const InferenceResponse& response) {
   {
     std::lock_guard<std::mutex> lock(mutex_);
     ++frame_index_;
+    const PresenceEvidenceConfig presence = presenceEvidenceConfig(config_);
+    for (InstanceTrack& track : tracks_) {
+      advancePositivePresenceWindow(&track, frame_index_, presence);
+    }
+    for (InstanceObservation& observation : observations) {
+      observation.eligible_frame_index = frame_index_;
+    }
     objects_before = object_graph_.objectCount();
     tracks_before = tracks_.size();
 
@@ -3385,7 +3405,7 @@ bool InstanceMapThread::maybePromoteOrUpdateObject(InstanceTrack* track) {
   if (config_.instance_association_mode == "evidence" &&
       track->object_id >= 0 &&
       track->state == InstanceTrackState::kInactive &&
-      hasPositivePresenceConfirmation(*track, track->last_seen_ns,
+      hasPositivePresenceConfirmation(*track, frame_index_,
                                       presenceEvidenceConfig(config_))) {
     track->state = InstanceTrackState::kStable;
     track->last_presence_evidence_reason = "reactivated_after_reid";
@@ -3404,7 +3424,7 @@ bool InstanceMapThread::maybePromoteOrUpdateObject(InstanceTrack* track) {
 bool InstanceMapThread::isPromotable(const InstanceTrack& track) const {
   if (config_.instance_association_mode == "evidence") {
     return hasPositivePresenceConfirmation(
-        track, track.last_seen_ns, presenceEvidenceConfig(config_));
+        track, frame_index_, presenceEvidenceConfig(config_));
   }
   return hasBasePromotionEvidence(track, config_) &&
          hasPromotionQuality(track, config_);

@@ -482,9 +482,14 @@ TEST(SceneStore, PositivePresenceViewpointsSurviveRestore) {
   PositivePresenceEvidenceSample first;
   first.time_ns = 100;
   first.camera_id = "head";
+  first.eligible_frame_index = 100;
   first.camera_position_world = {0.0f, 0.0f, 0.0f};
+  first.confidence = 0.90f;
+  first.bbox_quality = 0.90f;
+  first.camera_distance_m = 1.5f;
   PositivePresenceEvidenceSample second = first;
   second.time_ns = 200;
+  second.eligible_frame_index = 101;
   second.camera_position_world = {0.12f, 0.0f, 0.0f};
   create.track.positive_presence_evidence_history = {first, second};
   const SceneApplyResult applied =

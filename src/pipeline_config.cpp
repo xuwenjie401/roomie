@@ -4,6 +4,7 @@
 #include <cmath>
 #include <filesystem>
 #include <stdexcept>
+#include <utility>
 
 #include <ament_index_cpp/get_package_share_directory.hpp>
 
@@ -123,6 +124,46 @@ PipelineConfig PipelineConfig::declareAndLoad(rclcpp::Node& node) {
   config.robot_state_rotation_exit_hold_sec = node.declare_parameter<double>(
       "robot_state.rotation_exit_hold_sec",
       config.robot_state_rotation_exit_hold_sec);
+  config.robot_state_navigation_posture_config =
+      node.declare_parameter<std::string>(
+          "robot_state.navigation_posture_config",
+          config.robot_state_navigation_posture_config);
+  config.robot_state_posture_stale_timeout_sec =
+      node.declare_parameter<double>(
+          "robot_state.posture_stale_timeout_sec",
+          config.robot_state_posture_stale_timeout_sec);
+  config.robot_state_posture_enter_hold_sec = node.declare_parameter<double>(
+      "robot_state.posture_enter_hold_sec",
+      config.robot_state_posture_enter_hold_sec);
+  config.robot_state_posture_exit_hold_sec = node.declare_parameter<double>(
+      "robot_state.posture_exit_hold_sec",
+      config.robot_state_posture_exit_hold_sec);
+  config.robot_state_body_translation_enter_m =
+      node.declare_parameter<double>(
+          "robot_state.body_translation_enter_m",
+          config.robot_state_body_translation_enter_m);
+  config.robot_state_body_translation_exit_m =
+      node.declare_parameter<double>(
+          "robot_state.body_translation_exit_m",
+          config.robot_state_body_translation_exit_m);
+  config.robot_state_body_rotation_enter_rad = node.declare_parameter<double>(
+      "robot_state.body_rotation_enter_rad",
+      config.robot_state_body_rotation_enter_rad);
+  config.robot_state_body_rotation_exit_rad = node.declare_parameter<double>(
+      "robot_state.body_rotation_exit_rad",
+      config.robot_state_body_rotation_exit_rad);
+  config.robot_state_arm_translation_enter_m = node.declare_parameter<double>(
+      "robot_state.arm_translation_enter_m",
+      config.robot_state_arm_translation_enter_m);
+  config.robot_state_arm_translation_exit_m = node.declare_parameter<double>(
+      "robot_state.arm_translation_exit_m",
+      config.robot_state_arm_translation_exit_m);
+  config.robot_state_arm_rotation_enter_rad = node.declare_parameter<double>(
+      "robot_state.arm_rotation_enter_rad",
+      config.robot_state_arm_rotation_enter_rad);
+  config.robot_state_arm_rotation_exit_rad = node.declare_parameter<double>(
+      "robot_state.arm_rotation_exit_rad",
+      config.robot_state_arm_rotation_exit_rad);
   config.robot_state_drop_frames_when_unknown = node.declare_parameter<bool>(
       "robot_state.drop_frames_when_unknown",
       config.robot_state_drop_frames_when_unknown);
@@ -133,22 +174,58 @@ PipelineConfig PipelineConfig::declareAndLoad(rclcpp::Node& node) {
       std::isfinite(config.robot_state_rotation_enter_rad_s) &&
       std::isfinite(config.robot_state_rotation_exit_rad_s) &&
       std::isfinite(config.robot_state_rotation_exit_hold_sec) &&
+      std::isfinite(config.robot_state_posture_stale_timeout_sec) &&
+      std::isfinite(config.robot_state_posture_enter_hold_sec) &&
+      std::isfinite(config.robot_state_posture_exit_hold_sec) &&
+      std::isfinite(config.robot_state_body_translation_enter_m) &&
+      std::isfinite(config.robot_state_body_translation_exit_m) &&
+      std::isfinite(config.robot_state_body_rotation_enter_rad) &&
+      std::isfinite(config.robot_state_body_rotation_exit_rad) &&
+      std::isfinite(config.robot_state_arm_translation_enter_m) &&
+      std::isfinite(config.robot_state_arm_translation_exit_m) &&
+      std::isfinite(config.robot_state_arm_rotation_enter_rad) &&
+      std::isfinite(config.robot_state_arm_rotation_exit_rad) &&
       config.robot_state_odom_history_sec > 0.0 &&
       config.robot_state_odom_stale_timeout_sec > 0.0 &&
       config.robot_state_rotation_window_sec > 0.0 &&
       config.robot_state_rotation_enter_rad_s > 0.0 &&
       config.robot_state_rotation_exit_rad_s >= 0.0 &&
       config.robot_state_rotation_exit_hold_sec >= 0.0 &&
+      config.robot_state_posture_stale_timeout_sec > 0.0 &&
+      config.robot_state_posture_enter_hold_sec >= 0.0 &&
+      config.robot_state_posture_exit_hold_sec >= 0.0 &&
+      config.robot_state_body_translation_enter_m > 0.0 &&
+      config.robot_state_body_translation_exit_m >= 0.0 &&
+      config.robot_state_body_translation_enter_m >=
+          config.robot_state_body_translation_exit_m &&
+      config.robot_state_body_rotation_enter_rad > 0.0 &&
+      config.robot_state_body_rotation_exit_rad >= 0.0 &&
+      config.robot_state_body_rotation_enter_rad >=
+          config.robot_state_body_rotation_exit_rad &&
+      config.robot_state_arm_translation_enter_m > 0.0 &&
+      config.robot_state_arm_translation_exit_m >= 0.0 &&
+      config.robot_state_arm_translation_enter_m >=
+          config.robot_state_arm_translation_exit_m &&
+      config.robot_state_arm_rotation_enter_rad > 0.0 &&
+      config.robot_state_arm_rotation_exit_rad >= 0.0 &&
+      config.robot_state_arm_rotation_enter_rad >=
+          config.robot_state_arm_rotation_exit_rad &&
       config.robot_state_rotation_enter_rad_s >=
           config.robot_state_rotation_exit_rad_s &&
       config.robot_state_odom_history_sec >=
           config.robot_state_odom_stale_timeout_sec +
               config.robot_state_rotation_window_sec +
-              config.robot_state_rotation_exit_hold_sec;
+              config.robot_state_rotation_exit_hold_sec &&
+      config.robot_state_odom_history_sec >=
+          config.robot_state_posture_stale_timeout_sec +
+              config.robot_state_posture_enter_hold_sec +
+              config.robot_state_posture_exit_hold_sec;
   if (config.robot_state_enabled &&
-      (config.odom_topic.empty() || !valid_robot_state_config)) {
+      (config.odom_topic.empty() || config.tf_topic.empty() ||
+       config.robot_state_navigation_posture_config.empty() ||
+       !valid_robot_state_config)) {
     throw std::invalid_argument(
-        "enabled robot_state requires a non-empty odom topic and valid windows");
+        "enabled robot_state requires odom/TF topics, a navigation posture, and valid windows");
   }
 
   config.depth_min_m = positiveFloatOrDefault(
@@ -245,6 +322,27 @@ PipelineConfig PipelineConfig::declareAndLoad(rclcpp::Node& node) {
       config.patch_depth_zbuffer_min_cells_per_patch);
   config.detection_enabled = node.declare_parameter<bool>(
       "detection.enabled", config.detection_enabled);
+  config.additional_detection_camera_ids =
+      node.declare_parameter<std::vector<std::string>>(
+          "detection.additional_camera_ids",
+          config.additional_detection_camera_ids);
+  std::vector<std::string> unique_detection_camera_ids;
+  unique_detection_camera_ids.reserve(
+      config.additional_detection_camera_ids.size());
+  for (const std::string& camera_id :
+       config.additional_detection_camera_ids) {
+    if (camera_id.empty()) {
+      throw std::invalid_argument(
+          "detection.additional_camera_ids must not contain empty ids");
+    }
+    if (std::find(unique_detection_camera_ids.begin(),
+                  unique_detection_camera_ids.end(),
+                  camera_id) == unique_detection_camera_ids.end()) {
+      unique_detection_camera_ids.push_back(camera_id);
+    }
+  }
+  config.additional_detection_camera_ids =
+      std::move(unique_detection_camera_ids);
   config.max_inference_fps = std::max(
       0.0,
       node.declare_parameter<double>("detection.max_inference_fps",
@@ -412,6 +510,12 @@ PipelineConfig PipelineConfig::declareAndLoad(rclcpp::Node& node) {
   config.instance_presence_window_sec = std::max(
       0.1, node.declare_parameter<double>("instance.presence_window_sec",
                                           config.instance_presence_window_sec));
+  config.instance_presence_positive_window_eligible_frames =
+      positiveIntOrDefault(
+          node.declare_parameter<int>(
+              "instance.presence_positive_window_eligible_frames",
+              config.instance_presence_positive_window_eligible_frames),
+          config.instance_presence_positive_window_eligible_frames);
   config.instance_presence_min_positive_frames = positiveIntOrDefault(
       node.declare_parameter<int>("instance.presence_min_positive_frames",
                                   config.instance_presence_min_positive_frames),
@@ -442,6 +546,18 @@ PipelineConfig PipelineConfig::declareAndLoad(rclcpp::Node& node) {
           "instance.presence_viewpoint_min_angle_deg",
           config.instance_presence_viewpoint_min_angle_deg),
       config.instance_presence_viewpoint_min_angle_deg);
+  config.instance_presence_same_viewpoint_max_distance_m =
+      positiveFloatOrDefault(
+          node.declare_parameter<double>(
+              "instance.presence_same_viewpoint_max_distance_m",
+              config.instance_presence_same_viewpoint_max_distance_m),
+          config.instance_presence_same_viewpoint_max_distance_m);
+  config.instance_presence_same_viewpoint_min_confidence = unit_interval(
+      "instance.presence_same_viewpoint_min_confidence",
+      config.instance_presence_same_viewpoint_min_confidence);
+  config.instance_presence_same_viewpoint_min_bbox_quality = unit_interval(
+      "instance.presence_same_viewpoint_min_bbox_quality",
+      config.instance_presence_same_viewpoint_min_bbox_quality);
   config.instance_presence_min_negative_frames = positiveIntOrDefault(
       node.declare_parameter<int>("instance.presence_min_negative_frames",
                                   config.instance_presence_min_negative_frames),

@@ -51,6 +51,8 @@ def generate_launch_description() -> LaunchDescription:
     calibration_file = LaunchConfiguration("calibration_file")
     color_topic = LaunchConfiguration("color_topic")
     depth_topic = LaunchConfiguration("depth_topic")
+    hand_left_color_topic = LaunchConfiguration("hand_left_color_topic")
+    hand_right_color_topic = LaunchConfiguration("hand_right_color_topic")
     tf_topic = LaunchConfiguration("tf_topic")
     publish_static_tf = LaunchConfiguration("publish_static_tf")
     enable_boxer = LaunchConfiguration("enable_boxer")
@@ -77,6 +79,8 @@ def generate_launch_description() -> LaunchDescription:
             "calibration_file": calibration_file,
             "color_topic": color_topic,
             "depth_topic": depth_topic,
+            "hand_left_color_topic": hand_left_color_topic,
+            "hand_right_color_topic": hand_right_color_topic,
             "tf_topic": tf_topic,
             "publish_static_tf": publish_static_tf,
             "enable_boxer": enable_boxer,
@@ -141,6 +145,16 @@ def generate_launch_description() -> LaunchDescription:
                 "depth_topic",
                 default_value="/live_connect/head_depth",
                 description="live_connect depth image topic consumed by the adapter.",
+            ),
+            DeclareLaunchArgument(
+                "hand_left_color_topic",
+                default_value="/live_connect/hand_left_color",
+                description="live_connect left-hand color image topic.",
+            ),
+            DeclareLaunchArgument(
+                "hand_right_color_topic",
+                default_value="/live_connect/hand_right_color",
+                description="live_connect right-hand color image topic.",
             ),
             DeclareLaunchArgument("tf_topic", default_value="/tf"),
             DeclareLaunchArgument("publish_static_tf", default_value="false"),

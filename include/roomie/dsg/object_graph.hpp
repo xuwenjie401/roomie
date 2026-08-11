@@ -60,6 +60,7 @@ struct InstanceObservation {
 
   TimeNanoseconds time_ns = 0;
   std::string camera_id;
+  std::uint64_t eligible_frame_index = 0;
   bool has_camera_pose = false;
   Eigen::Vector3f camera_position_world = Eigen::Vector3f::Zero();
   RawDetection detection;
@@ -89,15 +90,23 @@ struct PositivePresenceEvidenceSample {
 
   TimeNanoseconds time_ns = 0;
   std::string camera_id;
+  std::uint64_t eligible_frame_index = 0;
   Eigen::Vector3f camera_position_world = Eigen::Vector3f::Zero();
+  float confidence = 0.0f;
+  float bbox_quality = 0.0f;
+  float camera_distance_m = 0.0f;
 };
 
 inline bool operator==(const PositivePresenceEvidenceSample& lhs,
                        const PositivePresenceEvidenceSample& rhs) {
   return lhs.time_ns == rhs.time_ns && lhs.camera_id == rhs.camera_id &&
+         lhs.eligible_frame_index == rhs.eligible_frame_index &&
          (lhs.camera_position_world.array() ==
           rhs.camera_position_world.array())
-             .all();
+             .all() &&
+         lhs.confidence == rhs.confidence &&
+         lhs.bbox_quality == rhs.bbox_quality &&
+         lhs.camera_distance_m == rhs.camera_distance_m;
 }
 
 inline bool operator!=(const PositivePresenceEvidenceSample& lhs,

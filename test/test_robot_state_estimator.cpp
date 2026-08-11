@@ -1,6 +1,7 @@
 #include "roomie/pipeline/robot_state_estimator.hpp"
 
 #include <cmath>
+#include <filesystem>
 #include <functional>
 #include <limits>
 #include <stdexcept>
@@ -31,6 +32,66 @@ void observeRange(RobotStateEstimator* estimator,
   for (double time = first_sec; time <= last_sec + 1.0e-9;
        time += step_sec) {
     estimator->observeOdometry(observation(time, yaw_at(time)));
+  }
+}
+
+NavigationPosture testNavigationPosture() {
+  NavigationPosture posture;
+  posture.root_frame = "base_link";
+  const auto add = [&](const std::string& frame_id,
+                       NavigationPostureGroup group,
+                       const Eigen::Vector3d& position) {
+    NavigationLinkPose pose;
+    pose.frame_id = frame_id;
+    pose.group = group;
+    pose.position = position;
+    posture.links.push_back(std::move(pose));
+  };
+  add("body_link5", NavigationPostureGroup::kBody,
+      Eigen::Vector3d(0.1, 0.0, 0.9));
+  add("arm_l_link1", NavigationPostureGroup::kLeftArm,
+      Eigen::Vector3d(0.1, 0.2, 1.2));
+  add("arm_r_link1", NavigationPostureGroup::kRightArm,
+      Eigen::Vector3d(0.1, -0.2, 1.2));
+  return posture;
+}
+
+PostureObservation postureObservation(double time_sec,
+                                      double body_angle_rad = 0.0,
+                                      double left_angle_rad = 0.0,
+                                      double right_angle_rad = 0.0) {
+  PostureObservation observation;
+  observation.time_ns =
+      static_cast<TimeNanoseconds>(std::llround(time_sec * kSecond));
+  const auto add = [&](const std::string& child_frame_id,
+                       const Eigen::Vector3d& position,
+                       double angle_rad) {
+    LinkTransformObservation transform;
+    transform.parent_frame_id = "base_link";
+    transform.child_frame_id = child_frame_id;
+    transform.position = position;
+    transform.orientation = Eigen::Quaterniond(
+        Eigen::AngleAxisd(angle_rad, Eigen::Vector3d::UnitY()));
+    observation.transforms.push_back(std::move(transform));
+  };
+  add("body_link5", Eigen::Vector3d(0.1, 0.0, 0.9), body_angle_rad);
+  add("arm_l_link1", Eigen::Vector3d(0.1, 0.2, 1.2), left_angle_rad);
+  add("arm_r_link1", Eigen::Vector3d(0.1, -0.2, 1.2), right_angle_rad);
+  // An unconfigured head transform must never affect the posture state.
+  add("head_link1", Eigen::Vector3d(0.0, 0.0, 1.5), 1.0);
+  return observation;
+}
+
+void observePostureRange(RobotStateEstimator* estimator,
+                         double first_sec,
+                         double last_sec,
+                         double body_angle_rad,
+                         double left_angle_rad,
+                         double right_angle_rad) {
+  ASSERT_NE(estimator, nullptr);
+  for (double time = first_sec; time <= last_sec + 1.0e-9; time += 0.01) {
+    estimator->observePosture(postureObservation(
+        time, body_angle_rad, left_angle_rad, right_angle_rad));
   }
 }
 
@@ -153,6 +214,99 @@ TEST(RobotStateEstimatorTest, RetainedHistoryHasAHardSampleBound) {
   const RobotStateEstimatorUpdate too_old =
       estimator.observeOdometry(observation(1.0, 0.0));
   EXPECT_EQ(too_old.outcome, OdometryObservationOutcome::kTooOld);
+}
+
+TEST(RobotStateEstimatorTest,
+     NavigationPostureEnablesForBodyOrEitherArmAndIgnoresHead) {
+  RobotStateEstimatorConfig config;
+  config.navigation_posture = testNavigationPosture();
+  RobotStateEstimator estimator(config);
+
+  observePostureRange(&estimator, 1.0, 1.05, 0.0, 0.0, 0.0);
+  RobotStateSnapshot state = estimator.snapshotAt(1050000000LL);
+  EXPECT_EQ(state.navigation_posture_deviated.value,
+            RobotActivityValue::kInactive);
+  EXPECT_EQ(state.body_bent.value, RobotActivityValue::kInactive);
+  EXPECT_EQ(state.left_arm_active.value, RobotActivityValue::kInactive);
+  EXPECT_EQ(state.right_arm_active.value, RobotActivityValue::kInactive);
+
+  observePostureRange(&estimator, 1.06, 1.20, 0.10, 0.0, 0.0);
+  state = estimator.snapshotAt(1200000000LL);
+  EXPECT_EQ(state.body_bent.value, RobotActivityValue::kActive);
+  EXPECT_EQ(state.navigation_posture_deviated.value,
+            RobotActivityValue::kActive);
+
+  PostureObservation head_only;
+  head_only.time_ns = 1205000000LL;
+  LinkTransformObservation head_transform;
+  head_transform.parent_frame_id = "base_link";
+  head_transform.child_frame_id = "head_link1";
+  head_transform.orientation = Eigen::Quaterniond(
+      Eigen::AngleAxisd(1.2, Eigen::Vector3d::UnitY()));
+  head_only.transforms.push_back(std::move(head_transform));
+  EXPECT_EQ(estimator.observePosture(head_only).outcome,
+            OdometryObservationOutcome::kInvalid);
+  EXPECT_EQ(estimator.snapshotAt(1205000000LL)
+                .navigation_posture_deviated.value,
+            RobotActivityValue::kActive);
+
+  observePostureRange(&estimator, 1.21, 1.75, 0.0, 0.0, 0.0);
+  state = estimator.snapshotAt(1750000000LL);
+  EXPECT_EQ(state.navigation_posture_deviated.value,
+            RobotActivityValue::kInactive);
+
+  observePostureRange(&estimator, 1.76, 2.20, 0.0, 0.12, 0.0);
+  state = estimator.snapshotAt(2200000000LL);
+  EXPECT_EQ(state.body_bent.value, RobotActivityValue::kInactive);
+  EXPECT_EQ(state.left_arm_active.value, RobotActivityValue::kActive);
+  EXPECT_EQ(state.navigation_posture_deviated.value,
+            RobotActivityValue::kActive);
+
+  // A held, motionless arm remains outside the navigation posture and keeps
+  // hand-camera detection enabled until the full exit dwell completes.
+  observePostureRange(&estimator, 2.21, 2.75, 0.0, 0.0, 0.0);
+  state = estimator.snapshotAt(2750000000LL);
+  EXPECT_EQ(state.navigation_posture_deviated.value,
+            RobotActivityValue::kInactive);
+
+  observePostureRange(&estimator, 2.76, 2.90, 0.0, 0.0, 0.12);
+  state = estimator.snapshotAt(2900000000LL);
+  EXPECT_EQ(state.right_arm_active.value, RobotActivityValue::kActive);
+  EXPECT_EQ(state.navigation_posture_deviated.value,
+            RobotActivityValue::kActive);
+
+  EXPECT_EQ(estimator.snapshotAt(3200000000LL)
+                .navigation_posture_deviated.value,
+            RobotActivityValue::kUnknown);
+}
+
+TEST(RobotStateEstimatorTest, LoadsCompleteDefaultWithoutHeadLinks) {
+  const std::filesystem::path config_path =
+      std::filesystem::path(ROOMIE_SOURCE_DIR) / "config" / "robots" / "G2" /
+      "default_navigation_posture.yaml";
+  const NavigationPosture posture = loadNavigationPosture(config_path);
+  EXPECT_EQ(posture.root_frame, "base_link");
+  EXPECT_EQ(posture.links.size(), 15U);
+  std::size_t body_links = 0;
+  std::size_t left_arm_links = 0;
+  std::size_t right_arm_links = 0;
+  for (const NavigationLinkPose& pose : posture.links) {
+    EXPECT_EQ(pose.frame_id.find("head"), std::string::npos);
+    switch (pose.group) {
+      case NavigationPostureGroup::kBody:
+        ++body_links;
+        break;
+      case NavigationPostureGroup::kLeftArm:
+        ++left_arm_links;
+        break;
+      case NavigationPostureGroup::kRightArm:
+        ++right_arm_links;
+        break;
+    }
+  }
+  EXPECT_EQ(body_links, 1U);
+  EXPECT_EQ(left_arm_links, 7U);
+  EXPECT_EQ(right_arm_links, 7U);
 }
 
 TEST(RobotStateEstimatorTest, RejectsInconsistentConfiguration) {

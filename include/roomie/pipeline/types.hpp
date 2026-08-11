@@ -36,16 +36,16 @@ struct RobotActivityStatus {
   bool active() const { return value == RobotActivityValue::kActive; }
 };
 
-// A timestamped, process-local view of robot activity. Only rotating is
-// estimated today. The remaining independent facets deliberately stay unknown
-// until their odometry/TF estimators are implemented, while allowing frame and
-// GPU scheduling policies to depend on one stable interface.
+// A timestamped, process-local view of robot activity. Arm activity means the
+// corresponding arm is outside the configured navigation posture; it remains
+// active while the arm is held still away from that posture.
 struct RobotStateSnapshot {
   RobotActivityStatus rotating;
   RobotActivityStatus near_stationary;
   RobotActivityStatus body_bent;
   RobotActivityStatus left_arm_active;
   RobotActivityStatus right_arm_active;
+  RobotActivityStatus navigation_posture_deviated;
   TimeNanoseconds source_time_ns = 0;
   std::optional<double> yaw_rate_rad_s;
 };

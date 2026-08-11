@@ -48,6 +48,19 @@ struct PipelineConfig {
   double robot_state_rotation_enter_rad_s = 0.05;
   double robot_state_rotation_exit_rad_s = 0.02;
   double robot_state_rotation_exit_hold_sec = 0.30;
+  std::string robot_state_navigation_posture_config =
+      "G2/default_navigation_posture.yaml";
+  double robot_state_posture_stale_timeout_sec = 0.25;
+  double robot_state_posture_enter_hold_sec = 0.10;
+  double robot_state_posture_exit_hold_sec = 0.50;
+  double robot_state_body_translation_enter_m = 0.02;
+  double robot_state_body_translation_exit_m = 0.01;
+  double robot_state_body_rotation_enter_rad = 0.05235987755982989;
+  double robot_state_body_rotation_exit_rad = 0.02617993877991494;
+  double robot_state_arm_translation_enter_m = 0.03;
+  double robot_state_arm_translation_exit_m = 0.015;
+  double robot_state_arm_rotation_enter_rad = 0.08726646259971647;
+  double robot_state_arm_rotation_exit_rad = 0.04363323129985824;
   bool robot_state_drop_frames_when_unknown = true;
 
   float depth_min_m = 0.1f;
@@ -72,6 +85,7 @@ struct PipelineConfig {
   float patch_depth_zbuffer_front_quantile = 0.25f;
   int patch_depth_zbuffer_min_cells_per_patch = 1;
   bool detection_enabled = true;
+  std::vector<std::string> additional_detection_camera_ids;
   double max_inference_fps = 10.0;
   int perception_deadline_ms = 10000;
   bool python_backend_enabled = true;
@@ -121,12 +135,16 @@ struct PipelineConfig {
   float instance_presence_active_threshold = 1.0986123f;
   float instance_presence_archive_threshold = -1.0986123f;
   double instance_presence_window_sec = 2.0;
+  int instance_presence_positive_window_eligible_frames = 20;
   int instance_presence_min_positive_frames = 2;
   int instance_presence_max_positive_interruptions = 1;
   float instance_presence_viewpoint_baseline_ratio = 0.15f;
   float instance_presence_viewpoint_baseline_min_m = 0.08f;
   float instance_presence_viewpoint_baseline_max_m = 0.20f;
   float instance_presence_viewpoint_min_angle_deg = 6.0f;
+  float instance_presence_same_viewpoint_max_distance_m = 2.5f;
+  float instance_presence_same_viewpoint_min_confidence = 0.85f;
+  float instance_presence_same_viewpoint_min_bbox_quality = 0.80f;
   int instance_presence_min_negative_frames = 3;
   int instance_presence_min_depth_samples = 32;
   float instance_presence_min_valid_depth_coverage = 0.50f;

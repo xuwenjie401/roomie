@@ -58,24 +58,24 @@ TEST(PresenceEvidence,
   observation.bbox_quality = 0.8f;
   observation.time_ns = 1'000'000'000LL;
   observation.camera_id = "head";
+  observation.eligible_frame_index = 1;
   observation.has_camera_pose = true;
   observation.camera_position_world = Eigen::Vector3f::Zero();
   addPositivePresenceEvidence(&track, observation, config);
   addPositivePresenceEvidence(&track, observation, config);
-  EXPECT_FALSE(hasPositivePresenceConfirmation(track, observation.time_ns,
-                                               config));
+  EXPECT_FALSE(hasPositivePresenceConfirmation(track, 1, config));
   observation.time_ns += 100'000'000LL;
+  observation.eligible_frame_index = 2;
   addPositivePresenceEvidence(&track, observation, config);
-  EXPECT_FALSE(hasPositivePresenceConfirmation(track, observation.time_ns,
-                                               config));
+  EXPECT_FALSE(hasPositivePresenceConfirmation(track, 2, config));
   EXPECT_EQ(track.last_presence_evidence_reason,
             "matched_detection_same_viewpoint");
 
   observation.time_ns += 100'000'000LL;
+  observation.eligible_frame_index = 3;
   observation.camera_position_world.x() = 0.12f;
   addPositivePresenceEvidence(&track, observation, config);
-  EXPECT_TRUE(hasPositivePresenceConfirmation(track, observation.time_ns,
-                                              config));
+  EXPECT_TRUE(hasPositivePresenceConfirmation(track, 3, config));
 
   track.existence_log_odds = 0.0f;
   track.negative_evidence_timestamps_ns.clear();
@@ -104,11 +104,13 @@ TEST(PresenceEvidence, ObjectRelativeViewAngleCanQualifyBelowBaseline) {
   observation.has_camera_pose = true;
   observation.bbox_quality = 0.8f;
   observation.time_ns = 1'000'000'000LL;
+  observation.eligible_frame_index = 1;
   observation.camera_position_world = {0.0f, 0.0f, -1.0f};
   addPositivePresenceEvidence(&track, observation, config);
 
   constexpr float angle_rad = 7.0f * 3.14159265358979323846f / 180.0f;
   observation.time_ns += 100'000'000LL;
+  observation.eligible_frame_index = 2;
   observation.camera_position_world =
       {std::sin(angle_rad), 0.0f, -std::cos(angle_rad)};
   ASSERT_LT((observation.camera_position_world -
@@ -117,8 +119,91 @@ TEST(PresenceEvidence, ObjectRelativeViewAngleCanQualifyBelowBaseline) {
                 .norm(),
             config.viewpoint_baseline_max_m);
   addPositivePresenceEvidence(&track, observation, config);
-  EXPECT_TRUE(hasPositivePresenceConfirmation(track, observation.time_ns,
-                                              config));
+  EXPECT_TRUE(hasPositivePresenceConfirmation(track, 2, config));
+}
+
+TEST(PresenceEvidence, PositiveWindowAdvancesOnlyOnEligibleFrames) {
+  PresenceEvidenceConfig config;
+  config.positive_window_eligible_frames = 3;
+  InstanceTrack track;
+  track.center_world = {0.0f, 0.0f, 2.0f};
+  track.size_m = {0.4f, 0.4f, 0.4f};
+
+  InstanceObservation observation;
+  observation.camera_id = "head";
+  observation.has_camera_pose = true;
+  observation.bbox_quality = 0.8f;
+  observation.time_ns = 1'000'000'000LL;
+  observation.eligible_frame_index = 10;
+  observation.camera_position_world = Eigen::Vector3f::Zero();
+  addPositivePresenceEvidence(&track, observation, config);
+
+  observation.time_ns += 60'000'000'000LL;
+  observation.eligible_frame_index = 11;
+  observation.camera_position_world.x() = 0.12f;
+  addPositivePresenceEvidence(&track, observation, config);
+  EXPECT_TRUE(hasPositivePresenceConfirmation(track, 11, config));
+
+  advancePositivePresenceWindow(&track, 13, config);
+  EXPECT_FALSE(hasPositivePresenceConfirmation(track, 13, config));
+  ASSERT_EQ(track.positive_presence_evidence_history.size(), 1U);
+  EXPECT_EQ(track.positive_presence_evidence_history.front()
+                .eligible_frame_index,
+            11U);
+}
+
+TEST(PresenceEvidence, SameViewpointRequiresTwoStrictHighQualityObservations) {
+  const PresenceEvidenceConfig config;
+  InstanceTrack track;
+  track.center_world = {0.0f, 0.0f, 1.5f};
+  track.size_m = {0.4f, 0.4f, 0.4f};
+
+  InstanceObservation observation;
+  observation.camera_id = "head";
+  observation.has_camera_pose = true;
+  observation.camera_position_world = Eigen::Vector3f::Zero();
+  observation.confidence = 0.90f;
+  observation.bbox_quality = 0.90f;
+  observation.camera_distance_m = 1.5f;
+  observation.time_ns = 1'000'000'000LL;
+  observation.eligible_frame_index = 1;
+  addPositivePresenceEvidence(&track, observation, config);
+  EXPECT_FALSE(hasPositivePresenceConfirmation(track, 1, config));
+
+  observation.time_ns += 100'000'000LL;
+  observation.eligible_frame_index = 2;
+  addPositivePresenceEvidence(&track, observation, config);
+  EXPECT_TRUE(hasPositivePresenceConfirmation(track, 2, config));
+  EXPECT_EQ(track.last_presence_evidence_reason,
+            "matched_detection_same_viewpoint_high_quality");
+}
+
+TEST(PresenceEvidence, SameViewpointFallbackRejectsWeakQualitySignals) {
+  const PresenceEvidenceConfig config;
+  const auto confirms = [&config](float distance,
+                                  float confidence,
+                                  float bbox_quality) {
+    InstanceTrack track;
+    track.center_world = {0.0f, 0.0f, 1.5f};
+    track.size_m = {0.4f, 0.4f, 0.4f};
+    InstanceObservation observation;
+    observation.camera_id = "head";
+    observation.has_camera_pose = true;
+    observation.camera_position_world = Eigen::Vector3f::Zero();
+    observation.camera_distance_m = distance;
+    observation.confidence = confidence;
+    observation.bbox_quality = bbox_quality;
+    for (std::uint64_t frame = 1; frame <= 2; ++frame) {
+      observation.eligible_frame_index = frame;
+      observation.time_ns = static_cast<TimeNanoseconds>(frame) * 100'000'000LL;
+      addPositivePresenceEvidence(&track, observation, config);
+    }
+    return hasPositivePresenceConfirmation(track, 2, config);
+  };
+
+  EXPECT_FALSE(confirms(2.6f, 0.90f, 0.90f));
+  EXPECT_FALSE(confirms(1.5f, 0.84f, 0.90f));
+  EXPECT_FALSE(confirms(1.5f, 0.90f, 0.79f));
 }
 
 TEST(PresenceEvidence, UnknownVisibilityDoesNotChangeBelief) {

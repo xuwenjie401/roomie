@@ -30,6 +30,9 @@ struct RobotMaskGeneratorConfig {
 
 struct RobotMaskCameraInfo {
   std::string name;
+  std::string topic;
+  std::string camera_info_topic;
+  std::string frame;
   int width = 0;
   int height = 0;
   double fx = 0.0;

@@ -1,0 +1,68 @@
+# G2 default navigation posture, expressed as base_link -> link transforms.
+# Keep the complete body/arm reference in this one file. Head links are
+# intentionally excluded because head motion is allowed during navigation.
+root_frame: base_link
+
+links:
+  body_link5:
+    group: body
+    translation: [0.100367126621, 0.0, 0.901066138044]
+    rotation_xyzw: [0.0, -0.041446985231, 0.0, 0.999140704513]
+
+  arm_l_link1:
+    group: left_arm
+    translation: [0.074816311317, 0.069000000000, 1.208506223000]
+    rotation_xyzw: [-0.480564495225, 0.518707784720, 0.518707784720, 0.480564495225]
+  arm_l_link2:
+    group: left_arm
+    translation: [0.074816311317, 0.243500000000, 1.208506223000]
+    rotation_xyzw: [-0.398956852446, 0.615588311564, -0.369621517771, 0.570319554419]
+  arm_l_link3:
+    group: left_arm
+    translation: [0.074816311317, 0.243500000000, 1.208506223000]
+    rotation_xyzw: [0.972988121446, 0.091441346083, -0.015893303965, -0.211376438235]
+  arm_l_link4:
+    group: left_arm
+    translation: [0.062033186582, 0.381036680677, 0.906422533154]
+    rotation_xyzw: [0.209450229544, 0.499007967819, 0.700304573284, -0.465505267461]
+  arm_l_link5:
+    group: left_arm
+    translation: [0.067061334321, 0.385687725561, 0.898464168837]
+    rotation_xyzw: [-0.316156214827, 0.384822960854, -0.601942478260, 0.624196915638]
+  arm_l_link6:
+    group: left_arm
+    translation: [0.306426551257, 0.366618316018, 1.038552084189]
+    rotation_xyzw: [0.217818954732, -0.153527801723, -0.697748671629, 0.664929250595]
+  arm_l_link7:
+    group: left_arm
+    translation: [0.306426551257, 0.366618316018, 1.038552084189]
+    rotation_xyzw: [0.703983745549, -0.233034944917, 0.197443423276, 0.641184602947]
+
+  arm_r_link1:
+    group: right_arm
+    translation: [0.074816311317, -0.069000000000, 1.208506223000]
+    rotation_xyzw: [0.480575580870, 0.518697514040, -0.518697514040, 0.480575580870]
+  arm_r_link2:
+    group: right_arm
+    translation: [0.074816311317, -0.243500000000, 1.208506223000]
+    rotation_xyzw: [-0.570297806668, -0.369683878237, 0.615537069374, 0.399009220580]
+  arm_r_link3:
+    group: right_arm
+    translation: [0.074816311317, -0.243500000000, 1.208506223000]
+    rotation_xyzw: [0.973008929618, -0.091443141668, -0.015883605440, 0.211280585488]
+  arm_r_link4:
+    group: right_arm
+    translation: [0.062044773946, -0.380978258587, 0.906395532505]
+    rotation_xyzw: [0.465486649427, 0.700251699428, 0.499082200647, -0.209491512123]
+  arm_r_link5:
+    group: right_arm
+    translation: [0.067072923098, -0.385627747730, 0.898436264574]
+    rotation_xyzw: [0.316280700598, 0.384706264226, 0.602076706147, 0.624076316335]
+  arm_r_link6:
+    group: right_arm
+    translation: [0.306437151183, -0.366590598177, 1.038530280286]
+    rotation_xyzw: [0.664930147195, 0.697763463803, 0.153703335985, 0.217644968790]
+  arm_r_link7:
+    group: right_arm
+    translation: [0.306437151183, -0.366590598177, 1.038530280286]
+    rotation_xyzw: [-0.703827192431, -0.233002213402, -0.197411891942, 0.641378045043]

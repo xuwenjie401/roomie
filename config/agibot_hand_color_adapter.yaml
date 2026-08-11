@@ -1,0 +1,10 @@
+roomie_agibot_hand_color_adapter:
+  ros__parameters:
+    camera_config: /home/lindenbot/RealityLab/jarvis/src/roomie/config/robots/G2/cameras.yaml
+    camera_ids: [hand_left_color, hand_right_color]
+    enable_topic: /roomie/hand_cameras/enabled
+    hand_left_input_topic: /live_connect/hand_left_color
+    hand_right_input_topic: /live_connect/hand_right_color
+    max_fps: 5.0
+    publish_static_tf: true
+    log_period_sec: 5.0

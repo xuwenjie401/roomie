@@ -46,6 +46,18 @@ roomie_pipeline_node:
       rotation_enter_rad_s: 0.05
       rotation_exit_rad_s: 0.02
       rotation_exit_hold_sec: 0.30
+      navigation_posture_config: G2/default_navigation_posture.yaml
+      posture_stale_timeout_sec: 0.25
+      posture_enter_hold_sec: 0.10
+      posture_exit_hold_sec: 0.50
+      body_translation_enter_m: 0.02
+      body_translation_exit_m: 0.01
+      body_rotation_enter_rad: 0.05235987755982989
+      body_rotation_exit_rad: 0.02617993877991494
+      arm_translation_enter_m: 0.03
+      arm_translation_exit_m: 0.015
+      arm_rotation_enter_rad: 0.08726646259971647
+      arm_rotation_exit_rad: 0.04363323129985824
       drop_frames_when_unknown: true
 
     input_filter:
@@ -80,6 +92,7 @@ roomie_pipeline_node:
     # python_backend_enabled when enable_boxer:=true.
     detection:
       enabled: false
+      additional_camera_ids: [hand_left_color, hand_right_color]
       python_backend_enabled: false
       max_inference_fps: 5.0
       boxer_input_size: 960
@@ -119,12 +132,16 @@ roomie_pipeline_node:
       association_archived_threshold: 0.75
       association_merge_threshold: 0.75
       presence_window_sec: 2.0
+      presence_positive_window_eligible_frames: 20
       presence_min_positive_frames: 2
       presence_max_positive_interruptions: 1
       presence_viewpoint_baseline_ratio: 0.15
       presence_viewpoint_baseline_min_m: 0.08
       presence_viewpoint_baseline_max_m: 0.20
       presence_viewpoint_min_angle_deg: 6.0
+      presence_same_viewpoint_max_distance_m: 2.5
+      presence_same_viewpoint_min_confidence: 0.85
+      presence_same_viewpoint_min_bbox_quality: 0.80
       presence_min_negative_frames: 3
       presence_min_depth_samples: 32
       presence_min_valid_depth_coverage: 0.50
@@ -135,7 +152,7 @@ roomie_pipeline_node:
       input_queue_size: 60
       pending_frame_limit: 120
       mapping_queue_size: 30
-      detection_queue_size: 2
+      detection_queue_size: 3
       inference_request_queue_size: 1
       inference_response_queue_size: 1
       shutdown_drain_timeout_ms: 5000

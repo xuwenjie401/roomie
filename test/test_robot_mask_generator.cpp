@@ -1,3 +1,4 @@
+#include <atomic>
 #include <chrono>
 #include <cmath>
 #include <filesystem>
@@ -10,6 +11,7 @@
 #include <rclcpp/executors/single_threaded_executor.hpp>
 #include <rclcpp/rclcpp.hpp>
 #include <sensor_msgs/msg/image.hpp>
+#include <std_msgs/msg/bool.hpp>
 #include <tf2_msgs/msg/tf_message.hpp>
 
 #include "roomie/pipeline/robot_mask_generator.hpp"
@@ -160,6 +162,10 @@ TEST(RobotMaskGeneratorTest, LoadsCanonicalG2CameraProfiles) {
   EXPECT_TRUE(generator.hasCamera("hand_right_color"));
 
   const RobotMaskCameraInfo head = generator.cameraInfo("head_color");
+  EXPECT_EQ(head.topic, "/roomie/input/head_color/image_rect");
+  EXPECT_EQ(head.camera_info_topic,
+            "/roomie/input/head_color/camera_info");
+  EXPECT_EQ(head.frame, "head_color");
   EXPECT_EQ(head.width, 640);
   EXPECT_EQ(head.height, 400);
   EXPECT_NEAR(head.fx, 305.2087402344, 1.0e-9);
@@ -209,21 +215,29 @@ TEST(RobotMaskGeneratorTest, KeepsIndependentCachesForEveryCamera) {
 
   const RobotMaskResult head = generator.generate("head_color", pose);
   const RobotMaskResult left = generator.generate("hand_left_color", pose);
+  const RobotMaskResult right = generator.generate("hand_right_color", pose);
   EXPECT_FALSE(head.reused);
   EXPECT_FALSE(left.reused);
+  EXPECT_FALSE(right.reused);
   ASSERT_TRUE(head.mask);
   ASSERT_TRUE(left.mask);
+  ASSERT_TRUE(right.mask);
   EXPECT_EQ(head.mask->width, 640);
   EXPECT_EQ(left.mask->width, 1280);
+  EXPECT_EQ(right.mask->width, 1280);
 
   pose.time_ns = 11;
   const RobotMaskResult head_reused = generator.generate("head_color", pose);
   const RobotMaskResult left_reused =
       generator.generate("hand_left_color", pose);
+  const RobotMaskResult right_reused =
+      generator.generate("hand_right_color", pose);
   EXPECT_TRUE(head_reused.reused);
   EXPECT_TRUE(left_reused.reused);
+  EXPECT_TRUE(right_reused.reused);
   EXPECT_EQ(head_reused.mask.get(), head.mask.get());
   EXPECT_EQ(left_reused.mask.get(), left.mask.get());
+  EXPECT_EQ(right_reused.mask.get(), right.mask.get());
 }
 
 TEST(RobotMaskGeneratorTest, RosIoRejectsCameraGeometryOutsideMaskProfile) {
@@ -468,7 +482,162 @@ TEST(RobotMaskGeneratorTest,
 }
 
 TEST(RobotMaskGeneratorTest,
-     RosIoRobotStateGateDropsUnknownAndRotatingFramesWithoutPurgingQueues) {
+     RosIoGatesDetectionOnlyRgbBeforeDecodeAndMaskPreparation) {
+  ScopedRclcppInit rclcpp_init;
+  auto io_node =
+      std::make_shared<rclcpp::Node>("roomie_early_hand_gate_io_test");
+  auto publisher_node =
+      std::make_shared<rclcpp::Node>("roomie_early_hand_gate_publisher_test");
+
+  ThreadSafeQueue<FrameBundlePtr> mapping_queue(2);
+  ThreadSafeQueue<FrameBundlePtr> detection_queue(3);
+  RosIoThread ros_io(mapping_queue, detection_queue);
+  auto generator = std::make_shared<RobotMaskGenerator>(generatorConfig());
+  const RobotMaskCameraInfo profile =
+      generator->cameraInfo("hand_left_color");
+  std::atomic<int> admission_calls{0};
+
+  RosIoSubscriptionConfig config;
+  config.odom_topic.clear();
+  config.tf_topic.clear();
+  config.tf_static_topic.clear();
+  config.robot_mask_generator = generator;
+  config.robot_frame_admission =
+      [&admission_calls](const std::string& camera_id, TimeNanoseconds) {
+        EXPECT_EQ(camera_id, "hand_left_color");
+        ++admission_calls;
+        RobotFrameAdmissionDecision decision;
+        decision.allow_detection = false;
+        decision.reason = RobotFrameAdmissionReason::kNavigationPosture;
+        return decision;
+      };
+  RosCameraSubscriptionConfig camera;
+  camera.camera_id = "hand_left_color";
+  camera.camera_frame = profile.frame;
+  camera.rgb_topic = "/roomie/test/early_hand_gate/image";
+  camera.fallback_intrinsics =
+      CameraIntrinsics{profile.width,
+                       profile.height,
+                       static_cast<float>(profile.fx),
+                       static_cast<float>(profile.fy),
+                       static_cast<float>(profile.cx),
+                       static_cast<float>(profile.cy)};
+  camera.enable_mapping = false;
+  camera.enable_detection = true;
+  config.cameras.push_back(camera);
+  ros_io.configure(config);
+  ros_io.attachNode(*io_node);
+
+  const auto image_publisher =
+      publisher_node->create_publisher<sensor_msgs::msg::Image>(
+          camera.rgb_topic,
+          rclcpp::QoS(2).best_effort().durability_volatile());
+  rclcpp::executors::SingleThreadedExecutor executor;
+  executor.add_node(io_node);
+  executor.add_node(publisher_node);
+  ASSERT_TRUE(spinUntil(
+      &executor,
+      [&]() { return image_publisher->get_subscription_count() == 1; },
+      std::chrono::seconds(2)));
+
+  sensor_msgs::msg::Image malformed_image;
+  malformed_image.header.stamp.sec = 5;
+  malformed_image.header.frame_id = profile.frame;
+  malformed_image.width = static_cast<std::uint32_t>(profile.width);
+  malformed_image.height = static_cast<std::uint32_t>(profile.height);
+  malformed_image.encoding = "bgr8";
+  malformed_image.step = malformed_image.width * 3;
+  // Deliberately omit image.data. Admission must run before ROS image decode.
+  image_publisher->publish(malformed_image);
+  ASSERT_TRUE(spinUntil(
+      &executor,
+      [&]() { return admission_calls.load() == 1; },
+      std::chrono::seconds(2)));
+  FrameBundlePtr frame;
+  EXPECT_FALSE(mapping_queue.tryPop(&frame));
+  EXPECT_FALSE(detection_queue.tryPop(&frame));
+
+  executor.remove_node(publisher_node);
+  executor.remove_node(io_node);
+}
+
+TEST(RobotMaskGeneratorTest,
+     RosIoPublishesLatchedHandEnableFromPostureTransitions) {
+  ScopedRclcppInit rclcpp_init;
+  auto io_node =
+      std::make_shared<rclcpp::Node>("roomie_hand_enable_io_test");
+  auto publisher_node =
+      std::make_shared<rclcpp::Node>("roomie_hand_enable_publisher_test");
+
+  ThreadSafeQueue<FrameBundlePtr> mapping_queue(2);
+  ThreadSafeQueue<FrameBundlePtr> detection_queue(3);
+  RosIoThread ros_io(mapping_queue, detection_queue);
+  RosIoSubscriptionConfig config;
+  config.odom_topic.clear();
+  config.tf_topic = "/roomie/test/hand_enable/tf";
+  config.tf_static_topic.clear();
+  config.hand_camera_enable_topic = "/roomie/test/hand_enable/enabled";
+  config.robot_mask_generator =
+      std::make_shared<RobotMaskGenerator>(generatorConfig());
+  config.posture_observer = [](const PostureObservation& observation) {
+    RobotPostureEstimatorUpdate update;
+    update.outcome = OdometryObservationOutcome::kInserted;
+    update.latest_state_changed = true;
+    update.previous_latest_state = RobotActivityValue::kInactive;
+    update.latest.source_time_ns = observation.time_ns;
+    update.latest.navigation_posture_deviated.value =
+        RobotActivityValue::kActive;
+    update.latest.navigation_posture_deviated.observed_at_ns =
+        observation.time_ns;
+    update.latest.navigation_posture_deviated.since_ns =
+        observation.time_ns;
+    return update;
+  };
+
+  std::vector<bool> enable_values;
+  const auto enable_subscription =
+      publisher_node->create_subscription<std_msgs::msg::Bool>(
+          config.hand_camera_enable_topic,
+          rclcpp::QoS(1).reliable().transient_local(),
+          [&enable_values](const std_msgs::msg::Bool::SharedPtr message) {
+            enable_values.push_back(message->data);
+          });
+  ros_io.configure(config);
+  ros_io.attachNode(*io_node);
+  const auto tf_publisher =
+      publisher_node->create_publisher<tf2_msgs::msg::TFMessage>(
+          config.tf_topic,
+          rclcpp::QoS(2).reliable().durability_volatile());
+
+  rclcpp::executors::SingleThreadedExecutor executor;
+  executor.add_node(io_node);
+  executor.add_node(publisher_node);
+  ASSERT_TRUE(spinUntil(
+      &executor,
+      [&]() {
+        return tf_publisher->get_subscription_count() == 1 &&
+               !enable_values.empty();
+      },
+      std::chrono::seconds(2)));
+  ASSERT_FALSE(enable_values.back());
+
+  tf2_msgs::msg::TFMessage tf_message;
+  auto transform = identityTransform("base_link", "body_link5");
+  transform.header.stamp.sec = 10;
+  tf_message.transforms.push_back(transform);
+  tf_publisher->publish(tf_message);
+  ASSERT_TRUE(spinUntil(
+      &executor,
+      [&]() { return !enable_values.empty() && enable_values.back(); },
+      std::chrono::seconds(2)));
+
+  executor.remove_node(publisher_node);
+  executor.remove_node(io_node);
+  (void)enable_subscription;
+}
+
+TEST(RobotMaskGeneratorTest,
+     RosIoRobotStateGateDropsUnknownAndMapsWhileRotating) {
   ScopedRclcppInit rclcpp_init;
   auto io_node =
       std::make_shared<rclcpp::Node>("roomie_robot_state_io_test");
@@ -498,7 +667,6 @@ TEST(RobotMaskGeneratorTest,
         RobotFrameAdmissionDecision decision;
         decision.state = estimator->snapshotAt(time_ns);
         if (decision.state.rotating.value == RobotActivityValue::kActive) {
-          decision.allow_mapping = false;
           decision.allow_detection = false;
           decision.reason = RobotFrameAdmissionReason::kRotating;
         } else if (decision.state.rotating.value ==
@@ -594,8 +762,9 @@ TEST(RobotMaskGeneratorTest,
       [&]() { return !mapping_queue.empty() && !detection_queue.empty(); },
       std::chrono::seconds(2)));
 
-  // The stable frame is deliberately left queued. Entering rotation must only
-  // reject the matching rotating frame, never purge earlier admitted work.
+  // The stable frame is deliberately left queued. Entering rotation must keep
+  // mapping the matching frame, reject only detection, and never purge earlier
+  // admitted work.
   publish_odom_range(10.21, 10.60, [](double time) {
     return 0.20 * (time - 10.20);
   });
@@ -623,6 +792,13 @@ TEST(RobotMaskGeneratorTest,
   EXPECT_EQ(stable_detection->provenance.sensor_time_ns, 10200000000LL);
   EXPECT_EQ(stable_mapping->robot_state.rotating.value,
             RobotActivityValue::kInactive);
+
+  FrameBundlePtr rotating_mapping;
+  ASSERT_TRUE(mapping_queue.tryPop(&rotating_mapping));
+  ASSERT_TRUE(rotating_mapping);
+  EXPECT_EQ(rotating_mapping->provenance.sensor_time_ns, 10600000000LL);
+  EXPECT_EQ(rotating_mapping->robot_state.rotating.value,
+            RobotActivityValue::kActive);
   EXPECT_FALSE(mapping_queue.tryPop(&frame));
   EXPECT_FALSE(detection_queue.tryPop(&frame));
 

@@ -26,6 +26,13 @@ double elapsedMs(std::chrono::steady_clock::time_point start,
   return std::chrono::duration<double, std::milli>(end - start).count();
 }
 
+std::string cameraDebugImageTopic(const std::string& base_topic,
+                                  const std::string& camera_id) {
+  return base_topic +
+         ((!base_topic.empty() && base_topic.back() == '/') ? "" : "/") +
+         camera_id;
+}
+
 const char* mapModeName(MapMode mode) {
   return mode == MapMode::kFrozen ? "frozen" : "online";
 }
@@ -218,6 +225,23 @@ DetectionBridgeThread::DetectionBridgeThread(
   detection_debug_pub_ = node.create_publisher<sensor_msgs::msg::Image>(
       config_.detection_debug_image_topic,
       rclcpp::QoS(1).reliable());
+  for (const std::string& camera_id :
+       config_.additional_detection_camera_ids) {
+    if (camera_id == config_.mapping_camera_id) {
+      continue;
+    }
+    const std::string topic =
+        cameraDebugImageTopic(config_.detection_debug_image_topic, camera_id);
+    additional_detection_debug_pubs_.emplace(
+        camera_id,
+        node.create_publisher<sensor_msgs::msg::Image>(
+            topic,
+            rclcpp::QoS(1).reliable()));
+    RCLCPP_INFO(logger_,
+                "additional detection debug image: camera=%s topic=%s",
+                camera_id.c_str(),
+                topic.c_str());
+  }
   raw_detection_pub_ = node.create_publisher<visualization_msgs::msg::MarkerArray>(
       config_.raw_detections_topic,
       rclcpp::QoS(1).reliable());
@@ -1042,9 +1066,6 @@ std::optional<DetectionBridgeThread::PendingDebugFrame> DetectionBridgeThread::t
 void DetectionBridgeThread::publishDetectionDebugImage(
     const InferenceResponse& response,
     const std::optional<PendingDebugFrame>& pending) {
-  if (!detection_debug_pub_) {
-    return;
-  }
   if (!pending || pending->image.empty()) {
     return;
   }
@@ -1056,7 +1077,19 @@ void DetectionBridgeThread::publishDetectionDebugImage(
   cv::Mat rgb(image.height, image.width, CV_8UC3, image.data.data());
   drawDetectionBoxes(&rgb, response.filtered_2d_detections, response.ok, response.error);
 
-  detection_debug_pub_->publish(
+  auto publisher = detection_debug_pub_;
+  if (response.camera_id != config_.mapping_camera_id) {
+    const auto found =
+        additional_detection_debug_pubs_.find(response.camera_id);
+    if (found == additional_detection_debug_pubs_.end()) {
+      return;
+    }
+    publisher = found->second;
+  }
+  if (!publisher) {
+    return;
+  }
+  publisher->publish(
       imageMessageFromBuffer(image, response.time_ns, response.camera_id));
 }
 

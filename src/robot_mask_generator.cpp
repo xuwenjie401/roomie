@@ -76,6 +76,10 @@ RobotMaskCameraInfo loadCameraInfo(const YAML::Node& cameras,
   }
   RobotMaskCameraInfo info;
   info.name = name;
+  info.topic = camera["topic"].as<std::string>("");
+  info.camera_info_topic =
+      camera["camera_info_topic"].as<std::string>("");
+  info.frame = camera["frame"].as<std::string>("");
   info.width = resolution[0].as<int>();
   info.height = resolution[1].as<int>();
   info.fx = intrinsics["fx"].as<double>();

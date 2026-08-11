@@ -32,21 +32,7 @@ Visualization Manager:
       Max Value: 1
       Median window: 5
       Min Value: 0
-      Name: Head RGB Image
-      Normalize Range: true
-      Topic:
-        Depth: 5
-        Durability Policy: Volatile
-        History Policy: Keep Last
-        Reliability Policy: Reliable
-        Value: /roomie/input/head_color/image_rect
-      Value: true
-    - Class: rviz_default_plugins/Image
-      Enabled: true
-      Max Value: 1
-      Median window: 5
-      Min Value: 0
-      Name: Roomie 2D Detections
+      Name: Head Color Detections
       Normalize Range: true
       Topic:
         Depth: 5
@@ -54,6 +40,34 @@ Visualization Manager:
         History Policy: Keep Last
         Reliability Policy: Reliable
         Value: /roomie/detections_2d_image
+      Value: true
+    - Class: rviz_default_plugins/Image
+      Enabled: true
+      Max Value: 1
+      Median window: 5
+      Min Value: 0
+      Name: Hand Left Color Detections
+      Normalize Range: true
+      Topic:
+        Depth: 5
+        Durability Policy: Volatile
+        History Policy: Keep Last
+        Reliability Policy: Reliable
+        Value: /roomie/detections_2d_image/hand_left_color
+      Value: true
+    - Class: rviz_default_plugins/Image
+      Enabled: true
+      Max Value: 1
+      Median window: 5
+      Min Value: 0
+      Name: Hand Right Color Detections
+      Normalize Range: true
+      Topic:
+        Depth: 5
+        Durability Policy: Volatile
+        History Policy: Keep Last
+        Reliability Policy: Reliable
+        Value: /roomie/detections_2d_image/hand_right_color
       Value: true
     - Alpha: 1
       Autocompute Intensity Bounds: true
@@ -169,9 +183,11 @@ Visualization Manager:
       Yaw: 0.8
     Saved: ~
 Window Geometry:
-  Head RGB Image:
+  Hand Left Color Detections:
     collapsed: false
-  Roomie 2D Detections:
+  Hand Right Color Detections:
+    collapsed: false
+  Head Color Detections:
     collapsed: false
   Height: 900
   Width: 1400

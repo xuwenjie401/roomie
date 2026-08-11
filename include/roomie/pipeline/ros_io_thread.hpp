@@ -17,6 +17,7 @@
 #include <rclcpp/rclcpp.hpp>
 #include <sensor_msgs/msg/camera_info.hpp>
 #include <sensor_msgs/msg/image.hpp>
+#include <std_msgs/msg/bool.hpp>
 #include <tf2/buffer_core.h>
 #include <tf2_msgs/msg/tf_message.hpp>
 
@@ -47,6 +48,7 @@ enum class RobotFrameAdmissionReason : std::uint8_t {
   kRotating = 1,
   kStateUnknown = 2,
   kPolicyError = 3,
+  kNavigationPosture = 4,
 };
 
 struct RobotFrameAdmissionDecision {
@@ -61,6 +63,7 @@ struct RosIoSubscriptionConfig {
   std::string odom_topic = "/odom";
   std::string tf_topic = "/tf";
   std::string tf_static_topic = "/tf_static";
+  std::string hand_camera_enable_topic = "/roomie/hand_cameras/enabled";
   double max_image_stamp_delta_sec = 0.002;
   double tf_buffer_duration_sec = 5.0;
   double max_tf_gap_sec = 0.2;
@@ -74,6 +77,8 @@ struct RosIoSubscriptionConfig {
       perception_candidate_cancelled;
   std::function<RobotStateEstimatorUpdate(const OdometryObservation&)>
       odometry_observer;
+  std::function<RobotPostureEstimatorUpdate(const PostureObservation&)>
+      posture_observer;
   std::function<RobotFrameAdmissionDecision(const std::string&,
                                             TimeNanoseconds)>
       robot_frame_admission;
@@ -149,6 +154,7 @@ class RosIoThread : public WorkerThread {
     std::uint64_t mask_tf_waits = 0;
     std::uint64_t mask_generation_failures = 0;
     std::uint64_t mask_geometry_rejections = 0;
+    std::uint64_t preprocess_admission_drops = 0;
     std::uint64_t full_masks = 0;
     double last_mask_render_ms = 0.0;
     std::size_t last_mask_pixels = 0;
@@ -199,6 +205,7 @@ class RosIoThread : public WorkerThread {
   rclcpp::Subscription<tf2_msgs::msg::TFMessage>::SharedPtr tf_subscription_;
   rclcpp::Subscription<tf2_msgs::msg::TFMessage>::SharedPtr tf_static_subscription_;
   rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr odom_subscription_;
+  rclcpp::Publisher<std_msgs::msg::Bool>::SharedPtr hand_camera_enable_publisher_;
   rclcpp::Logger logger_;
   std::chrono::steady_clock::time_point last_status_log_time_ =
       std::chrono::steady_clock::now();
@@ -225,6 +232,7 @@ class RosIoThread : public WorkerThread {
   std::uint64_t robot_rotation_detection_drops_ = 0;
   std::uint64_t robot_unknown_mapping_drops_ = 0;
   std::uint64_t robot_unknown_detection_drops_ = 0;
+  std::uint64_t robot_navigation_posture_detection_drops_ = 0;
   std::uint64_t robot_policy_errors_ = 0;
   std::string last_tf_error_;
 };
