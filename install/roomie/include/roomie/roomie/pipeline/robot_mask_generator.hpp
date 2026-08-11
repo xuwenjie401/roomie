@@ -1,1 +1,0 @@
-/home/lindenbot/RealityLab/jarvis/src/roomie/include/roomie/pipeline/robot_mask_generator.hpp

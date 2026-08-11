@@ -1,1 +1,0 @@
-/home/lindenbot/RealityLab/jarvis/src/roomie/include/roomie/artifacts/semantic_scene_projector.hpp

@@ -1,1 +1,0 @@
-/home/lindenbot/RealityLab/jarvis/src/roomie/include/roomie/artifacts/python_dam_worker.hpp

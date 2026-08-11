@@ -1,1 +1,0 @@
-/home/lindenbot/RealityLab/jarvis/src/roomie/launch/roomie_agibot_live_with_qa.launch.py

@@ -1,1 +1,0 @@
-/home/lindenbot/RealityLab/jarvis/src/roomie/include/roomie/utils/run_logger.hpp

@@ -1,1 +1,0 @@
-/home/lindenbot/RealityLab/jarvis/src/roomie/scripts/roomie_scene_qa.py

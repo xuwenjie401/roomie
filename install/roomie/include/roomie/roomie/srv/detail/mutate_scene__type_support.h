@@ -1,1 +1,0 @@
-/home/lindenbot/RealityLab/jarvis/src/roomie/build/roomie/rosidl_generator_c/roomie/srv/detail/mutate_scene__type_support.h

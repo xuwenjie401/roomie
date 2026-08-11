@@ -1,1 +1,0 @@
-/home/lindenbot/RealityLab/jarvis/src/roomie/include/roomie/artifacts/artifact_slo_clock.hpp

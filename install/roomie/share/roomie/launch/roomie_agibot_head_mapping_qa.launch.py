@@ -1,1 +1,0 @@
-/home/lindenbot/RealityLab/jarvis/src/roomie/launch/roomie_agibot_head_mapping_qa.launch.py

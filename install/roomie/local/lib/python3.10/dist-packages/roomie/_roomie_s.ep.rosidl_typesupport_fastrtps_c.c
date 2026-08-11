@@ -1,1 +1,0 @@
-/home/lindenbot/RealityLab/jarvis/src/roomie/build/roomie/rosidl_generator_py/roomie/_roomie_s.ep.rosidl_typesupport_fastrtps_c.c
