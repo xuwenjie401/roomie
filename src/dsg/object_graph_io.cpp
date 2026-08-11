@@ -20,7 +20,7 @@
 namespace roomie {
 namespace {
 
-constexpr int kRoomieObjectGraphFormatVersion = 4;
+constexpr int kRoomieObjectGraphFormatVersion = 5;
 constexpr const char* kRoomieObjectGraphFormat = "roomie_object_graph";
 constexpr const char* kRoomieManualSceneGraphFormat = "roomie_manual_scene_graph";
 
@@ -426,6 +426,10 @@ json objectNodeToJson(const ObjectNode& object) {
   value["high_quality_observation_mass"] = object.high_quality_observation_mass;
   value["active"] = object.active;
   value["publishable"] = object.publishable;
+  value["existence_log_odds"] = object.existence_log_odds;
+  value["last_presence_evidence_ns"] = object.last_presence_evidence_ns;
+  value["last_presence_evidence_reason"] =
+      object.last_presence_evidence_reason;
   value["geometry_status"] = geometryStatusToString(object.geometry_status);
   value["geometry_evaluation_obb_revision"] = object.geometry_evaluation_obb_revision;
   value["geometry_evaluation_map_version"] = object.geometry_evaluation_map_version;
@@ -481,6 +485,12 @@ ObjectNode objectNodeFromJson(const json& value) {
       value.value("high_quality_observation_mass", 0.0f);
   object.active = value.value("active", true);
   object.publishable = value.value("publishable", true);
+  object.existence_log_odds = value.value(
+      "existence_log_odds", object.active ? 1.0986123f : -1.0986123f);
+  object.last_presence_evidence_ns =
+      value.value("last_presence_evidence_ns", TimeNanoseconds{0});
+  object.last_presence_evidence_reason =
+      value.value("last_presence_evidence_reason", std::string("legacy_restore"));
   object.geometry_status =
       geometryStatusFromString(value.value("geometry_status", std::string()));
   object.geometry_evaluation_obb_revision =

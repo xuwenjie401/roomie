@@ -735,6 +735,13 @@ InferenceRequest DetectionBridgeThread::makeRequest(
   request.intrinsics_960 =
       frame.intrinsics.scaledTo(config_.boxer_input_size, config_.boxer_input_size);
   request.T_world_camera = frame.T_world_camera;
+  auto visibility = std::make_shared<VisibilityContext>();
+  visibility->depth = frame.depth;
+  visibility->robot_mask = frame.robot_mask;
+  visibility->intrinsics = frame.intrinsics;
+  if (visibility->valid()) {
+    request.visibility_context = std::move(visibility);
+  }
   return request;
 }
 
@@ -766,6 +773,7 @@ void DetectionBridgeThread::forwardBackendResponses() {
       response.provenance = pending->provenance;
       response.has_camera_pose = true;
       response.T_world_camera = pending->T_world_camera;
+      response.visibility_context = pending->visibility_context;
       if (config_.online_snapshot_enabled ||
           config_.snapshot_remake_enabled) {
         response.source_rgb_960 = pending->image;
@@ -975,6 +983,7 @@ void DetectionBridgeThread::stashDebugFrame(const InferenceRequest& request,
   debug.due_time = request.due_time;
   debug.sent_time = std::chrono::steady_clock::now();
   debug.T_world_camera = request.T_world_camera;
+  debug.visibility_context = request.visibility_context;
   debug.projection_ms = projection_ms;
   debug.resize_ms = resize_ms;
   debug.rgb_resize_ms = timing.rgb_resize_ms;

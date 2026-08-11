@@ -81,6 +81,7 @@ add_library(
   src/artifacts/semantic_scene_projector.cpp
   src/artifacts/semantic_index_store_adapter.cpp
   src/artifacts/snapshot_bank.cpp
+  src/association_engine.cpp
   src/cpu_point_map_backend.cpp
   src/detection_bridge_thread.cpp
   src/ephemeral_run_workspace.cpp
@@ -94,6 +95,7 @@ add_library(
   src/map_thread.cpp
   src/pipeline.cpp
   src/pipeline_config.cpp
+  src/presence_evidence.cpp
   src/publisher_persistence_thread.cpp
   src/python_inference_backend.cpp
   src/robot_mask_generator.cpp
@@ -223,6 +225,10 @@ if(BUILD_TESTING)
   target_link_libraries(test_inference_wire roomie_pipeline)
   ament_add_gtest(test_label_thresholds test/test_label_thresholds.cpp)
   target_link_libraries(test_label_thresholds roomie_pipeline)
+  ament_add_gtest(test_association_engine test/test_association_engine.cpp)
+  target_link_libraries(test_association_engine roomie_pipeline)
+  ament_add_gtest(test_presence_evidence test/test_presence_evidence.cpp)
+  target_link_libraries(test_presence_evidence roomie_pipeline)
   ament_add_gtest(test_robot_mask_generator
                   test/test_robot_mask_generator.cpp)
   target_link_libraries(test_robot_mask_generator roomie_pipeline)

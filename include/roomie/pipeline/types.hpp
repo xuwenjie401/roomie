@@ -206,6 +206,22 @@ struct DepthBuffer {
   bool empty() const { return width <= 0 || height <= 0 || depth_m.empty(); }
 };
 
+// Process-local evidence carried from the admitted RGB-D frame to the
+// association actor.  It is deliberately excluded from the Python wire
+// protocol: the worker never owns lifecycle decisions or the raw depth frame.
+struct VisibilityContext {
+  std::shared_ptr<const DepthBuffer> depth;
+  std::shared_ptr<const ImageBuffer> robot_mask;
+  CameraIntrinsics intrinsics;
+
+  bool valid() const {
+    return depth && !depth->empty() && intrinsics.width > 0 &&
+           intrinsics.height > 0 && intrinsics.fx > 0.0f &&
+           intrinsics.fy > 0.0f &&
+           depth->width == intrinsics.width && depth->height == intrinsics.height;
+  }
+};
+
 struct SyncDiagnostics {
   TimeNanoseconds rgb_depth_delta_ns = 0;
   TimeNanoseconds tf_delta_ns = 0;
@@ -325,6 +341,7 @@ struct InferenceRequest {
   PatchDepth patch_depth;
   CameraIntrinsics intrinsics_960;
   Eigen::Isometry3f T_world_camera = Eigen::Isometry3f::Identity();
+  std::shared_ptr<const VisibilityContext> visibility_context;
 };
 
 struct Raw2dDetection {
@@ -345,6 +362,8 @@ struct RawDetection {
   std::array<float, 4> box_xyxy = {0.0f, 0.0f, 0.0f, 0.0f};
   int semantic_id = -1;
   std::string label;
+  std::string appearance_model_id;
+  std::vector<float> appearance_descriptor;
 };
 
 struct InferenceResponse {
@@ -368,6 +387,7 @@ struct InferenceResponse {
   std::vector<Raw2dDetection> filtered_2d_detections;
   std::vector<RawDetection, Eigen::aligned_allocator<RawDetection>> detections;
   ImageBuffer source_rgb_960;
+  std::shared_ptr<const VisibilityContext> visibility_context;
 };
 
 struct VoxelRef {
@@ -404,6 +424,11 @@ struct InstanceRecord {
   float high_quality_observation_mass = 0.0f;
   bool active = true;
   bool publishable = true;
+  float existence_log_odds = 0.0f;
+  float existence_probability = 0.5f;
+  std::string presence_state = "tentative";
+  TimeNanoseconds last_presence_evidence_ns = 0;
+  std::string last_presence_evidence_reason;
   InstanceGeometryStatus geometry_status = InstanceGeometryStatus::kUnchecked;
   TimeNanoseconds last_geometry_check_ns = 0;
   TimeNanoseconds first_seen_ns = 0;

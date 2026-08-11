@@ -150,6 +150,11 @@ struct QueryObjectView {
   bool description_is_label_fallback = false;
   bool active = false;
   bool publishable = false;
+  float existence_log_odds = 0.0f;
+  float existence_probability = 0.5f;
+  std::string presence_state = "tentative";
+  TimeNanoseconds last_presence_evidence_ns = 0;
+  std::string last_presence_evidence_reason;
   Eigen::Vector3f center_world = Eigen::Vector3f::Zero();
   Eigen::Vector3f size_m = Eigen::Vector3f::Zero();
   float yaw_rad = 0.0f;

@@ -14,6 +14,9 @@ enum class InstanceTrackState {
   kTentative,
   kStable,
   kInactive,
+  // Durable compatibility name.  Archived objects remain queryable and can
+  // be reactivated; they are not tombstones.
+  kArchived = kInactive,
 };
 
 struct ObjectSnapshotRef {
@@ -64,6 +67,12 @@ struct InstanceObservation {
   std::vector<VoxelRef, Eigen::aligned_allocator<VoxelRef>> near_surface_voxels;
   bool rejected = false;
   std::string reject_reason;
+  // A physical observation may contain multiple per-class detector outputs
+  // from the same frame.  Association consumes the representative detection,
+  // while semantics consume these soft votes exactly once per physical item.
+  std::size_t member_count = 1;
+  std::map<std::string, float> label_votes;
+  std::map<int, float> semantic_votes;
 };
 
 struct ObservationQualitySample {
@@ -103,6 +112,13 @@ struct InstanceTrack {
   float high_quality_observation_mass = 0.0f;
   int missed_count = 0;
   bool publishable = true;
+  float existence_log_odds = 0.0f;
+  std::vector<TimeNanoseconds> positive_evidence_timestamps_ns;
+  std::vector<TimeNanoseconds> negative_evidence_timestamps_ns;
+  int positive_window_interruptions = 0;
+  TimeNanoseconds last_presence_evidence_ns = 0;
+  float last_presence_evidence_reliability = 0.0f;
+  std::string last_presence_evidence_reason;
   InstanceGeometryStatus geometry_status = InstanceGeometryStatus::kUnchecked;
   std::uint64_t first_seen_frame_index = 0;
   std::uint64_t last_seen_frame_index = 0;
@@ -123,6 +139,10 @@ struct InstanceTrack {
   std::vector<VoxelRef, Eigen::aligned_allocator<VoxelRef>> near_surface_voxels;
   std::map<std::string, float> label_weights;
   std::map<int, float> semantic_weights;
+  // Appearance is collected and persisted for shadow evaluation only.  The
+  // association score intentionally ignores it until replay validation.
+  std::string appearance_model_id;
+  std::vector<float> appearance_descriptor_shadow;
 };
 
 enum class SceneEntityType {
@@ -258,6 +278,9 @@ struct ObjectNode {
   float high_quality_observation_mass = 0.0f;
   bool active = true;
   bool publishable = true;
+  float existence_log_odds = 0.0f;
+  TimeNanoseconds last_presence_evidence_ns = 0;
+  std::string last_presence_evidence_reason;
   InstanceGeometryStatus geometry_status = InstanceGeometryStatus::kUnchecked;
   std::uint64_t geometry_evaluation_obb_revision = 0;
   std::uint64_t geometry_evaluation_map_version = 0;
@@ -278,7 +301,7 @@ struct ObjectNode {
 };
 
 struct ObjectGraphSnapshot {
-  int schema_version = 4;
+  int schema_version = 5;
   int next_object_id = 0;
   std::vector<ObjectNode, Eigen::aligned_allocator<ObjectNode>> objects;
   std::vector<RoomNode, Eigen::aligned_allocator<RoomNode>> rooms;

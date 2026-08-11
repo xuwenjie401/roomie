@@ -522,6 +522,18 @@ QueryObjectView SceneQueryGateway::objectView(
   if (object.lifecycle) {
     view.active = object.lifecycle->active;
     view.publishable = object.lifecycle->publishable;
+    view.existence_log_odds = object.lifecycle->existence_log_odds;
+    view.existence_probability =
+        1.0f / (1.0f + std::exp(-object.lifecycle->existence_log_odds));
+    view.presence_state = object.lifecycle->track_state ==
+                                  InstanceTrackState::kTentative
+                              ? "tentative"
+                              : (object.lifecycle->active ? "active"
+                                                          : "archived");
+    view.last_presence_evidence_ns =
+        object.lifecycle->last_presence_evidence_ns;
+    view.last_presence_evidence_reason =
+        object.lifecycle->last_presence_evidence_reason;
   }
   if (object.geometry) {
     view.center_world = object.geometry->center_world;

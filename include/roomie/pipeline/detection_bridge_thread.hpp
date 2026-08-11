@@ -53,6 +53,7 @@ class DetectionBridgeThread : public WorkerThread {
     std::chrono::steady_clock::time_point due_time;
     std::chrono::steady_clock::time_point sent_time;
     Eigen::Isometry3f T_world_camera = Eigen::Isometry3f::Identity();
+    std::shared_ptr<const VisibilityContext> visibility_context;
     double projection_ms = 0.0;
     double resize_ms = 0.0;
     double rgb_resize_ms = 0.0;

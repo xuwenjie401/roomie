@@ -459,6 +459,19 @@ Json objectToJson(const SceneObject& object) {
             {"track_state", static_cast<int>(lifecycle.track_state)},
             {"active", lifecycle.active},
             {"publishable", lifecycle.publishable},
+            {"existence_log_odds", lifecycle.existence_log_odds},
+            {"last_presence_evidence_ns",
+             lifecycle.last_presence_evidence_ns},
+            {"last_presence_evidence_reliability",
+             lifecycle.last_presence_evidence_reliability},
+            {"last_presence_evidence_reason",
+             lifecycle.last_presence_evidence_reason},
+            {"positive_evidence_timestamps_ns",
+             lifecycle.positive_evidence_timestamps_ns},
+            {"negative_evidence_timestamps_ns",
+             lifecycle.negative_evidence_timestamps_ns},
+            {"positive_window_interruptions",
+             lifecycle.positive_window_interruptions},
             {"first_seen_ns", lifecycle.first_seen_ns},
             {"last_seen_ns", lifecycle.last_seen_ns},
             {"first_seen_frame_index", lifecycle.first_seen_frame_index},
@@ -572,6 +585,21 @@ SceneObjectPtr objectFromJson(const Json& value) {
   lifecycle->track_state = static_cast<InstanceTrackState>(track_state);
   lifecycle->active = lifecycle_json.at("active").get<bool>();
   lifecycle->publishable = lifecycle_json.at("publishable").get<bool>();
+  lifecycle->existence_log_odds = lifecycle_json.value(
+      "existence_log_odds",
+      lifecycle->active ? 1.0986123f : -1.0986123f);
+  lifecycle->last_presence_evidence_ns = lifecycle_json.value(
+      "last_presence_evidence_ns", TimeNanoseconds{0});
+  lifecycle->last_presence_evidence_reliability = lifecycle_json.value(
+      "last_presence_evidence_reliability", 0.0f);
+  lifecycle->last_presence_evidence_reason = lifecycle_json.value(
+      "last_presence_evidence_reason", std::string("legacy_restore"));
+  lifecycle->positive_evidence_timestamps_ns = lifecycle_json.value(
+      "positive_evidence_timestamps_ns", std::vector<TimeNanoseconds>());
+  lifecycle->negative_evidence_timestamps_ns = lifecycle_json.value(
+      "negative_evidence_timestamps_ns", std::vector<TimeNanoseconds>());
+  lifecycle->positive_window_interruptions = lifecycle_json.value(
+      "positive_window_interruptions", 0);
   lifecycle->first_seen_ns =
       jsonInt64(lifecycle_json, "first_seen_ns", true);
   lifecycle->last_seen_ns =
@@ -820,6 +848,18 @@ Json trackToJson(const InstanceTrack& track) {
       {"high_quality_observation_mass", track.high_quality_observation_mass},
       {"missed_count", track.missed_count},
       {"publishable", track.publishable},
+      {"existence_log_odds", track.existence_log_odds},
+      {"positive_evidence_timestamps_ns",
+       track.positive_evidence_timestamps_ns},
+      {"negative_evidence_timestamps_ns",
+       track.negative_evidence_timestamps_ns},
+      {"positive_window_interruptions",
+       track.positive_window_interruptions},
+      {"last_presence_evidence_ns", track.last_presence_evidence_ns},
+      {"last_presence_evidence_reliability",
+       track.last_presence_evidence_reliability},
+      {"last_presence_evidence_reason",
+       track.last_presence_evidence_reason},
       {"geometry_status", static_cast<int>(track.geometry_status)},
       {"first_seen_frame_index", track.first_seen_frame_index},
       {"last_seen_frame_index", track.last_seen_frame_index},
@@ -844,6 +884,9 @@ Json trackToJson(const InstanceTrack& track) {
       {"near_surface_voxels", std::move(voxels)},
       {"label_weights", track.label_weights},
       {"semantic_weights", semanticWeightsToJson(track.semantic_weights)},
+      {"appearance_model_id", track.appearance_model_id},
+      {"appearance_descriptor_shadow",
+       track.appearance_descriptor_shadow},
   };
 }
 
@@ -885,6 +928,24 @@ InstanceTrack trackFromJson(const Json& value) {
       value.at("high_quality_observation_mass").get<float>();
   track.missed_count = jsonInt(value, "missed_count");
   track.publishable = value.at("publishable").get<bool>();
+  track.existence_log_odds = value.value(
+      "existence_log_odds",
+      track.state == InstanceTrackState::kStable
+          ? 1.0986123f
+          : (track.state == InstanceTrackState::kInactive ? -1.0986123f
+                                                          : 0.0f));
+  track.positive_evidence_timestamps_ns = value.value(
+      "positive_evidence_timestamps_ns", std::vector<TimeNanoseconds>());
+  track.negative_evidence_timestamps_ns = value.value(
+      "negative_evidence_timestamps_ns", std::vector<TimeNanoseconds>());
+  track.positive_window_interruptions =
+      value.value("positive_window_interruptions", 0);
+  track.last_presence_evidence_ns =
+      value.value("last_presence_evidence_ns", TimeNanoseconds{0});
+  track.last_presence_evidence_reliability =
+      value.value("last_presence_evidence_reliability", 0.0f);
+  track.last_presence_evidence_reason = value.value(
+      "last_presence_evidence_reason", std::string("legacy_restore"));
   const int geometry_status = jsonInt(value, "geometry_status");
   if (geometry_status < static_cast<int>(InstanceGeometryStatus::kUnchecked) ||
       geometry_status > static_cast<int>(InstanceGeometryStatus::kEmpty)) {
@@ -942,6 +1003,10 @@ InstanceTrack trackFromJson(const Json& value) {
       value.at("label_weights").get<std::map<std::string, float>>();
   track.semantic_weights =
       semanticWeightsFromJson(value.at("semantic_weights"));
+  track.appearance_model_id =
+      value.value("appearance_model_id", std::string());
+  track.appearance_descriptor_shadow = value.value(
+      "appearance_descriptor_shadow", std::vector<float>());
   return track;
 }
 

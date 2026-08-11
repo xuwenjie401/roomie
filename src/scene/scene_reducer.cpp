@@ -143,6 +143,10 @@ std::shared_ptr<const LifecycleComponent> lifecycleFromNode(
       node.active ? InstanceTrackState::kStable : InstanceTrackState::kInactive;
   component->active = node.active;
   component->publishable = node.publishable;
+  component->existence_log_odds = node.existence_log_odds;
+  component->last_presence_evidence_ns = node.last_presence_evidence_ns;
+  component->last_presence_evidence_reason =
+      node.last_presence_evidence_reason;
   component->first_seen_ns = node.first_seen_ns;
   component->last_seen_ns = node.last_seen_ns;
   return component;
@@ -236,6 +240,18 @@ SceneObjectPtr objectFromTrack(const InstanceTrack& track,
   lifecycle->track_state = track.state;
   lifecycle->active = track.state != InstanceTrackState::kInactive;
   lifecycle->publishable = track.publishable;
+  lifecycle->existence_log_odds = track.existence_log_odds;
+  lifecycle->last_presence_evidence_ns = track.last_presence_evidence_ns;
+  lifecycle->last_presence_evidence_reliability =
+      track.last_presence_evidence_reliability;
+  lifecycle->last_presence_evidence_reason =
+      track.last_presence_evidence_reason;
+  lifecycle->positive_evidence_timestamps_ns =
+      track.positive_evidence_timestamps_ns;
+  lifecycle->negative_evidence_timestamps_ns =
+      track.negative_evidence_timestamps_ns;
+  lifecycle->positive_window_interruptions =
+      track.positive_window_interruptions;
   lifecycle->first_seen_ns = track.first_seen_ns;
   lifecycle->last_seen_ns = track.last_seen_ns;
   lifecycle->first_seen_frame_index = track.first_seen_frame_index;
@@ -336,6 +352,18 @@ bool updateObjectFromTrack(const InstanceTrack& track,
     const LifecycleComponent& old = *next->lifecycle;
     if (old.track_state != track.state || old.active != active ||
         old.publishable != track.publishable ||
+        old.existence_log_odds != track.existence_log_odds ||
+        old.last_presence_evidence_ns != track.last_presence_evidence_ns ||
+        old.last_presence_evidence_reliability !=
+            track.last_presence_evidence_reliability ||
+        old.last_presence_evidence_reason !=
+            track.last_presence_evidence_reason ||
+        old.positive_evidence_timestamps_ns !=
+            track.positive_evidence_timestamps_ns ||
+        old.negative_evidence_timestamps_ns !=
+            track.negative_evidence_timestamps_ns ||
+        old.positive_window_interruptions !=
+            track.positive_window_interruptions ||
         old.first_seen_ns != track.first_seen_ns ||
         old.last_seen_ns != track.last_seen_ns ||
         old.first_seen_frame_index != track.first_seen_frame_index ||
@@ -345,6 +373,19 @@ bool updateObjectFromTrack(const InstanceTrack& track,
       component->track_state = track.state;
       component->active = active;
       component->publishable = track.publishable;
+      component->existence_log_odds = track.existence_log_odds;
+      component->last_presence_evidence_ns =
+          track.last_presence_evidence_ns;
+      component->last_presence_evidence_reliability =
+          track.last_presence_evidence_reliability;
+      component->last_presence_evidence_reason =
+          track.last_presence_evidence_reason;
+      component->positive_evidence_timestamps_ns =
+          track.positive_evidence_timestamps_ns;
+      component->negative_evidence_timestamps_ns =
+          track.negative_evidence_timestamps_ns;
+      component->positive_window_interruptions =
+          track.positive_window_interruptions;
       component->first_seen_ns = track.first_seen_ns;
       component->last_seen_ns = track.last_seen_ns;
       component->first_seen_frame_index = track.first_seen_frame_index;
@@ -359,56 +400,16 @@ bool updateObjectFromTrack(const InstanceTrack& track,
     *obb_changed = !vectorsApprox(old.center_world, track.center_world) ||
                    !vectorsApprox(old.size_m, track.size_m) ||
                    std::fabs(old.yaw_rad - track.yaw_rad) > 1.0e-6f;
-    const bool geometry_changed =
-        *obb_changed || old.status != track.geometry_status ||
-        old.score != track.geometry_score ||
-        old.shell_ratio != track.geometry_shell_ratio ||
-        old.extent_score != track.geometry_extent_score ||
-        old.leak_ratio != track.geometry_leak_ratio ||
-        old.cavity_ratio != track.geometry_cavity_ratio ||
-        old.in_box_points != track.geometry_in_box_points ||
-        old.shell_points != track.geometry_shell_points ||
-        old.unique_voxels != track.geometry_unique_voxels ||
-        old.expanded_points != track.geometry_expanded_points ||
-        old.bad_count != track.geometry_bad_count ||
-        old.last_check_ns != track.last_geometry_check_ns ||
-        old.evaluated_obb_revision !=
-            track.geometry_evaluation_obb_revision ||
-        !vectorsApprox(old.evaluated_center_world,
-                       track.geometry_evaluated_center_world) ||
-        !vectorsApprox(old.evaluated_size_m,
-                       track.geometry_evaluated_size_m) ||
-        std::fabs(old.evaluated_yaw_rad -
-                  track.geometry_evaluated_yaw_rad) > 1.0e-6f ||
-        old.evaluation_reason != track.geometry_evaluation_reason;
-    if (geometry_changed) {
+    // Validation is reducer-owned derived state.  Association may update the
+    // OBB, but must never replay a stale validation copy from InstanceTrack.
+    if (*obb_changed) {
       auto component = std::make_shared<GeometryComponent>(old);
       component->revision = nextComponentRevision(old.revision);
-      if (*obb_changed) {
-        component->obb_revision = std::max(
-            nextComponentRevision(old.obb_revision), track.obb_revision);
-      }
+      component->obb_revision = std::max(
+          nextComponentRevision(old.obb_revision), track.obb_revision);
       component->center_world = track.center_world;
       component->size_m = track.size_m;
       component->yaw_rad = track.yaw_rad;
-      component->status = track.geometry_status;
-      component->score = track.geometry_score;
-      component->shell_ratio = track.geometry_shell_ratio;
-      component->extent_score = track.geometry_extent_score;
-      component->leak_ratio = track.geometry_leak_ratio;
-      component->cavity_ratio = track.geometry_cavity_ratio;
-      component->in_box_points = track.geometry_in_box_points;
-      component->shell_points = track.geometry_shell_points;
-      component->unique_voxels = track.geometry_unique_voxels;
-      component->expanded_points = track.geometry_expanded_points;
-      component->bad_count = track.geometry_bad_count;
-      component->last_check_ns = track.last_geometry_check_ns;
-      component->evaluated_obb_revision =
-          track.geometry_evaluation_obb_revision;
-      component->evaluated_center_world = track.geometry_evaluated_center_world;
-      component->evaluated_size_m = track.geometry_evaluated_size_m;
-      component->evaluated_yaw_rad = track.geometry_evaluated_yaw_rad;
-      component->evaluation_reason = track.geometry_evaluation_reason;
       next->geometry = std::move(component);
       changed = true;
     }
@@ -946,7 +947,7 @@ std::optional<ObjectRelation> deriveRoomContainmentRelation(
 
 ObjectGraphSnapshot SceneSnapshot::materializeObjectGraph() const {
   ObjectGraphSnapshot graph;
-  graph.schema_version = 4;
+  graph.schema_version = 5;
   graph.next_object_id = nextObjectId();
   graph.rooms = graphMetadata().rooms;
   graph.furniture = graphMetadata().furniture;
@@ -994,6 +995,11 @@ ObjectGraphSnapshot SceneSnapshot::materializeObjectGraph() const {
         object->semantic->high_quality_observation_mass;
     node.active = object->lifecycle->active;
     node.publishable = object->lifecycle->publishable;
+    node.existence_log_odds = object->lifecycle->existence_log_odds;
+    node.last_presence_evidence_ns =
+        object->lifecycle->last_presence_evidence_ns;
+    node.last_presence_evidence_reason =
+        object->lifecycle->last_presence_evidence_reason;
     node.geometry_status = object->geometry->status;
     node.geometry_evaluation_obb_revision =
         object->geometry->evaluated_obb_revision;

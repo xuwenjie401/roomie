@@ -288,6 +288,110 @@ PipelineConfig PipelineConfig::declareAndLoad(rclcpp::Node& node) {
       0.0,
       node.declare_parameter<double>("instance.match_center_distance_m",
                                      config.instance_match_center_distance_m)));
+  config.instance_association_mode = node.declare_parameter<std::string>(
+      "instance.association_mode", config.instance_association_mode);
+  if (config.instance_association_mode != "legacy" &&
+      config.instance_association_mode != "shadow" &&
+      config.instance_association_mode != "evidence") {
+    config.instance_association_mode = "legacy";
+  }
+  const auto unit_interval = [&node](const char* name, float fallback) {
+    return static_cast<float>(std::clamp(
+        node.declare_parameter<double>(name, fallback), 0.0, 1.0));
+  };
+  config.instance_physical_min_2d_iou = unit_interval(
+      "instance.physical_min_2d_iou", config.instance_physical_min_2d_iou);
+  config.instance_physical_min_volume_ratio = unit_interval(
+      "instance.physical_min_volume_ratio",
+      config.instance_physical_min_volume_ratio);
+  config.instance_physical_max_normalized_center_distance =
+      static_cast<float>(std::max(
+          0.0, node.declare_parameter<double>(
+                   "instance.physical_max_normalized_center_distance",
+                   config.instance_physical_max_normalized_center_distance)));
+  config.instance_physical_min_3d_iou = unit_interval(
+      "instance.physical_min_3d_iou", config.instance_physical_min_3d_iou);
+  config.instance_physical_min_containment = unit_interval(
+      "instance.physical_min_containment",
+      config.instance_physical_min_containment);
+  config.instance_association_overlap_weight = static_cast<float>(std::max(
+      0.0, node.declare_parameter<double>(
+               "instance.association_overlap_weight",
+               config.instance_association_overlap_weight)));
+  config.instance_association_center_weight = static_cast<float>(std::max(
+      0.0, node.declare_parameter<double>(
+               "instance.association_center_weight",
+               config.instance_association_center_weight)));
+  config.instance_association_size_weight = static_cast<float>(std::max(
+      0.0, node.declare_parameter<double>(
+               "instance.association_size_weight",
+               config.instance_association_size_weight)));
+  config.instance_association_projected_2d_weight = static_cast<float>(std::max(
+      0.0, node.declare_parameter<double>(
+               "instance.association_projected_2d_weight",
+               config.instance_association_projected_2d_weight)));
+  config.instance_association_semantic_weight = static_cast<float>(std::max(
+      0.0, node.declare_parameter<double>(
+               "instance.association_semantic_weight",
+               config.instance_association_semantic_weight)));
+  config.instance_association_recency_weight = static_cast<float>(std::max(
+      0.0, node.declare_parameter<double>(
+               "instance.association_recency_weight",
+               config.instance_association_recency_weight)));
+  config.instance_association_min_size_ratio = unit_interval(
+      "instance.association_min_size_ratio",
+      config.instance_association_min_size_ratio);
+  config.instance_association_active_threshold = unit_interval(
+      "instance.association_active_threshold",
+      config.instance_association_active_threshold);
+  config.instance_association_archived_threshold = unit_interval(
+      "instance.association_archived_threshold",
+      config.instance_association_archived_threshold);
+  config.instance_association_merge_threshold = unit_interval(
+      "instance.association_merge_threshold",
+      config.instance_association_merge_threshold);
+  config.instance_presence_log_odds_cap = positiveFloatOrDefault(
+      node.declare_parameter<double>("instance.presence_log_odds_cap",
+                                     config.instance_presence_log_odds_cap),
+      config.instance_presence_log_odds_cap);
+  config.instance_presence_active_threshold = static_cast<float>(
+      node.declare_parameter<double>("instance.presence_active_threshold",
+                                     config.instance_presence_active_threshold));
+  config.instance_presence_archive_threshold = static_cast<float>(
+      node.declare_parameter<double>("instance.presence_archive_threshold",
+                                     config.instance_presence_archive_threshold));
+  config.instance_presence_window_sec = std::max(
+      0.1, node.declare_parameter<double>("instance.presence_window_sec",
+                                          config.instance_presence_window_sec));
+  config.instance_presence_min_positive_frames = positiveIntOrDefault(
+      node.declare_parameter<int>("instance.presence_min_positive_frames",
+                                  config.instance_presence_min_positive_frames),
+      config.instance_presence_min_positive_frames);
+  config.instance_presence_max_positive_interruptions = std::max(
+      0, static_cast<int>(node.declare_parameter<int>(
+             "instance.presence_max_positive_interruptions",
+             config.instance_presence_max_positive_interruptions)));
+  config.instance_presence_min_negative_frames = positiveIntOrDefault(
+      node.declare_parameter<int>("instance.presence_min_negative_frames",
+                                  config.instance_presence_min_negative_frames),
+      config.instance_presence_min_negative_frames);
+  config.instance_presence_min_depth_samples = positiveIntOrDefault(
+      node.declare_parameter<int>("instance.presence_min_depth_samples",
+                                  config.instance_presence_min_depth_samples),
+      config.instance_presence_min_depth_samples);
+  config.instance_presence_min_valid_depth_coverage = unit_interval(
+      "instance.presence_min_valid_depth_coverage",
+      config.instance_presence_min_valid_depth_coverage);
+  config.instance_presence_min_free_space_ratio = unit_interval(
+      "instance.presence_min_free_space_ratio",
+      config.instance_presence_min_free_space_ratio);
+  config.instance_presence_max_occlusion_ratio = unit_interval(
+      "instance.presence_max_occlusion_ratio",
+      config.instance_presence_max_occlusion_ratio);
+  config.instance_presence_depth_margin_m = positiveFloatOrDefault(
+      node.declare_parameter<double>("instance.presence_depth_margin_m",
+                                     config.instance_presence_depth_margin_m),
+      config.instance_presence_depth_margin_m);
   config.instance_min_support_count = positiveIntOrDefault(
       node.declare_parameter<int>("instance.min_support_count",
                                   config.instance_min_support_count),

@@ -255,7 +255,7 @@ TEST(ObjectGraphIo, ManualSceneGraphPreservesEnvelopeWhenSavingSnapshots) {
   ASSERT_TRUE(saved_stream);
   const nlohmann::json saved = nlohmann::json::parse(saved_stream);
   EXPECT_EQ(saved.value("format", std::string()), "roomie_manual_scene_graph");
-  EXPECT_EQ(saved.value("format_version", 0), 4);
+  EXPECT_EQ(saved.value("format_version", 0), 5);
   EXPECT_FALSE(saved.contains("object_graph"));
   ASSERT_TRUE(saved.contains("rooms"));
   EXPECT_EQ(saved.at("rooms").at(0).value("room_id", -1), 3);
@@ -363,7 +363,7 @@ TEST(ObjectGraphIo, LegacyV1AndSchemaV3TypedRoomsRelationsAreCompatible) {
       loaded_v1, "map", 456, v3_path, &error)) << error;
   std::ifstream stream(v3_path);
   const nlohmann::json v3 = nlohmann::json::parse(stream);
-  EXPECT_EQ(v3.value("format_version", 0), 4);
+  EXPECT_EQ(v3.value("format_version", 0), 5);
   ASSERT_EQ(v3.at("objects").size(), 1U);
   ASSERT_EQ(v3.at("rooms").size(), 1U);
   ASSERT_EQ(v3.at("furniture").size(), 1U);
@@ -582,6 +582,155 @@ TEST(InstanceMapThread, FrozenSnapshotRemakeMatchesInactivePublishableObjects) {
   ASSERT_EQ(saved.snapshot_images.size(), 1U);
   EXPECT_TRUE(std::filesystem::exists(saved.snapshot_images.front().source_path));
   EXPECT_EQ(saved.objects.front().snapshot.camera_id, "head");
+}
+
+TEST(InstanceMapThread,
+     EvidenceModeConfirmsArchivesAndReactivatesWithTheSameObjectId) {
+  PipelineConfig config;
+  config.instance_association_mode = "evidence";
+  config.instance_min_confidence = 0.0f;
+  config.instance_min_bbox_size_m = 0.001f;
+  config.instance_max_bbox_size_m = 10.0f;
+  config.instance_presence_min_depth_samples = 8;
+  config.instance_presence_window_sec = 2.0;
+
+  ThreadSafeQueue<InferenceResponse> queue(16);
+  FakeMapProjector projector;
+  InstanceMapThread instance_map(queue, projector, config);
+  instance_map.start();
+
+  const RunId run{100, 200};
+  const auto make_response = [&](FrameId frame_id, bool detected,
+                                 bool with_depth) {
+    InferenceResponse response;
+    response.ok = true;
+    response.time_ns = static_cast<TimeNanoseconds>(frame_id) * 100'000'000LL;
+    response.camera_id = "head";
+    response.provenance.run_id = run;
+    response.provenance.frame_id = frame_id;
+    response.provenance.request_id = frame_id;
+    response.provenance.sensor_time_ns = response.time_ns;
+    response.has_camera_pose = true;
+    response.T_world_camera = Eigen::Isometry3f::Identity();
+    if (detected) {
+      RawDetection detection;
+      detection.label = "backpack";
+      detection.semantic_id = 7;
+      detection.center_world = {0.0f, 0.0f, 2.0f};
+      detection.size_m = {0.4f, 0.4f, 0.4f};
+      detection.score_2d = 0.9f;
+      detection.score_3d = 0.9f;
+      detection.box_xyxy = {40.0f, 40.0f, 60.0f, 60.0f};
+      response.detections.push_back(std::move(detection));
+    }
+    if (with_depth) {
+      auto depth = std::make_shared<DepthBuffer>();
+      depth->width = 100;
+      depth->height = 100;
+      depth->depth_m.assign(10'000, 4.0f);
+      auto visibility = std::make_shared<VisibilityContext>();
+      visibility->depth = std::move(depth);
+      visibility->intrinsics = CameraIntrinsics{100, 100, 100.0f, 100.0f,
+                                                50.0f, 50.0f};
+      response.visibility_context = std::move(visibility);
+    }
+    return response;
+  };
+
+  ASSERT_TRUE(instance_map.enqueueDetections(make_response(1, true, false)));
+  ASSERT_TRUE(instance_map.waitUntilIdle(std::chrono::seconds(1)));
+  EXPECT_TRUE(instance_map.snapshotInstances().empty());
+  ASSERT_EQ(instance_map.snapshotTrackedInstances().size(), 1U);
+  EXPECT_EQ(instance_map.snapshotTrackedInstances().front().presence_state,
+            "tentative");
+
+  ASSERT_TRUE(instance_map.enqueueDetections(make_response(2, true, false)));
+  ASSERT_TRUE(instance_map.waitUntilIdle(std::chrono::seconds(1)));
+  ASSERT_EQ(instance_map.snapshotInstances().size(), 1U);
+  const int original_object_id =
+      instance_map.snapshotInstances().front().object_id;
+
+  for (FrameId frame_id = 3; frame_id <= 5; ++frame_id) {
+    ASSERT_TRUE(
+        instance_map.enqueueDetections(make_response(frame_id, false, true)));
+    ASSERT_TRUE(instance_map.waitUntilIdle(std::chrono::seconds(1)));
+  }
+  EXPECT_TRUE(instance_map.snapshotInstances().empty());
+  ASSERT_EQ(instance_map.snapshotTrackedInstances().size(), 1U);
+  EXPECT_EQ(instance_map.snapshotTrackedInstances().front().presence_state,
+            "archived");
+  EXPECT_TRUE(instance_map.sceneSnapshot().findObject(original_object_id));
+
+  ASSERT_TRUE(instance_map.enqueueDetections(make_response(6, true, false)));
+  ASSERT_TRUE(instance_map.waitUntilIdle(std::chrono::seconds(1)));
+  EXPECT_TRUE(instance_map.snapshotInstances().empty());
+  ASSERT_TRUE(instance_map.enqueueDetections(make_response(7, true, false)));
+  ASSERT_TRUE(instance_map.waitUntilIdle(std::chrono::seconds(1)));
+  ASSERT_EQ(instance_map.snapshotInstances().size(), 1U);
+  EXPECT_EQ(instance_map.snapshotInstances().front().object_id,
+            original_object_id);
+  instance_map.stop();
+}
+
+TEST(InstanceMapThread, EvidenceModeDurablyMergesLegacyBackpackHandbagPair) {
+  PipelineConfig config;
+  config.instance_association_mode = "evidence";
+  config.instance_min_confidence = 0.0f;
+  config.instance_min_bbox_size_m = 0.001f;
+
+  ThreadSafeQueue<InferenceResponse> queue(8);
+  FakeMapProjector projector;
+  InstanceMapThread instance_map(queue, projector, config);
+  ObjectGraphSnapshot loaded;
+  ObjectNode backpack = makeObject(76);
+  backpack.label = "backpack";
+  backpack.semantic_id = 1;
+  backpack.center_world = {2.415f, -0.731f, 0.833f};
+  backpack.size_m = {0.46f, 0.375f, 0.462f};
+  backpack.yaw_rad = -1.492f;
+  backpack.existence_log_odds = 2.0f;
+  ObjectNode handbag = makeObject(99);
+  handbag.label = "handbag";
+  handbag.semantic_id = 2;
+  handbag.center_world = {2.412f, -0.764f, 0.796f};
+  handbag.size_m = {0.395f, 0.312f, 0.472f};
+  handbag.yaw_rad = -1.477f;
+  handbag.existence_log_odds = 2.0f;
+  loaded.objects = {backpack, handbag};
+  loaded.next_object_id = 100;
+  std::string error;
+  ASSERT_TRUE(instance_map.loadObjectGraphSnapshot(loaded, &error)) << error;
+  instance_map.start();
+
+  for (FrameId frame_id = 1; frame_id <= 2; ++frame_id) {
+    InferenceResponse response;
+    response.ok = true;
+    response.time_ns = static_cast<TimeNanoseconds>(frame_id) * 100'000'000LL;
+    response.camera_id = "head";
+    response.provenance.run_id = RunId{300, 400};
+    response.provenance.frame_id = frame_id;
+    response.provenance.request_id = frame_id;
+    RawDetection detection;
+    detection.label = "backpack";
+    detection.semantic_id = 1;
+    detection.center_world = backpack.center_world;
+    detection.size_m = backpack.size_m;
+    detection.yaw_rad = backpack.yaw_rad;
+    detection.score_2d = 0.9f;
+    detection.score_3d = 0.9f;
+    detection.box_xyxy = {100, 100, 300, 400};
+    response.detections.push_back(std::move(detection));
+    ASSERT_TRUE(instance_map.enqueueDetections(std::move(response)));
+    ASSERT_TRUE(instance_map.waitUntilIdle(std::chrono::seconds(1)));
+  }
+
+  const SceneSnapshot snapshot = instance_map.sceneSnapshot();
+  EXPECT_EQ(snapshot.objects().size(), 1U);
+  EXPECT_EQ(snapshot.resolveCanonicalId(99),
+            std::optional<SceneObjectId>(76));
+  EXPECT_TRUE(snapshot.findExactObject(76));
+  EXPECT_FALSE(snapshot.findExactObject(99));
+  instance_map.stop();
 }
 
 TEST(InstanceMapThread,

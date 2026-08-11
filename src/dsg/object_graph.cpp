@@ -1,6 +1,7 @@
 #include "roomie/dsg/object_graph.hpp"
 
 #include <algorithm>
+#include <cmath>
 
 namespace roomie {
 namespace {
@@ -62,6 +63,9 @@ void ObjectGraph::updateNodeFromTrack(const InstanceTrack& track) {
   node->high_quality_observation_mass = track.high_quality_observation_mass;
   node->active = track.state != InstanceTrackState::kInactive;
   node->publishable = track.publishable;
+  node->existence_log_odds = track.existence_log_odds;
+  node->last_presence_evidence_ns = track.last_presence_evidence_ns;
+  node->last_presence_evidence_reason = track.last_presence_evidence_reason;
   node->geometry_status = track.geometry_status;
   node->geometry_evaluation_obb_revision = track.geometry_evaluation_obb_revision;
   node->geometry_evaluation_map_version = track.geometry_evaluation_map_version;
@@ -203,6 +207,9 @@ ObjectNode ObjectGraph::nodeFromTrack(const InstanceTrack& track, int object_id)
   node.high_quality_observation_mass = track.high_quality_observation_mass;
   node.active = track.state != InstanceTrackState::kInactive;
   node.publishable = track.publishable;
+  node.existence_log_odds = track.existence_log_odds;
+  node.last_presence_evidence_ns = track.last_presence_evidence_ns;
+  node.last_presence_evidence_reason = track.last_presence_evidence_reason;
   node.geometry_status = track.geometry_status;
   node.geometry_evaluation_obb_revision = track.geometry_evaluation_obb_revision;
   node.geometry_evaluation_map_version = track.geometry_evaluation_map_version;
@@ -253,6 +260,12 @@ InstanceRecord ObjectGraph::recordFromNode(const ObjectNode& node) {
   record.high_quality_observation_mass = node.high_quality_observation_mass;
   record.active = node.active;
   record.publishable = node.publishable;
+  record.existence_log_odds = node.existence_log_odds;
+  record.existence_probability =
+      1.0f / (1.0f + std::exp(-node.existence_log_odds));
+  record.presence_state = node.active ? "active" : "archived";
+  record.last_presence_evidence_ns = node.last_presence_evidence_ns;
+  record.last_presence_evidence_reason = node.last_presence_evidence_reason;
   record.geometry_status = node.geometry_status;
   record.last_geometry_check_ns = node.last_geometry_check_ns;
   record.first_seen_ns = node.first_seen_ns;

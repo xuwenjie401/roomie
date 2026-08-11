@@ -163,7 +163,7 @@ def test_request_v2_round_trip_preserves_all_provenance() -> None:
     response = worker.empty_response(parsed, ok=True)
     response_body = worker.ResponseWriter().encode_response(response)
     reader = worker.RequestReader(response_body)
-    assert reader.read_bytes(5) == b"RIRS2"
+    assert reader.read_bytes(5) == b"RIRS3"
     assert reader.read_struct("q") == parsed["time_ns"]
     assert reader.read_provenance() == parsed["provenance"]
     assert reader.read_pipeline_timing() == parsed["pipeline_timing"]

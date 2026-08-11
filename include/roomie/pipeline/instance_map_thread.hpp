@@ -10,6 +10,7 @@
 #include <string>
 #include <vector>
 #include <map>
+#include <set>
 
 #include "roomie/pipeline/interfaces.hpp"
 #include "roomie/artifacts/online_snapshot_worker.hpp"
@@ -104,7 +105,7 @@ class InstanceMapThread : public WorkerThread, public InstanceStore {
                    bool* geometry_update_suppressed = nullptr,
                    std::string* geometry_update_suppression_reason = nullptr);
   void ageUnmatchedTracks(const std::vector<bool>& track_matched,
-                          TimeNanoseconds response_time_ns);
+                          const InferenceResponse& response);
   std::size_t removeExpiredTentativeTracks(
       std::vector<int>* removed_track_ids = nullptr);
   std::size_t mergeDuplicateStableTracks(
@@ -128,6 +129,9 @@ class InstanceMapThread : public WorkerThread, public InstanceStore {
   ObjectSnapshotRemaker snapshot_remaker_;
   std::vector<InstanceTrack, Eigen::aligned_allocator<InstanceTrack>> tracks_;
   std::vector<std::pair<int, int>> pending_reducer_merges_;
+  std::map<std::pair<int, int>, std::vector<TimeNanoseconds>>
+      duplicate_support_timestamps_;
+  std::set<std::pair<int, int>> duplicate_pairs_ready_;
   ReducerCore reducer_;
   std::shared_ptr<const SceneState> published_scene_state_;
   std::function<bool(const SceneApplyResult&)> scene_commit_sink_;

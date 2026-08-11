@@ -26,6 +26,9 @@ SceneSnapshot makeQuerySnapshot(SceneRevision revision) {
   lifecycle->track_state = InstanceTrackState::kStable;
   lifecycle->active = true;
   lifecycle->publishable = true;
+  lifecycle->existence_log_odds = 2.0f;
+  lifecycle->last_presence_evidence_ns = 1234;
+  lifecycle->last_presence_evidence_reason = "matched_detection";
   object->lifecycle = lifecycle;
 
   SurfaceStamp surface;
@@ -183,6 +186,10 @@ TEST(SceneQueryJsonAdapter, BatchPinsOnceAndEveryCallUsesOneRevision) {
     EXPECT_EQ(call.at("metadata").at("durable_scene_revision"), 40);
   }
   const Json& object_result = result.at("calls").at(0).at("result");
+  EXPECT_EQ(object_result.at("presence_state"), "active");
+  EXPECT_GT(object_result.at("existence_probability").get<float>(), 0.8f);
+  EXPECT_EQ(object_result.at("last_presence_evidence_reason"),
+            "matched_detection");
   ASSERT_TRUE(object_result.at("furniture_role").is_object());
   EXPECT_EQ(object_result.at("furniture_role").at("object_id"), 7);
   const Json& furniture_result = result.at("calls").at(3).at("result");

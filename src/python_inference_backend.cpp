@@ -25,7 +25,7 @@ namespace roomie {
 namespace {
 
 constexpr char kRequestMagic[] = {'R', 'I', 'E', 'Q', '2'};
-constexpr char kResponseMagic[] = {'R', 'I', 'R', 'S', '2'};
+constexpr char kResponseMagic[] = {'R', 'I', 'R', 'S', '3'};
 constexpr std::size_t kMinimum2dDetectionBytes = 28U;
 constexpr std::size_t kMinimum3dDetectionBytes = 56U;
 constexpr std::chrono::milliseconds kWorkerPollPeriod{50};
@@ -637,6 +637,14 @@ bool encodeResponse(const InferenceResponse& response,
     if (!appendString(&encoded, detection.label, error)) {
       return false;
     }
+    if (!appendString(&encoded, detection.appearance_model_id, error)) {
+      return false;
+    }
+    appendU32(&encoded, static_cast<std::uint32_t>(
+                            detection.appearance_descriptor.size()));
+    for (float value : detection.appearance_descriptor) {
+      appendFloat(&encoded, value);
+    }
   }
 
   if (encoded.size() > kMaxMessageBytes) {
@@ -766,11 +774,32 @@ bool decodeResponse(const std::vector<std::uint8_t>& body,
         return false;
       }
     }
-    if (!reader.readI32(&semantic_id) || !reader.readString(&detection.label)) {
+    if (!reader.readI32(&semantic_id) || !reader.readString(&detection.label) ||
+        !reader.readString(&detection.appearance_model_id)) {
       if (error != nullptr) {
         *error = "Python worker response label is truncated";
       }
       return false;
+    }
+    std::uint32_t descriptor_size = 0;
+    if (!reader.readU32(&descriptor_size) || descriptor_size > 4096U ||
+        descriptor_size > reader.remaining() / sizeof(float)) {
+      if (error != nullptr) {
+        *error = "Python worker response appearance descriptor is invalid";
+      }
+      return false;
+    }
+    detection.appearance_descriptor.reserve(descriptor_size);
+    for (std::uint32_t descriptor_index = 0;
+         descriptor_index < descriptor_size; ++descriptor_index) {
+      float value = 0.0f;
+      if (!reader.readFloat(&value)) {
+        if (error != nullptr) {
+          *error = "Python worker response appearance descriptor is truncated";
+        }
+        return false;
+      }
+      detection.appearance_descriptor.push_back(value);
     }
     detection.semantic_id = semantic_id;
     decoded.detections.push_back(std::move(detection));

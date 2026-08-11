@@ -259,6 +259,29 @@ TEST(SceneReducer, GeometryCasRequiresIdentityObbEpochAndSafeSurfaceAdvance) {
   ASSERT_TRUE(advanced_result.committedRevision()) << advanced_result.reason;
   EXPECT_FLOAT_EQ(advanced_result.snapshot.findObject(4)->geometry->score, 0.8f);
 
+  UpsertTrackMutation stale_validation;
+  stale_validation.object_id = 4;
+  stale_validation.track.track_id = 1004;
+  stale_validation.track.object_id = 4;
+  stale_validation.track.state = InstanceTrackState::kStable;
+  stale_validation.track.publishable = true;
+  stale_validation.track.label = "cabinet";
+  stale_validation.track.center_world =
+      advanced_result.snapshot.findObject(4)->geometry->center_world;
+  stale_validation.track.size_m =
+      advanced_result.snapshot.findObject(4)->geometry->size_m;
+  stale_validation.track.yaw_rad =
+      advanced_result.snapshot.findObject(4)->geometry->yaw_rad;
+  stale_validation.track.geometry_status = InstanceGeometryStatus::kUnchecked;
+  stale_validation.track.geometry_score = 0.0f;
+  const SceneApplyResult validation_preserved =
+      reducer.apply(SceneCommand{mutationBatch(stale_validation)});
+  ASSERT_TRUE(validation_preserved.accepted()) << validation_preserved.reason;
+  EXPECT_FLOAT_EQ(
+      validation_preserved.snapshot.findObject(4)->geometry->score, 0.8f);
+  EXPECT_EQ(validation_preserved.snapshot.findObject(4)->geometry->status,
+            InstanceGeometryStatus::kGood);
+
   const SceneApplyResult regressed = reducer.apply(SceneCommand{exact});
   EXPECT_EQ(regressed.status, SceneApplyStatus::kRejected);
   EXPECT_NE(regressed.reason.find("regressed"), std::string::npos);
@@ -292,6 +315,7 @@ TEST(SceneReducer, GeometryCasRequiresIdentityObbEpochAndSafeSurfaceAdvance) {
   move.track.yaw_rad = 0.1f;
   ASSERT_TRUE(
       reducer.apply(SceneCommand{mutationBatch(move)}).committedRevision());
+  EXPECT_FLOAT_EQ(reducer.snapshot().findObject(4)->geometry->score, 0.8f);
   const SceneApplyResult stale_obb = reducer.apply(SceneCommand{exact});
   EXPECT_EQ(stale_obb.status, SceneApplyStatus::kRejected);
   EXPECT_NE(stale_obb.reason.find("OBB dependency"), std::string::npos);

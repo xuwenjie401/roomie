@@ -18,6 +18,8 @@
 #include <utility>
 
 #include "roomie/dsg/observation_history.hpp"
+#include "roomie/pipeline/association_engine.hpp"
+#include "roomie/pipeline/presence_evidence.hpp"
 #include "roomie/utils/run_logger.hpp"
 
 namespace roomie {
@@ -43,6 +45,23 @@ void appendUnique(std::vector<T>* values, const T& value) {
   }
 }
 
+template <typename Key>
+void capSemanticPrior(std::map<Key, float>* weights, float cap) {
+  float total = 0.0f;
+  for (const auto& [key, weight] : *weights) {
+    (void)key;
+    total += std::max(0.0f, weight);
+  }
+  if (total <= cap || total <= kEpsilon) {
+    return;
+  }
+  const float scale = cap / total;
+  for (auto& [key, weight] : *weights) {
+    (void)key;
+    weight *= scale;
+  }
+}
+
 bool isFiniteVector(const Eigen::Vector3f& value) {
   return std::isfinite(value.x()) && std::isfinite(value.y()) && std::isfinite(value.z());
 }
@@ -53,6 +72,61 @@ float clamp01(float value) {
 
 float rawDetectionConfidence(const RawDetection& detection) {
   return clamp01(0.5f * (detection.score_2d + detection.score_3d));
+}
+
+PhysicalObservationConfig physicalObservationConfig(
+    const PipelineConfig& config) {
+  PhysicalObservationConfig result;
+  result.min_2d_iou = config.instance_physical_min_2d_iou;
+  result.min_volume_ratio = config.instance_physical_min_volume_ratio;
+  result.max_normalized_center_distance =
+      config.instance_physical_max_normalized_center_distance;
+  result.min_3d_iou = config.instance_physical_min_3d_iou;
+  result.min_containment = config.instance_physical_min_containment;
+  return result;
+}
+
+AssociationScoringConfig associationScoringConfig(
+    const PipelineConfig& config) {
+  AssociationScoringConfig result;
+  result.overlap_weight = config.instance_association_overlap_weight;
+  result.center_weight = config.instance_association_center_weight;
+  result.size_weight = config.instance_association_size_weight;
+  result.projected_2d_weight =
+      config.instance_association_projected_2d_weight;
+  result.semantic_weight = config.instance_association_semantic_weight;
+  result.recency_weight = config.instance_association_recency_weight;
+  result.min_size_ratio = config.instance_association_min_size_ratio;
+  result.active_match_threshold =
+      config.instance_association_active_threshold;
+  result.archived_match_threshold =
+      config.instance_association_archived_threshold;
+  result.merge_support_threshold =
+      config.instance_association_merge_threshold;
+  result.max_center_gate_m = config.instance_match_center_distance_m;
+  return result;
+}
+
+PresenceEvidenceConfig presenceEvidenceConfig(const PipelineConfig& config) {
+  PresenceEvidenceConfig result;
+  result.log_odds_cap = config.instance_presence_log_odds_cap;
+  result.active_threshold = config.instance_presence_active_threshold;
+  result.archive_threshold = config.instance_presence_archive_threshold;
+  result.evidence_window_ns = static_cast<TimeNanoseconds>(
+      config.instance_presence_window_sec * 1.0e9);
+  result.min_positive_frames = config.instance_presence_min_positive_frames;
+  result.max_positive_interruptions =
+      config.instance_presence_max_positive_interruptions;
+  result.min_negative_frames = config.instance_presence_min_negative_frames;
+  result.min_depth_samples = config.instance_presence_min_depth_samples;
+  result.min_valid_depth_coverage =
+      config.instance_presence_min_valid_depth_coverage;
+  result.min_free_space_ratio =
+      config.instance_presence_min_free_space_ratio;
+  result.max_occlusion_ratio =
+      config.instance_presence_max_occlusion_ratio;
+  result.depth_margin_m = config.instance_presence_depth_margin_m;
+  return result;
 }
 
 MergeObjectsMutation durableMergeMutation(
@@ -166,6 +240,33 @@ void alignBoxToReference(Eigen::Vector3f* size, float* yaw, float reference_yaw)
   if (diff_rotated < diff_keep) {
     std::swap(size->x(), size->y());
     *yaw = normalizeYaw(rotated_yaw);
+  }
+}
+
+void fuseAppearanceShadow(InstanceTrack* track,
+                          const RawDetection& detection) {
+  if (track == nullptr || detection.appearance_descriptor.empty() ||
+      detection.appearance_model_id.empty()) {
+    return;
+  }
+  if (track->appearance_model_id != detection.appearance_model_id ||
+      track->appearance_descriptor_shadow.size() !=
+          detection.appearance_descriptor.size()) {
+    track->appearance_model_id = detection.appearance_model_id;
+    track->appearance_descriptor_shadow = detection.appearance_descriptor;
+    return;
+  }
+  double norm = 0.0;
+  for (std::size_t i = 0; i < track->appearance_descriptor_shadow.size(); ++i) {
+    float& value = track->appearance_descriptor_shadow[i];
+    value = 0.8f * value + 0.2f * detection.appearance_descriptor[i];
+    norm += static_cast<double>(value) * value;
+  }
+  norm = std::sqrt(norm);
+  if (norm > kEpsilon) {
+    for (float& value : track->appearance_descriptor_shadow) {
+      value = static_cast<float>(value / norm);
+    }
   }
 }
 
@@ -1162,6 +1263,11 @@ InstanceRecord recordFromTrack(const InstanceTrack& track) {
   record.high_quality_observation_mass = track.high_quality_observation_mass;
   record.active = track.state != InstanceTrackState::kInactive;
   record.publishable = track.publishable;
+  record.existence_log_odds = track.existence_log_odds;
+  record.existence_probability = presenceProbability(track.existence_log_odds);
+  record.presence_state = presenceStateName(track.state);
+  record.last_presence_evidence_ns = track.last_presence_evidence_ns;
+  record.last_presence_evidence_reason = track.last_presence_evidence_reason;
   record.geometry_status = track.geometry_status;
   record.last_geometry_check_ns = track.last_geometry_check_ns;
   record.first_seen_ns = track.first_seen_ns;
@@ -1269,7 +1375,9 @@ std::vector<InstanceRecord, Eigen::aligned_allocator<InstanceRecord>>
 InstanceMapThread::snapshotInstances() const {
   ObjectGraph graph;
   graph.loadSnapshot(sceneSnapshot().materializeObjectGraph());
-  return graph.snapshotInstanceRecords(/*publishable_only=*/false);
+  // /roomie/objects is the active view.  Archived objects remain available
+  // through snapshotTrackedInstances() and include_inactive scene queries.
+  return graph.snapshotInstanceRecords(/*publishable_only=*/true);
 }
 
 std::vector<InstanceRecord, Eigen::aligned_allocator<InstanceRecord>>
@@ -1280,7 +1388,29 @@ InstanceMapThread::snapshotTrackedInstances() const {
   for (const auto& [track_id, track] : snapshot.tracks()) {
     (void)track_id;
     if (track) {
-      records.push_back(recordFromTrack(*track));
+      InstanceRecord record = recordFromTrack(*track);
+      if (track->object_id >= 0) {
+        const SceneObjectPtr object = snapshot.findObject(track->object_id);
+        if (object && object->geometry) {
+          record.center_world = object->geometry->center_world;
+          record.size_m = object->geometry->size_m;
+          record.yaw_rad = object->geometry->yaw_rad;
+          record.geometry_status = object->geometry->status;
+          record.description = geometryStatusName(object->geometry->status);
+          record.geometry_score = object->geometry->score;
+          record.geometry_shell_ratio = object->geometry->shell_ratio;
+          record.geometry_extent_score = object->geometry->extent_score;
+          record.geometry_leak_ratio = object->geometry->leak_ratio;
+          record.geometry_cavity_ratio = object->geometry->cavity_ratio;
+          record.geometry_in_box_points = object->geometry->in_box_points;
+          record.geometry_shell_points = object->geometry->shell_points;
+          record.geometry_unique_voxels = object->geometry->unique_voxels;
+          record.geometry_expanded_points = object->geometry->expanded_points;
+          record.geometry_bad_count = object->geometry->bad_count;
+          record.last_geometry_check_ns = object->geometry->last_check_ns;
+        }
+      }
+      records.push_back(std::move(record));
     }
   }
   return records;
@@ -1617,6 +1747,10 @@ bool InstanceMapThread::loadInitialSnapshot(
     track.high_quality_observation_mass = object.high_quality_observation_mass;
     track.missed_count = object.active ? 0 : config_.instance_inactive_after_missed;
     track.publishable = object.publishable;
+    track.existence_log_odds = object.existence_log_odds;
+    track.last_presence_evidence_ns = object.last_presence_evidence_ns;
+    track.last_presence_evidence_reason =
+        object.last_presence_evidence_reason;
     track.geometry_status = object.geometry_status;
     track.geometry_evaluation_obb_revision = object.geometry_evaluation_obb_revision;
     track.geometry_evaluation_map_version = object.geometry_evaluation_map_version;
@@ -1731,6 +1865,38 @@ void InstanceMapThread::refreshAssociationWorkingSet(
       continue;
     }
     tracks_.push_back(*track);
+    // InstanceTrack validation fields are compatibility-only.  Hydrate them
+    // from the canonical object component for association diagnostics; an
+    // upsert is never allowed to write them back over reducer state.
+    InstanceTrack& hydrated = tracks_.back();
+    if (hydrated.object_id >= 0) {
+      const SceneObjectPtr object = snapshot.findObject(hydrated.object_id);
+      if (object && object->geometry) {
+        const GeometryComponent& geometry = *object->geometry;
+        hydrated.obb_revision = geometry.obb_revision;
+        hydrated.geometry_status = geometry.status;
+        hydrated.geometry_score = geometry.score;
+        hydrated.geometry_shell_ratio = geometry.shell_ratio;
+        hydrated.geometry_extent_score = geometry.extent_score;
+        hydrated.geometry_leak_ratio = geometry.leak_ratio;
+        hydrated.geometry_cavity_ratio = geometry.cavity_ratio;
+        hydrated.geometry_in_box_points = geometry.in_box_points;
+        hydrated.geometry_shell_points = geometry.shell_points;
+        hydrated.geometry_unique_voxels = geometry.unique_voxels;
+        hydrated.geometry_expanded_points = geometry.expanded_points;
+        hydrated.geometry_bad_count = geometry.bad_count;
+        hydrated.last_geometry_check_ns = geometry.last_check_ns;
+        hydrated.geometry_evaluation_obb_revision =
+            geometry.evaluated_obb_revision;
+        hydrated.geometry_evaluation_map_version =
+            geometry.evaluated_surface.source_map_revision;
+        hydrated.geometry_evaluated_center_world =
+            geometry.evaluated_center_world;
+        hydrated.geometry_evaluated_size_m = geometry.evaluated_size_m;
+        hydrated.geometry_evaluated_yaw_rad = geometry.evaluated_yaw_rad;
+        hydrated.geometry_evaluation_reason = geometry.evaluation_reason;
+      }
+    }
     next_track_id_ = std::max(next_track_id_, track_id + 1);
     highest_frame_index =
         std::max(highest_frame_index, track->last_seen_frame_index);
@@ -1862,12 +2028,6 @@ void InstanceMapThread::onStopRequested() {
 
 SceneApplyResult InstanceMapThread::applyQueuedSceneCommand(
     SceneCommand command) {
-  const auto* geometry_command =
-      std::get_if<ApplyGeometryResultCommand>(&command);
-  const std::optional<ApplyGeometryResultCommand> geometry_update =
-      geometry_command
-          ? std::optional<ApplyGeometryResultCommand>(*geometry_command)
-          : std::nullopt;
   const bool persist_content_commit =
       !std::holds_alternative<PersistedThroughCommand>(command) &&
       !std::holds_alternative<AdvanceSurfaceCommand>(command);
@@ -1884,43 +2044,6 @@ SceneApplyResult InstanceMapThread::applyQueuedSceneCommand(
     return result;
   }
 
-  // tracks_ is now only the association working set. Keep the geometry fields
-  // required by the unchanged association formulas in sync with the reducer's
-  // accepted CAS result; it is never published as current scene state.
-  if (geometry_update) {
-    std::lock_guard<std::mutex> lock(mutex_);
-    for (InstanceTrack& track : tracks_) {
-      if (track.object_id != geometry_update->dependency.object.object_id ||
-          track.obb_revision !=
-              geometry_update->dependency.object.obb_revision) {
-        continue;
-      }
-      const GeometryEvaluationResult& evaluation = geometry_update->result;
-      track.geometry_status = evaluation.status;
-      track.geometry_score = evaluation.score;
-      track.geometry_shell_ratio = evaluation.shell_ratio;
-      track.geometry_extent_score = evaluation.extent_score;
-      track.geometry_leak_ratio = evaluation.leak_ratio;
-      track.geometry_cavity_ratio = evaluation.cavity_ratio;
-      track.geometry_in_box_points = evaluation.in_box_points;
-      track.geometry_shell_points = evaluation.shell_points;
-      track.geometry_unique_voxels = evaluation.unique_voxels;
-      track.geometry_expanded_points = evaluation.expanded_points;
-      track.geometry_bad_count = evaluation.bad_count;
-      track.last_geometry_check_ns = evaluation.checked_at_ns;
-      track.geometry_evaluation_obb_revision = track.obb_revision;
-      track.geometry_evaluation_map_version =
-          geometry_update->dependency.surface.source_map_revision;
-      track.geometry_evaluated_center_world =
-          evaluation.evaluated_center_world;
-      track.geometry_evaluated_size_m = evaluation.evaluated_size_m;
-      track.geometry_evaluated_yaw_rad = evaluation.evaluated_yaw_rad;
-      track.geometry_evaluation_reason = evaluation.reason;
-      updateObjectQualityScore(&track);
-      object_graph_.updateNodeFromTrack(track);
-      break;
-    }
-  }
   publishReducerResult(result, persist_content_commit);
   return result;
 }
@@ -2115,6 +2238,16 @@ void InstanceMapThread::applyDetections(const InferenceResponse& response) {
       ++rejected;
     }
   }
+  const std::size_t per_class_observation_count = observations.size();
+  std::vector<InstanceObservation, Eigen::aligned_allocator<InstanceObservation>>
+      physical_observations = observations;
+  if (config_.instance_association_mode != "legacy") {
+    physical_observations = clusterPhysicalObservations(
+        observations, physicalObservationConfig(config_));
+    if (config_.instance_association_mode == "evidence") {
+      observations = physical_observations;
+    }
+  }
 
   std::shared_ptr<const ImageBuffer> snapshot_frame;
   std::vector<std::optional<SnapshotCandidate>> snapshot_candidates;
@@ -2154,20 +2287,66 @@ void InstanceMapThread::applyDetections(const InferenceResponse& response) {
     objects_before = object_graph_.objectCount();
     tracks_before = tracks_.size();
 
+    const std::size_t association_track_count = tracks_.size();
+    const auto& factor_observations =
+        config_.instance_association_mode == "shadow"
+            ? physical_observations
+            : observations;
+    const AssociationResult factor_association =
+        config_.instance_association_mode == "legacy"
+            ? AssociationResult{}
+            : associatePhysicalObservations(
+                  factor_observations, tracks_, response.time_ns,
+                  associationScoringConfig(config_));
+    if (config_.instance_association_mode == "shadow") {
+      std::size_t shadow_matches = 0;
+      for (const auto& match : factor_association.track_by_observation) {
+        shadow_matches += match.has_value() ? 1U : 0U;
+      }
+      RunLogger::logGlobal(
+          "association_shadow",
+          "frame_id=" + std::to_string(response.provenance.frame_id) +
+              " physical_observations=" +
+              std::to_string(physical_observations.size()) + " matches=" +
+              std::to_string(shadow_matches));
+    }
     std::vector<bool> track_matched(tracks_.size(), false);
     for (std::size_t observation_index = 0;
          observation_index < observations.size(); ++observation_index) {
       const InstanceObservation& observation = observations[observation_index];
       const std::string observation_label = diagnosticsLabel(observation.detection.label);
-      if (shouldRejectAsDuplicateOfConfirmed(observation)) {
+      if (config_.instance_association_mode == "legacy" &&
+          shouldRejectAsDuplicateOfConfirmed(observation)) {
         ++duplicate_rejected;
         ++duplicate_rejected_by_label[observation_label];
         continue;
       }
       ++accepted_by_label[observation_label];
       const std::optional<std::size_t> track_index =
-          findBestTrack(observation, track_matched);
+          config_.instance_association_mode == "evidence"
+              ? factor_association.track_by_observation[observation_index]
+              : findBestTrack(observation, track_matched);
       if (track_index) {
+        if (config_.instance_association_mode == "evidence") {
+          const AssociationPairFeatures& features =
+              factor_association
+                  .pair_features[observation_index][*track_index];
+          std::ostringstream trace;
+          trace << std::fixed << std::setprecision(4)
+                << "frame_id=" << response.provenance.frame_id
+                << " observation=" << observation_index
+                << " track_id=" << tracks_[*track_index].track_id
+                << " score=" << features.score
+                << " identity=" << features.identity_score
+                << " iou3d=" << features.iou_3d
+                << " containment=" << features.containment
+                << " center=" << features.center_score
+                << " size=" << features.size_ratio
+                << " semantic=" << features.semantic_similarity
+                << " appearance_shadow="
+                << features.appearance_similarity_shadow;
+          RunLogger::logGlobal("association_decision", trace.str());
+        }
         const bool was_tentative = tracks_[*track_index].object_id < 0;
         bool suppressed_geometry_update = false;
         std::string geometry_suppression_reason;
@@ -2243,7 +2422,66 @@ void InstanceMapThread::applyDetections(const InferenceResponse& response) {
       }
     }
 
-    ageUnmatchedTracks(track_matched, response.time_ns);
+    if (config_.instance_association_mode == "evidence") {
+      const AssociationScoringConfig scoring = associationScoringConfig(config_);
+      std::set<std::pair<int, int>> supported_this_frame;
+      for (std::size_t observation_index = 0;
+           observation_index < observations.size(); ++observation_index) {
+        if (!factor_association.track_by_observation[observation_index]) {
+          continue;
+        }
+        const std::size_t matched_index =
+            *factor_association.track_by_observation[observation_index];
+        if (matched_index >= association_track_count ||
+            tracks_[matched_index].object_id < 0) {
+          continue;
+        }
+        for (std::size_t candidate_index = 0;
+             candidate_index < association_track_count; ++candidate_index) {
+          if (candidate_index == matched_index ||
+              tracks_[candidate_index].object_id < 0 ||
+              factor_association
+                      .pair_features[observation_index][candidate_index]
+                      .identity_score < scoring.merge_support_threshold) {
+            continue;
+          }
+          supported_this_frame.emplace(
+              std::min(tracks_[matched_index].track_id,
+                       tracks_[candidate_index].track_id),
+              std::max(tracks_[matched_index].track_id,
+                       tracks_[candidate_index].track_id));
+        }
+      }
+      const PresenceEvidenceConfig presence = presenceEvidenceConfig(config_);
+      for (auto it = duplicate_support_timestamps_.begin();
+           it != duplicate_support_timestamps_.end();) {
+        auto& timestamps = it->second;
+        timestamps.erase(
+            std::remove_if(timestamps.begin(), timestamps.end(),
+                           [&response, &presence](TimeNanoseconds time_ns) {
+                             return time_ns > response.time_ns ||
+                                    response.time_ns - time_ns >
+                                        presence.evidence_window_ns;
+                           }),
+            timestamps.end());
+        if (timestamps.empty() && supported_this_frame.count(it->first) == 0) {
+          it = duplicate_support_timestamps_.erase(it);
+        } else {
+          ++it;
+        }
+      }
+      for (const auto& pair : supported_this_frame) {
+        auto& timestamps = duplicate_support_timestamps_[pair];
+        if (timestamps.empty() || timestamps.back() != response.time_ns) {
+          timestamps.push_back(response.time_ns);
+        }
+        if (timestamps.size() >= 2U) {
+          duplicate_pairs_ready_.insert(pair);
+        }
+      }
+    }
+
+    ageUnmatchedTracks(track_matched, response);
     removed_tentative =
         removeExpiredTentativeTracks(&expired_snapshot_tracks);
     merged_duplicates += mergeDuplicateStableTracks(&merged_small_duplicates_by_label);
@@ -2270,6 +2508,9 @@ void InstanceMapThread::applyDetections(const InferenceResponse& response) {
            << "applied camera=" << response.camera_id
            << " t=" << response.time_ns
            << " raw=" << response.detections.size()
+           << " physical=" << observations.size()
+           << " clustered="
+           << (per_class_observation_count - physical_observations.size())
            << " accepted=" << (observations.size() - duplicate_rejected)
            << " rejected=" << (rejected + duplicate_rejected)
            << " duplicate_rejected=" << duplicate_rejected
@@ -2356,7 +2597,12 @@ bool InstanceMapThread::commitReducerState(
   ApplyObservationBatchCommand command;
   command.provenance = response.provenance;
   command.observations = observations;
-  command.association_source = "scene_snapshot_association_v1";
+  command.association_source =
+      config_.instance_association_mode == "evidence"
+          ? "physical_observation_hungarian_presence_v2"
+          : (config_.instance_association_mode == "shadow"
+                 ? "legacy_with_hungarian_shadow_v2"
+                 : "scene_snapshot_association_v1");
   command.associated_mutations.reserve(current_tracks.size() +
                                        before.objects().size());
   for (const InstanceTrack& track : current_tracks) {
@@ -2601,6 +2847,14 @@ std::optional<InstanceObservation> InstanceMapThread::makeObservation(
                                                     observation.confidence,
                                                     config_.boxer_input_size,
                                                     &observation.camera_distance_m);
+  const float semantic_vote =
+      observation.confidence * observation.bbox_quality;
+  if (!detection.label.empty()) {
+    observation.label_votes[detection.label] = semantic_vote;
+  }
+  if (detection.semantic_id >= 0) {
+    observation.semantic_votes[detection.semantic_id] = semantic_vote;
+  }
   return observation;
 }
 
@@ -2720,12 +2974,26 @@ bool InstanceMapThread::createTrack(const InstanceObservation& observation) {
   track.source_cameras.push_back(observation.camera_id);
   track.observation_timestamps_ns.push_back(observation.time_ns);
   track.near_surface_voxels = observation.near_surface_voxels;
+  fuseAppearanceShadow(&track, observation.detection);
   recordObservationQuality(&track, observation, config_);
-  if (!track.label.empty()) {
+  capSemanticPrior(&track.label_weights, 20.0f);
+  capSemanticPrior(&track.semantic_weights, 20.0f);
+  for (const auto& [label, vote] : observation.label_votes) {
+    track.label_weights[label] += vote * promotion_weight;
+  }
+  for (const auto& [semantic_id, vote] : observation.semantic_votes) {
+    track.semantic_weights[semantic_id] += vote * promotion_weight;
+  }
+  if (track.label_weights.empty() && !track.label.empty()) {
     track.label_weights[track.label] = observation.confidence * promotion_weight;
   }
-  if (track.semantic_id >= 0) {
-    track.semantic_weights[track.semantic_id] = observation.confidence * promotion_weight;
+  if (track.semantic_weights.empty() && track.semantic_id >= 0) {
+    track.semantic_weights[track.semantic_id] =
+        observation.confidence * promotion_weight;
+  }
+  if (config_.instance_association_mode == "evidence") {
+    addPositivePresenceEvidence(&track, observation,
+                                presenceEvidenceConfig(config_));
   }
   updateObjectQualityScore(&track);
   tracks_.push_back(std::move(track));
@@ -2797,20 +3065,24 @@ bool InstanceMapThread::updateTrack(InstanceTrack* track,
   if (!observation.near_surface_voxels.empty()) {
     track->near_surface_voxels = observation.near_surface_voxels;
   }
+  fuseAppearanceShadow(track, observation.detection);
   recordObservationQuality(track, observation, config_);
 
-  if (!observation.detection.label.empty()) {
-    track->label_weights[observation.detection.label] +=
-        observation.confidence * promotion_weight;
+  capSemanticPrior(&track->label_weights, 20.0f);
+  capSemanticPrior(&track->semantic_weights, 20.0f);
+  for (const auto& [label, vote] : observation.label_votes) {
+    track->label_weights[label] += vote * promotion_weight;
     track->label = bestWeightedKey(track->label_weights, track->label);
   }
-  if (observation.detection.semantic_id >= 0) {
-    track->semantic_weights[observation.detection.semantic_id] +=
-        observation.confidence * promotion_weight;
+  for (const auto& [semantic_id, vote] : observation.semantic_votes) {
+    track->semantic_weights[semantic_id] += vote * promotion_weight;
     track->semantic_id = bestWeightedKey(track->semantic_weights, track->semantic_id);
   }
 
-  if (track->object_id >= 0) {
+  if (config_.instance_association_mode == "evidence") {
+    addPositivePresenceEvidence(track, observation,
+                                presenceEvidenceConfig(config_));
+  } else if (track->object_id >= 0) {
     track->state = InstanceTrackState::kStable;
   }
   updateObjectQualityScore(track);
@@ -2819,18 +3091,49 @@ bool InstanceMapThread::updateTrack(InstanceTrack* track,
 }
 
 void InstanceMapThread::ageUnmatchedTracks(const std::vector<bool>& track_matched,
-                                           TimeNanoseconds response_time_ns) {
+                                           const InferenceResponse& response) {
   for (std::size_t i = 0; i < tracks_.size(); ++i) {
     if (i < track_matched.size() && track_matched[i]) {
       continue;
     }
     InstanceTrack& track = tracks_[i];
+    if (config_.instance_association_mode == "evidence") {
+      if (track.state == InstanceTrackState::kInactive) {
+        continue;
+      }
+      const PresenceEvidenceConfig presence = presenceEvidenceConfig(config_);
+      const VisibilityEvidence evidence =
+          evaluateVisibility(track, response, presence);
+      if (evidence.kind != VisibilityEvidenceKind::kFreeSpace) {
+        RunLogger::logGlobal(
+            "presence_evidence",
+            "frame_id=" + std::to_string(response.provenance.frame_id) +
+                " track_id=" + std::to_string(track.track_id) +
+                " delta=0 reason=" + evidence.reason);
+        continue;
+      }
+      addFreeSpacePresenceEvidence(&track, response.time_ns, evidence, presence);
+      ++track.missed_count;
+      if (track.object_id >= 0 &&
+          hasNegativePresenceConfirmation(track, response.time_ns, presence)) {
+        track.state = InstanceTrackState::kInactive;
+        track.last_presence_evidence_reason = "archived_after_free_space";
+      }
+      RunLogger::logGlobal(
+          "presence_evidence",
+          "frame_id=" + std::to_string(response.provenance.frame_id) +
+              " track_id=" + std::to_string(track.track_id) +
+              " kind=free_space reliability=" +
+              std::to_string(evidence.reliability) + " log_odds=" +
+              std::to_string(track.existence_log_odds) + " state=" +
+              presenceStateName(track.state));
+      continue;
+    }
     ++track.missed_count;
     if (track.object_id >= 0 &&
         track.missed_count >= config_.instance_inactive_after_missed) {
       track.state = InstanceTrackState::kInactive;
     }
-    (void)response_time_ns;
   }
 }
 
@@ -2870,9 +3173,18 @@ std::size_t InstanceMapThread::mergeDuplicateStableTracks(
         if (rhs.object_id < 0 || !rhs.publishable) {
           continue;
         }
+        const std::pair<int, int> pair{
+            std::min(lhs.track_id, rhs.track_id),
+            std::max(lhs.track_id, rhs.track_id)};
+        const bool evidence_ready =
+            duplicate_pairs_ready_.count(pair) != 0;
         const bool small_duplicate =
+            config_.instance_association_mode == "legacy" &&
             smallStableTracksAreDuplicates(lhs, rhs, config_);
-        if (!small_duplicate && !stableTracksAreDuplicates(lhs, rhs, config_)) {
+        const bool legacy_duplicate =
+            config_.instance_association_mode == "legacy" &&
+            stableTracksAreDuplicates(lhs, rhs, config_);
+        if (!evidence_ready && !small_duplicate && !legacy_duplicate) {
           continue;
         }
 
@@ -2885,7 +3197,27 @@ std::size_t InstanceMapThread::mergeDuplicateStableTracks(
                                  track.support_count,
                                  -track.object_id);
         };
-        if (winner_key(rhs) > winner_key(lhs)) {
+        if (config_.instance_association_mode == "evidence") {
+          const SceneSnapshot scene = reducer_.snapshot();
+          const auto has_human_override = [&scene](int object_id) {
+            const SceneObjectPtr object = scene.findObject(object_id);
+            return object && object->annotation &&
+                   (object->annotation->semantic_id_override.has_value() ||
+                    object->annotation->label_override.has_value() ||
+                    object->annotation->description_override.has_value() ||
+                    !object->annotation->attributes.empty());
+          };
+          const bool lhs_annotated = has_human_override(lhs.object_id);
+          const bool rhs_annotated = has_human_override(rhs.object_id);
+          // Human authority wins; otherwise monotonic object ids make the
+          // lower id the older durable identity.
+          if ((!lhs_annotated && rhs_annotated) ||
+              (lhs_annotated == rhs_annotated &&
+               rhs.object_id < lhs.object_id)) {
+            winner_index = j;
+            loser_index = i;
+          }
+        } else if (winner_key(rhs) > winner_key(lhs)) {
           winner_index = j;
           loser_index = i;
         }
@@ -2908,6 +3240,25 @@ std::size_t InstanceMapThread::mergeDuplicateStableTracks(
         winner.first_seen_ns = std::min(winner.first_seen_ns, loser.first_seen_ns);
         winner.last_seen_ns = std::max(winner.last_seen_ns, loser.last_seen_ns);
         winner.missed_count = std::min(winner.missed_count, loser.missed_count);
+        winner.existence_log_odds =
+            std::max(winner.existence_log_odds, loser.existence_log_odds);
+        for (TimeNanoseconds time_ns :
+             loser.positive_evidence_timestamps_ns) {
+          appendUnique(&winner.positive_evidence_timestamps_ns, time_ns);
+        }
+        for (TimeNanoseconds time_ns :
+             loser.negative_evidence_timestamps_ns) {
+          appendUnique(&winner.negative_evidence_timestamps_ns, time_ns);
+        }
+        if (loser.last_presence_evidence_ns >
+            winner.last_presence_evidence_ns) {
+          winner.last_presence_evidence_ns =
+              loser.last_presence_evidence_ns;
+          winner.last_presence_evidence_reliability =
+              loser.last_presence_evidence_reliability;
+          winner.last_presence_evidence_reason =
+              loser.last_presence_evidence_reason;
+        }
         winner.geometry_score = std::max(winner.geometry_score, loser.geometry_score);
         winner.geometry_shell_ratio =
             std::max(winner.geometry_shell_ratio, loser.geometry_shell_ratio);
@@ -2964,6 +3315,13 @@ std::size_t InstanceMapThread::mergeDuplicateStableTracks(
         for (const auto& [semantic_id, weight] : loser.semantic_weights) {
           winner.semantic_weights[semantic_id] += weight;
         }
+        if (!loser.appearance_descriptor_shadow.empty()) {
+          RawDetection appearance;
+          appearance.appearance_model_id = loser.appearance_model_id;
+          appearance.appearance_descriptor =
+              loser.appearance_descriptor_shadow;
+          fuseAppearanceShadow(&winner, appearance);
+        }
         winner.label = bestWeightedKey(winner.label_weights, winner.label);
         winner.semantic_id = bestWeightedKey(winner.semantic_weights, winner.semantic_id);
         updateObjectQualityScore(&winner);
@@ -2974,6 +3332,8 @@ std::size_t InstanceMapThread::mergeDuplicateStableTracks(
         object_graph_.removeNode(loser_object_id);
         pending_reducer_merges_.emplace_back(loser_object_id,
                                              winner.object_id);
+        duplicate_pairs_ready_.erase(pair);
+        duplicate_support_timestamps_.erase(pair);
         tracks_.erase(tracks_.begin() + static_cast<std::ptrdiff_t>(loser_index));
         auto winner_it = std::find_if(tracks_.begin(),
                                       tracks_.end(),
@@ -2994,6 +3354,14 @@ std::size_t InstanceMapThread::mergeDuplicateStableTracks(
 
 bool InstanceMapThread::maybePromoteOrUpdateObject(InstanceTrack* track) {
   bool promoted = false;
+  if (config_.instance_association_mode == "evidence" &&
+      track->object_id >= 0 &&
+      track->state == InstanceTrackState::kInactive &&
+      hasPositivePresenceConfirmation(*track, track->last_seen_ns,
+                                      presenceEvidenceConfig(config_))) {
+    track->state = InstanceTrackState::kStable;
+    track->last_presence_evidence_reason = "reactivated_after_reid";
+  }
   if (track->object_id < 0 && isPromotable(*track)) {
     track->state = InstanceTrackState::kStable;
     track->object_id = object_graph_.createNodeFromTrack(*track);
@@ -3006,6 +3374,10 @@ bool InstanceMapThread::maybePromoteOrUpdateObject(InstanceTrack* track) {
 }
 
 bool InstanceMapThread::isPromotable(const InstanceTrack& track) const {
+  if (config_.instance_association_mode == "evidence") {
+    return hasPositivePresenceConfirmation(
+        track, track.last_seen_ns, presenceEvidenceConfig(config_));
+  }
   return hasBasePromotionEvidence(track, config_) &&
          hasPromotionQuality(track, config_);
 }

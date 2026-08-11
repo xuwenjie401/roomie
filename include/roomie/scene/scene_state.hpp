@@ -98,6 +98,13 @@ struct LifecycleComponent {
   InstanceTrackState track_state = InstanceTrackState::kTentative;
   bool active = true;
   bool publishable = true;
+  float existence_log_odds = 0.0f;
+  TimeNanoseconds last_presence_evidence_ns = 0;
+  float last_presence_evidence_reliability = 0.0f;
+  std::string last_presence_evidence_reason;
+  std::vector<TimeNanoseconds> positive_evidence_timestamps_ns;
+  std::vector<TimeNanoseconds> negative_evidence_timestamps_ns;
+  int positive_window_interruptions = 0;
   TimeNanoseconds first_seen_ns = 0;
   TimeNanoseconds last_seen_ns = 0;
   std::uint64_t first_seen_frame_index = 0;

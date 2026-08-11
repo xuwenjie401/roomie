@@ -1,12 +1,15 @@
+#include <algorithm>
 #include <chrono>
 #include <cstdint>
 #include <filesystem>
+#include <iostream>
 #include <thread>
 #include <vector>
 
 #include <gtest/gtest.h>
 
 #include "roomie/dsg/observation_history.hpp"
+#include "roomie/pipeline/association_engine.hpp"
 #include "roomie/pipeline/instance_map_thread.hpp"
 #include "roomie/pipeline/snapshot_control_queue.hpp"
 
@@ -129,6 +132,53 @@ TEST(InstanceMapThreadBounds, NormalizesOversizedImportedHistory) {
   ASSERT_TRUE(loaded.tracks().begin()->second);
   EXPECT_EQ(loaded.tracks().begin()->second->observation_timestamps_ns,
             (std::vector<TimeNanoseconds>{20, 30, 40}));
+}
+
+TEST(AssociationEngineBounds, TwoHundredTracksByThirtyObservationsIsBounded) {
+  std::vector<InstanceTrack, Eigen::aligned_allocator<InstanceTrack>> tracks;
+  tracks.reserve(200);
+  for (int i = 0; i < 200; ++i) {
+    InstanceTrack track;
+    track.track_id = i;
+    track.object_id = i;
+    track.state = InstanceTrackState::kStable;
+    track.publishable = true;
+    track.center_world = {0.5f * static_cast<float>(i % 20),
+                          0.5f * static_cast<float>(i / 20), 1.0f};
+    track.size_m = {0.35f, 0.35f, 0.5f};
+    track.label = "object";
+    track.label_weights[track.label] = 1.0f;
+    tracks.push_back(std::move(track));
+  }
+  std::vector<InstanceObservation,
+              Eigen::aligned_allocator<InstanceObservation>> observations;
+  observations.reserve(30);
+  for (int i = 0; i < 30; ++i) {
+    InstanceObservation observation;
+    observation.time_ns = 1;
+    observation.confidence = 0.9f;
+    observation.bbox_quality = 0.9f;
+    observation.detection.center_world = tracks[i].center_world;
+    observation.detection.size_m = tracks[i].size_m;
+    observation.detection.label = "object";
+    observation.label_votes["object"] = 1.0f;
+    observations.push_back(std::move(observation));
+  }
+
+  std::vector<double> elapsed_ms;
+  for (int iteration = 0; iteration < 20; ++iteration) {
+    const auto started = std::chrono::steady_clock::now();
+    const AssociationResult result = associatePhysicalObservations(
+        observations, tracks, 1, AssociationScoringConfig{});
+    ASSERT_EQ(result.track_by_observation.size(), observations.size());
+    elapsed_ms.push_back(std::chrono::duration<double, std::milli>(
+                             std::chrono::steady_clock::now() - started)
+                             .count());
+  }
+  std::sort(elapsed_ms.begin(), elapsed_ms.end());
+  const double p99_ms = elapsed_ms.back();
+  std::cout << "association_200x30_p99_ms=" << p99_ms << std::endl;
+  EXPECT_LT(p99_ms, 10.0);
 }
 
 TEST(InstanceMapThreadBounds, IdleWaitHasDeadlineAndThenDrains) {

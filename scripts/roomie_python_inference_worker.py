@@ -13,7 +13,7 @@ import traceback
 
 
 REQUEST_MAGIC = b"RIEQ2"
-RESPONSE_MAGIC = b"RIRS2"
+RESPONSE_MAGIC = b"RIRS3"
 PATCH_VALUES = 60 * 60
 MAX_MESSAGE_BYTES = 64 * 1024 * 1024
 
@@ -270,6 +270,11 @@ class ResponseWriter:
             self.write_struct("4f", *det["box_xyxy"])
             self.write_struct("i", int(det["semantic_id"]))
             self.write_string(det["label"])
+            self.write_string(det.get("appearance_model_id", ""))
+            descriptor = det.get("appearance_descriptor", [])
+            self.write_struct("I", len(descriptor))
+            for value in descriptor:
+                self.write_struct("f", float(value))
 
         return bytes(self.body)
 
@@ -628,6 +633,7 @@ class InferenceRuntime:
         )
         keepers = scores3d >= boxernet_thresholds
 
+        dino_map = outputs.get("dino0")
         detections = []
         for original_index in torch.nonzero(keepers, as_tuple=False).flatten().tolist():
             obb = obb_pr_w[original_index]
@@ -636,6 +642,22 @@ class InferenceRuntime:
             size = obb.bb3_diagonal.detach().cpu().numpy().reshape(-1)
             yaw = obb.T_world_object.to_euler().detach().cpu().numpy().reshape(-1)[2]
             bb = bb2d[original_index].detach().cpu().numpy().reshape(-1)
+            descriptor = []
+            if dino_map is not None:
+                feature = dino_map[0]
+                feature_height, feature_width = feature.shape[-2:]
+                input_height, input_width = img_tensor.shape[-2:]
+                x0 = max(0, min(feature_width - 1, int(torch.floor(
+                    bb2d[original_index, 0] * feature_width / input_width).item())))
+                x1 = max(x0 + 1, min(feature_width, int(torch.ceil(
+                    bb2d[original_index, 1] * feature_width / input_width).item())))
+                y0 = max(0, min(feature_height - 1, int(torch.floor(
+                    bb2d[original_index, 2] * feature_height / input_height).item())))
+                y1 = max(y0 + 1, min(feature_height, int(torch.ceil(
+                    bb2d[original_index, 3] * feature_height / input_height).item())))
+                pooled = feature[:, y0:y1, x0:x1].float().mean(dim=(1, 2))
+                pooled = self.F.normalize(pooled, dim=0)
+                descriptor = pooled.detach().cpu().tolist()
             detections.append(
                 {
                     "center_world": [
@@ -659,6 +681,8 @@ class InferenceRuntime:
                     ],
                     "semantic_id": label_int,
                     "label": labels2d[original_index],
+                    "appearance_model_id": "boxernet_dinov3_roi_mean_v1",
+                    "appearance_descriptor": descriptor,
                 }
             )
 
@@ -1024,7 +1048,10 @@ class InferenceRuntime:
 
         def run_forward():
             out = self._encode_with_patch_depth(inputs)
-            return self.boxernet.query(inputs, out)
+            query_out = self.boxernet.query(inputs, out)
+            if isinstance(query_out, dict):
+                query_out.setdefault("dino0", out["dino0"])
+            return query_out
 
         if self.device == "cuda":
             if self.precision == "bfloat16" or (

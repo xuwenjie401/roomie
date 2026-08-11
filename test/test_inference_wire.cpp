@@ -132,12 +132,14 @@ TEST(InferenceWireV2, ResponseRoundTripPreservesProvenanceAndDetections) {
   detection_3d.box_xyxy = {4.0f, 5.0f, 60.0f, 70.0f};
   detection_3d.semantic_id = 23;
   detection_3d.label = "chair";
+  detection_3d.appearance_model_id = "dino-shadow-v1";
+  detection_3d.appearance_descriptor = {0.6f, 0.8f};
   expected.detections.push_back(detection_3d);
 
   std::vector<std::uint8_t> body;
   std::string error;
   ASSERT_TRUE(inference_wire::encodeResponse(expected, &body, &error)) << error;
-  EXPECT_EQ(std::string(body.begin(), body.begin() + 5), "RIRS2");
+  EXPECT_EQ(std::string(body.begin(), body.begin() + 5), "RIRS3");
 
   InferenceResponse actual;
   ASSERT_TRUE(inference_wire::decodeResponse(body, &actual, &error)) << error;
@@ -152,6 +154,10 @@ TEST(InferenceWireV2, ResponseRoundTripPreservesProvenanceAndDetections) {
   EXPECT_EQ(actual.detections.front().label, detection_3d.label);
   EXPECT_EQ(actual.detections.front().center_world, detection_3d.center_world);
   EXPECT_EQ(actual.detections.front().score_3d, detection_3d.score_3d);
+  EXPECT_EQ(actual.detections.front().appearance_model_id,
+            detection_3d.appearance_model_id);
+  EXPECT_EQ(actual.detections.front().appearance_descriptor,
+            detection_3d.appearance_descriptor);
 }
 
 TEST(InferenceWireV2, RejectsBadMagicAndTruncatedBodies) {
