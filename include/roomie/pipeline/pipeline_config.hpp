@@ -155,6 +155,8 @@ struct PipelineConfig {
   std::string scene_graph_load_path;
   bool scene_store_enabled = true;
   std::string scene_store_path = "/tmp/roomie_scene.sqlite3";
+  bool ephemeral_run = false;
+  std::string ephemeral_workspace_root = "/tmp/roomie_ephemeral";
   int scene_store_flush_period_ms = 1000;
   std::size_t scene_store_flush_batch_size = 16;
   std::size_t scene_store_queue_size = 64;

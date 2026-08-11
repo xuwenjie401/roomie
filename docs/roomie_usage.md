@@ -349,6 +349,28 @@ sqlite3 /home/lindenbot/Datasets/output/roomie_agibot_head/roomie_scene.sqlite3 
   'select checkpoint_id, checkpoint_path, aligned_scene_revision from map_checkpoint_manifest order by checkpoint_id;'
 ```
 
+### 6.1 一次无痕运行
+
+需要从同一份 coordinated checkpoint 反复测试在线更新、同时不改写初始
+map/scene/assets 基线时，使用：
+
+```bash
+ros2 launch roomie roomie_agibot_live_with_qa.launch.py \
+  pipeline_config:=/home/lindenbot/RealityLab/jarvis/install/roomie/share/roomie/config/pipeline_genie_ephemeral.yaml \
+  enable_boxer:=true
+```
+
+该配置保持 TSDF、Boxer、instance、snapshot、DAM、embedding 和 QA 在线运行。
+启动时会把 SceneStore 一致性复制到 `/tmp/roomie_ephemeral` 下的唯一工作区，
+并为已有 snapshot assets 建立只读叠加；本次产生的 scene revision、任务、图片、
+DSG 导出全部写入该工作区。初始 NVBlox checkpoint 只读加载，退出时不保存新地图。
+正常退出后临时工作区自动删除，`logging.root_dir` 下的诊断日志仍会保留。
+
+无痕模式只支持 `tsdf.map_load_mode: coordinated`，且要求基线 SceneStore 中存在
+有效 map manifest。临时工作区准备失败时 pipeline 会拒绝启动，不会退回原路径写入。
+`SIGKILL` 或掉电可能留下临时目录，但不会修改基线；确认没有运行中的 Roomie 后可
+手动清理相应的 `roomie_ephemeral_*` 目录。
+
 ## 7. 运行状态检查
 
 ```bash

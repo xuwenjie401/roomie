@@ -83,6 +83,7 @@ add_library(
   src/artifacts/snapshot_bank.cpp
   src/cpu_point_map_backend.cpp
   src/detection_bridge_thread.cpp
+  src/ephemeral_run_workspace.cpp
   src/dsg/object_graph.cpp
   src/dsg/object_graph_io.cpp
   src/dsg/object_snapshot_remaker.cpp
@@ -304,6 +305,9 @@ if(BUILD_TESTING)
   target_link_libraries(test_scene_store roomie_pipeline)
   ament_add_gtest(test_persistence_actor test/test_persistence_actor.cpp)
   target_link_libraries(test_persistence_actor roomie_pipeline)
+  ament_add_gtest(test_ephemeral_run_workspace
+                  test/test_ephemeral_run_workspace.cpp)
+  target_link_libraries(test_ephemeral_run_workspace roomie_pipeline)
   ament_add_gtest(test_object_snapshots test/test_object_snapshots.cpp)
   target_link_libraries(test_object_snapshots roomie_pipeline)
   ament_add_gtest(test_runtime_bounds test/test_runtime_bounds.cpp)

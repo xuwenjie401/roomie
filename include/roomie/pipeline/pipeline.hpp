@@ -17,6 +17,7 @@
 #include "roomie/artifacts/online_snapshot_worker.hpp"
 #include "roomie/artifacts/semantic_index.hpp"
 #include "roomie/pipeline/detection_bridge_thread.hpp"
+#include "roomie/pipeline/ephemeral_run_workspace.hpp"
 #include "roomie/pipeline/instance_map_thread.hpp"
 #include "roomie/pipeline/map_thread.hpp"
 #include "roomie/pipeline/pipeline_config.hpp"
@@ -77,10 +78,17 @@ class RoomiePipeline {
       std::chrono::milliseconds timeout);
 
  private:
+  RoomiePipeline(
+      rclcpp::Node& node,
+      PreparedPipelineRuntime prepared,
+      RoomiePipelineRuntimeDependencies runtime_dependencies);
+
   void scheduleMissingEmbeddingJobs(std::vector<EmbeddingJob> jobs,
                                     const SceneSnapshot& snapshot);
 
   PipelineConfig config_;
+  // Must precede every consumer of rewritten paths so it is destroyed last.
+  std::shared_ptr<EphemeralRunWorkspace> ephemeral_workspace_;
   std::shared_ptr<RunLogger> run_logger_;
   ThreadSafeQueue<FrameBundlePtr> mapping_queue_;
   ThreadSafeQueue<FrameBundlePtr> detection_queue_;

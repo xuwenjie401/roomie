@@ -501,7 +501,16 @@ RoomiePipeline::RoomiePipeline(
     rclcpp::Node& node,
     PipelineConfig config,
     RoomiePipelineRuntimeDependencies runtime_dependencies)
-    : config_(std::move(config)),
+    : RoomiePipeline(node,
+                     preparePipelineRuntime(std::move(config)),
+                     std::move(runtime_dependencies)) {}
+
+RoomiePipeline::RoomiePipeline(
+    rclcpp::Node& node,
+    PreparedPipelineRuntime prepared,
+    RoomiePipelineRuntimeDependencies runtime_dependencies)
+    : config_(std::move(prepared.config)),
+      ephemeral_workspace_(std::move(prepared.ephemeral_workspace)),
       run_logger_(std::make_shared<RunLogger>(config_)),
       mapping_queue_(config_.mapping_queue_size, ChannelPolicy::kDropOldest),
       detection_queue_(
@@ -594,6 +603,14 @@ RoomiePipeline::RoomiePipeline(
                          " camera_id=" + config_.mapping_camera_id +
                          " debug_image=" + config_.detection_debug_image_topic +
                          " raw_detections=" + config_.raw_detections_topic);
+    if (ephemeral_workspace_) {
+      run_logger_->log(
+          "ephemeral_run",
+          "enabled baseline_scene_store=" +
+              ephemeral_workspace_->baselineSceneStorePath().string() +
+              " workspace=" + ephemeral_workspace_->path().string() +
+              " save_map=false cleanup=automatic");
+    }
   }
 
   bool restored_from_scene_store = false;

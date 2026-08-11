@@ -508,6 +508,11 @@ PipelineConfig PipelineConfig::declareAndLoad(rclcpp::Node& node) {
       "persistence.scene_store_enabled", config.scene_store_enabled);
   config.scene_store_path = node.declare_parameter<std::string>(
       "persistence.scene_store_path", config.scene_store_path);
+  config.ephemeral_run = node.declare_parameter<bool>(
+      "persistence.ephemeral_run", config.ephemeral_run);
+  config.ephemeral_workspace_root = node.declare_parameter<std::string>(
+      "persistence.ephemeral_workspace_root",
+      config.ephemeral_workspace_root);
   config.scene_store_flush_period_ms = positiveIntOrDefault(
       node.declare_parameter<int>("persistence.scene_store_flush_period_ms",
                                   config.scene_store_flush_period_ms),
