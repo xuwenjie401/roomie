@@ -554,6 +554,7 @@ void RosIoThread::enqueueBundles(FrameBundlePtr mapping_bundle,
     return;
   }
   const bool requires_current_map =
+      detection_bundle->perception_candidate &&
       detection_bundle->provenance.map_mode == MapMode::kOnline;
   if (requires_current_map && !map_admitted) {
     RunLogger::logGlobal(
@@ -614,6 +615,8 @@ void RosIoThread::handleRgb(const std::string& camera_id,
 
 void RosIoThread::handleDepth(const std::string& camera_id,
                               const sensor_msgs::msg::Image::SharedPtr msg) {
+  FrameBundlePtr mapping_bundle;
+  FrameBundlePtr detection_bundle;
   {
     std::lock_guard<std::mutex> lock(mutex_);
     auto& state = camera_states_[camera_id];
@@ -643,11 +646,23 @@ void RosIoThread::handleDepth(const std::string& camera_id,
       maybeLogStatusLocked();
       return;
     }
-    state.latest_depth_time_ns = toNanoseconds(msg->header.stamp);
-    state.latest_depth =
+    const TimeNanoseconds depth_time_ns = toNanoseconds(msg->header.stamp);
+    auto immutable_depth =
         std::make_shared<const DepthBuffer>(std::move(*depth));
+    state.latest_depth_time_ns = depth_time_ns;
+    state.latest_depth = immutable_depth;
+    state.buffered_depth_frames[depth_time_ns] = std::move(immutable_depth);
+    pruneBufferedFramesLocked(&state);
+    const std::optional<TimeNanoseconds> rgb_time_ns =
+        closestBufferedRgbTimeLocked(state, depth_time_ns);
+    if (rgb_time_ns) {
+      auto bundles = makeFrameBundlesLocked(camera_id, *rgb_time_ns);
+      mapping_bundle = std::move(bundles.first);
+      detection_bundle = std::move(bundles.second);
+    }
     maybeLogStatusLocked();
   }
+  enqueueBundles(std::move(mapping_bundle), std::move(detection_bundle));
   tryAssembleCamera(camera_id);
 }
 
@@ -744,6 +759,11 @@ void RosIoThread::tryAssembleCamera(const std::string& camera_id) {
     std::uint64_t rgb_revision = 0;
     std::shared_ptr<RobotMaskGenerator> generator;
     std::shared_ptr<tf2::BufferCore> tf_buffer;
+    std::shared_ptr<const ImageBuffer> rgb_for_mask;
+    std::optional<CameraIntrinsics> intrinsics_for_mask;
+    std::chrono::steady_clock::time_point rgb_ingest_time =
+        std::chrono::steady_clock::time_point::min();
+    std::uint64_t calibration_revision = 0;
     FrameBundlePtr ready_mapping_bundle;
     FrameBundlePtr ready_detection_bundle;
     bool mask_was_already_ready = false;
@@ -776,6 +796,10 @@ void RosIoThread::tryAssembleCamera(const std::string& camera_id) {
         state.mask_generation_in_flight_rgb_revision = rgb_revision;
         generator = config_.robot_mask_generator;
         tf_buffer = tf_buffer_;
+        rgb_for_mask = state.latest_rgb;
+        intrinsics_for_mask = state.latest_intrinsics;
+        rgb_ingest_time = state.latest_rgb_ingest_time;
+        calibration_revision = state.calibration_revision;
       }
     }
     if (mask_was_already_ready) {
@@ -894,20 +918,36 @@ void RosIoThread::tryAssembleCamera(const std::string& camera_id) {
       }
       newer_rgb_waiting = state.latest_rgb_time_ns != image_time_ns ||
                           state.rgb_revision != rgb_revision;
+      state.last_mask_error.clear();
+      const std::shared_ptr<const ImageBuffer> generated_mask = result.mask;
       if (!newer_rgb_waiting) {
-        state.last_mask_error.clear();
-        state.latest_robot_mask = std::move(result.mask);
+        state.latest_robot_mask = generated_mask;
         state.latest_robot_mask_time_ns = image_time_ns;
-        state.last_mask_pixels = result.mask_pixels;
-        if (result.reused) {
-          ++state.masks_reused;
-        } else {
-          ++state.masks_rendered;
-          state.last_mask_render_ms = result.render_ms;
+      }
+      state.last_mask_pixels = result.mask_pixels;
+      if (result.reused) {
+        ++state.masks_reused;
+      } else {
+        ++state.masks_rendered;
+        state.last_mask_render_ms = result.render_ms;
+      }
+      if (result.full_mask) {
+        ++state.full_masks;
+      }
+      if (rgb_for_mask && generated_mask && intrinsics_for_mask) {
+        BufferedRgbFrame buffered;
+        buffered.rgb = std::move(rgb_for_mask);
+        buffered.robot_mask = generated_mask;
+        buffered.intrinsics = *intrinsics_for_mask;
+        buffered.ingest_time = rgb_ingest_time;
+        buffered.calibration_revision = calibration_revision;
+        auto existing = state.buffered_rgb_frames.find(image_time_ns);
+        if (existing != state.buffered_rgb_frames.end()) {
+          buffered.mapping_consumed = existing->second.mapping_consumed;
+          buffered.detection_consumed = existing->second.detection_consumed;
         }
-        if (result.full_mask) {
-          ++state.full_masks;
-        }
+        state.buffered_rgb_frames[image_time_ns] = std::move(buffered);
+        pruneBufferedFramesLocked(&state);
         auto bundles = makeFrameBundlesLocked(camera_id, image_time_ns);
         mapping_bundle = std::move(bundles.first);
         detection_bundle = std::move(bundles.second);
@@ -994,6 +1034,47 @@ std::optional<Eigen::Isometry3f> RosIoThread::lookupTWorldFrameLocked(
   return std::nullopt;
 }
 
+std::optional<TimeNanoseconds> RosIoThread::closestBufferedRgbTimeLocked(
+    const CameraState& state, TimeNanoseconds depth_time_ns) const {
+  if (!state.config.enable_mapping || depth_time_ns == 0) {
+    return std::nullopt;
+  }
+  const TimeNanoseconds max_delta_ns =
+      secondsToNanoseconds(config_.max_image_stamp_delta_sec);
+  std::optional<TimeNanoseconds> best_time_ns;
+  TimeNanoseconds best_delta_ns = std::numeric_limits<TimeNanoseconds>::max();
+  for (const auto& [rgb_time_ns, rgb_frame] : state.buffered_rgb_frames) {
+    if (rgb_frame.mapping_consumed || rgb_time_ns == 0) {
+      continue;
+    }
+    const TimeNanoseconds delta_ns = absoluteDelta(rgb_time_ns, depth_time_ns);
+    const bool within_tolerance =
+        delta_ns == 0 || (max_delta_ns > 0 && delta_ns <= max_delta_ns);
+    if (within_tolerance && delta_ns < best_delta_ns) {
+      best_time_ns = rgb_time_ns;
+      best_delta_ns = delta_ns;
+    }
+  }
+  return best_time_ns;
+}
+
+void RosIoThread::pruneBufferedFramesLocked(CameraState* state) {
+  if (state == nullptr) {
+    return;
+  }
+  const std::size_t limit =
+      std::max<std::size_t>(2, config_.input_queue_size);
+  while (state->buffered_rgb_frames.size() > limit) {
+    const TimeNanoseconds expired_time_ns =
+        state->buffered_rgb_frames.begin()->first;
+    state->logical_frames.erase(expired_time_ns);
+    state->buffered_rgb_frames.erase(state->buffered_rgb_frames.begin());
+  }
+  while (state->buffered_depth_frames.size() > limit) {
+    state->buffered_depth_frames.erase(state->buffered_depth_frames.begin());
+  }
+}
+
 std::pair<FrameBundlePtr, FrameBundlePtr> RosIoThread::makeFrameBundlesLocked(
     const std::string& camera_id, TimeNanoseconds time_ns) {
   auto it = camera_states_.find(camera_id);
@@ -1005,45 +1086,54 @@ std::pair<FrameBundlePtr, FrameBundlePtr> RosIoThread::makeFrameBundlesLocked(
   if (time_ns == 0) {
     return {};
   }
+  auto rgb_it = state.buffered_rgb_frames.find(time_ns);
+  if (rgb_it == state.buffered_rgb_frames.end()) {
+    return {};
+  }
+  BufferedRgbFrame& rgb_frame = rgb_it->second;
   const bool mapping_pending =
-      state.config.enable_mapping && state.last_emitted_mapping_time_ns != time_ns;
+      state.config.enable_mapping && !rgb_frame.mapping_consumed;
   bool detection_pending =
-      state.config.enable_detection && state.last_emitted_detection_time_ns != time_ns;
+      state.config.enable_detection && !rgb_frame.detection_consumed;
   if (!mapping_pending && !detection_pending) {
     return {};
   }
-  if (!state.latest_rgb || !state.latest_robot_mask || !state.latest_intrinsics ||
+  if (!rgb_frame.rgb || !rgb_frame.robot_mask ||
       state.config.camera_frame.empty()) {
     return {};
   }
-  if (state.latest_rgb_time_ns != time_ns ||
-      state.latest_robot_mask_time_ns != time_ns ||
-      state.latest_robot_mask->width != state.latest_rgb->width ||
-      state.latest_robot_mask->height != state.latest_rgb->height ||
-      state.latest_robot_mask->channels != 1) {
+  if (rgb_frame.robot_mask->width != rgb_frame.rgb->width ||
+      rgb_frame.robot_mask->height != rgb_frame.rgb->height ||
+      rgb_frame.robot_mask->channels != 1) {
     return {};
   }
 
   const TimeNanoseconds max_image_delta_ns =
       secondsToNanoseconds(config_.max_image_stamp_delta_sec);
-  const bool depth_ready =
-      state.latest_depth &&
-      state.latest_depth->width == state.latest_rgb->width &&
-      state.latest_depth->height == state.latest_rgb->height &&
-      stampCloseEnough(time_ns, state.latest_depth_time_ns, max_image_delta_ns);
-  if (mapping_pending && !depth_ready) {
-    // Online perception must be assembled from the exact same immutable
-    // bundle that enters mapping. Wait for the matching depth instead of
-    // emitting an RGB-only detection copy with a misleading shared frame id.
-    if (detection_pending && config_.map_mode == MapMode::kOnline) {
-      return {};
-    }
-    if (!detection_pending) {
-      return {};
+  auto matched_depth_it = state.buffered_depth_frames.end();
+  TimeNanoseconds matched_depth_delta_ns =
+      std::numeric_limits<TimeNanoseconds>::max();
+  if (mapping_pending) {
+    for (auto candidate = state.buffered_depth_frames.begin();
+         candidate != state.buffered_depth_frames.end(); ++candidate) {
+      const auto& depth = candidate->second;
+      if (!depth || depth->width != rgb_frame.rgb->width ||
+          depth->height != rgb_frame.rgb->height) {
+        continue;
+      }
+      const TimeNanoseconds delta_ns = absoluteDelta(time_ns, candidate->first);
+      const bool within_tolerance =
+          delta_ns == 0 ||
+          (max_image_delta_ns > 0 && delta_ns <= max_image_delta_ns);
+      if (within_tolerance && delta_ns < matched_depth_delta_ns) {
+        matched_depth_it = candidate;
+        matched_depth_delta_ns = delta_ns;
+      }
     }
   }
+  const bool depth_ready = matched_depth_it != state.buffered_depth_frames.end();
 
-  bool perception_candidate = false;
+  bool detection_admitted = false;
   std::chrono::steady_clock::time_point candidate_admission_time =
       std::chrono::steady_clock::time_point::min();
   if (detection_pending) {
@@ -1057,13 +1147,8 @@ std::pair<FrameBundlePtr, FrameBundlePtr> RosIoThread::makeFrameBundlesLocked(
     }
     if (!admission_allowed) {
       state.last_emitted_detection_time_ns = time_ns;
+      rgb_frame.detection_consumed = true;
       ++perception_backpressure_skips_;
-      detection_pending = false;
-    } else if (config_.map_mode == MapMode::kOnline && !mapping_pending) {
-      // An online detection without corresponding mapping work cannot satisfy
-      // the include-current contract.
-      state.last_emitted_detection_time_ns = time_ns;
-      ++perception_rate_skips_;
       detection_pending = false;
     } else {
       const auto now = std::chrono::steady_clock::now();
@@ -1075,15 +1160,21 @@ std::pair<FrameBundlePtr, FrameBundlePtr> RosIoThread::makeFrameBundlesLocked(
               std::chrono::steady_clock::time_point::min() &&
           now - state.last_perception_admission_time < min_period) {
         state.last_emitted_detection_time_ns = time_ns;
+        rgb_frame.detection_consumed = true;
         ++perception_rate_skips_;
         detection_pending = false;
       } else {
         candidate_admission_time = now;
-        perception_candidate = true;
+        detection_admitted = true;
       }
     }
   }
-  if (!mapping_pending && !detection_pending) {
+  if ((!mapping_pending || !depth_ready) && !detection_admitted) {
+    if ((!state.config.enable_mapping || rgb_frame.mapping_consumed) &&
+        (!state.config.enable_detection || rgb_frame.detection_consumed)) {
+      state.logical_frames.erase(time_ns);
+      state.buffered_rgb_frames.erase(rgb_it);
+    }
     return {};
   }
 
@@ -1096,50 +1187,57 @@ std::pair<FrameBundlePtr, FrameBundlePtr> RosIoThread::makeFrameBundlesLocked(
 
   std::chrono::steady_clock::time_point ingest_time;
   const FrameProvenance provenance =
-      frameProvenanceLocked(&state, time_ns, &ingest_time);
-
-  auto mutable_bundle = std::make_shared<FrameBundle>();
-  mutable_bundle->provenance = provenance;
-  mutable_bundle->ingest_time = ingest_time;
-  mutable_bundle->due_time =
-      ingest_time + std::chrono::milliseconds(config_.perception_deadline_ms);
-  mutable_bundle->camera_id = camera_id;
-  mutable_bundle->rgb = state.latest_rgb;
-  mutable_bundle->robot_mask = state.latest_robot_mask;
-  mutable_bundle->depth = depth_ready ? state.latest_depth : nullptr;
-  mutable_bundle->intrinsics = *state.latest_intrinsics;
-  mutable_bundle->T_world_camera = *state.latest_T_world_camera;
-  mutable_bundle->calibration_revision = state.calibration_revision;
-  mutable_bundle->sync.rgb_depth_delta_ns =
-      depth_ready ? absoluteDelta(time_ns, state.latest_depth_time_ns) : 0;
-  mutable_bundle->sync.tf_delta_ns =
-      absoluteDelta(time_ns, state.latest_pose_time_ns);
-  mutable_bundle->perception_candidate = perception_candidate;
-  FrameBundlePtr bundle = std::move(mutable_bundle);
+      frameProvenanceLocked(&state, time_ns, rgb_frame.ingest_time,
+                            &ingest_time);
+  const auto make_bundle = [&](std::shared_ptr<const DepthBuffer> depth,
+                               TimeNanoseconds rgb_depth_delta_ns) {
+    auto mutable_bundle = std::make_shared<FrameBundle>();
+    mutable_bundle->provenance = provenance;
+    mutable_bundle->ingest_time = ingest_time;
+    mutable_bundle->due_time =
+        ingest_time + std::chrono::milliseconds(config_.perception_deadline_ms);
+    mutable_bundle->camera_id = camera_id;
+    mutable_bundle->rgb = rgb_frame.rgb;
+    mutable_bundle->robot_mask = rgb_frame.robot_mask;
+    mutable_bundle->depth = std::move(depth);
+    mutable_bundle->intrinsics = rgb_frame.intrinsics;
+    mutable_bundle->T_world_camera = *state.latest_T_world_camera;
+    mutable_bundle->calibration_revision = rgb_frame.calibration_revision;
+    mutable_bundle->sync.rgb_depth_delta_ns = rgb_depth_delta_ns;
+    mutable_bundle->sync.tf_delta_ns =
+        absoluteDelta(time_ns, state.latest_pose_time_ns);
+    // Independent detections project the latest committed map and therefore do
+    // not reserve an exact include-current map commit barrier.
+    mutable_bundle->perception_candidate = false;
+    return FrameBundlePtr(std::move(mutable_bundle));
+  };
 
   FrameBundlePtr detection_bundle;
-  if (detection_pending) {
-    detection_bundle = bundle;
-    if (perception_candidate) {
-      state.last_perception_admission_time = candidate_admission_time;
-    }
+  if (detection_admitted) {
+    detection_bundle = make_bundle(nullptr, 0);
+    state.last_perception_admission_time = candidate_admission_time;
     state.last_emitted_detection_time_ns = time_ns;
+    rgb_frame.detection_consumed = true;
     ++detection_frames_emitted_;
   }
 
   FrameBundlePtr mapping_bundle;
   if (mapping_pending && depth_ready) {
-    mapping_bundle = bundle;
+    mapping_bundle =
+        make_bundle(matched_depth_it->second, matched_depth_delta_ns);
     state.last_emitted_mapping_time_ns = time_ns;
+    rgb_frame.mapping_consumed = true;
+    state.buffered_depth_frames.erase(matched_depth_it);
     ++mapping_frames_emitted_;
   }
 
   const bool mapping_done = !state.config.enable_mapping ||
-                            state.last_emitted_mapping_time_ns == time_ns;
+                            rgb_frame.mapping_consumed;
   const bool detection_done = !state.config.enable_detection ||
-                              state.last_emitted_detection_time_ns == time_ns;
+                              rgb_frame.detection_consumed;
   if (mapping_done && detection_done) {
     state.logical_frames.erase(time_ns);
+    state.buffered_rgb_frames.erase(rgb_it);
   }
   return {std::move(mapping_bundle), std::move(detection_bundle)};
 }
@@ -1147,6 +1245,7 @@ std::pair<FrameBundlePtr, FrameBundlePtr> RosIoThread::makeFrameBundlesLocked(
 FrameProvenance RosIoThread::frameProvenanceLocked(
     CameraState* state,
     TimeNanoseconds time_ns,
+    std::chrono::steady_clock::time_point observed_ingest_time,
     std::chrono::steady_clock::time_point* ingest_time) {
   auto [identity_it, inserted] = state->logical_frames.try_emplace(time_ns);
   LogicalFrameIdentity& identity = identity_it->second;
@@ -1157,10 +1256,8 @@ FrameProvenance RosIoThread::frameProvenanceLocked(
     }
     identity.frame_id = frame_id;
     identity.ingest_time =
-        state->latest_rgb_time_ns == time_ns &&
-                state->latest_rgb_ingest_time !=
-                    std::chrono::steady_clock::time_point::min()
-            ? state->latest_rgb_ingest_time
+        observed_ingest_time != std::chrono::steady_clock::time_point::min()
+            ? observed_ingest_time
             : std::chrono::steady_clock::now();
   }
 
@@ -1210,6 +1307,8 @@ void RosIoThread::maybeLogStatusLocked() {
   for (const auto& [camera_id, state] : camera_states_) {
     stream << " camera[" << camera_id << "]={rendered="
            << state.masks_rendered << ",reused=" << state.masks_reused
+           << ",buffered_rgb=" << state.buffered_rgb_frames.size()
+           << ",buffered_depth=" << state.buffered_depth_frames.size()
            << ",tf_waits=" << state.mask_tf_waits
            << ",failures=" << state.mask_generation_failures
            << ",geometry_rejections=" << state.mask_geometry_rejections

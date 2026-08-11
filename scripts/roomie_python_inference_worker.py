@@ -400,6 +400,18 @@ def choose_device(device_arg: str, torch_module) -> str:
     return "cpu"
 
 
+def environment_flag(name: str, default: bool = False) -> bool:
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    return value.strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
+
 class InferenceRuntime:
     def __init__(self, args: argparse.Namespace):
         boxer_repo = os.path.abspath(os.path.expanduser(args.boxer_repo))
@@ -441,6 +453,16 @@ class InferenceRuntime:
 
         self.device = choose_device(args.device, torch)
         self.precision = args.precision
+        # These paths are the CUDA defaults. Set either environment variable
+        # to 0 for a controlled fallback/A-B run.
+        self.single_gpu_upload = self.device == "cuda" and environment_flag(
+            "ROOMIE_SINGLE_GPU_UPLOAD",
+            default=True,
+        )
+        self.gpu_nms = self.device == "cuda" and environment_flag(
+            "ROOMIE_GPU_NMS",
+            default=True,
+        )
         confidence_thresholds = load_label_confidence_thresholds(
             args.label_thresholds_file,
             {
@@ -480,7 +502,23 @@ class InferenceRuntime:
             warmup=True,
             nms_iou_threshold=float(args.owl_nms_iou_threshold),
         )
+        if self.single_gpu_upload and self.device == "cuda":
+            # OwlWrapper otherwise copies these small normalization tensors to
+            # CUDA on every request.  Keeping them resident also makes its
+            # preprocessing consume the same resident image tensor as Boxer.
+            self.owl.image_mean = self.owl.image_mean.to(self.device)
+            self.owl.image_std = self.owl.image_std.to(self.device)
+        if self.gpu_nms:
+            from torchvision.ops import batched_nms
+
+            self._batched_nms = batched_nms
         self.boxernet = BoxerNet.load_from_checkpoint(args.ckpt, device=self.device)
+        print(
+            "roomie inference optimization flags "
+            f"single_gpu_upload={self.single_gpu_upload} "
+            f"gpu_nms={self.gpu_nms}",
+            flush=True,
+        )
 
     def process(self, request: dict) -> dict:
         torch = self.torch
@@ -496,16 +534,28 @@ class InferenceRuntime:
             return response
 
         img_tensor = torch.from_numpy(rgb_np).permute(2, 0, 1).float()[None] / 255.0
-        img_torch_255 = img_tensor * 255.0
+        if self.single_gpu_upload and self.device == "cuda":
+            # This is the only host-to-device image transfer. OWL performs its
+            # resize/normalization from this resident image and Boxer reuses it.
+            img_tensor = img_tensor.to(self.device)
+        if self.single_gpu_upload and self.device == "cuda":
+            self._sync_if_cuda()
         response["timings_ms"]["preprocess"] = (time.perf_counter() - t_pre) * 1000.0
 
         self._sync_if_cuda()
         t0 = time.perf_counter()
-        bb2d, scores2d, label_ints, _ = self.owl.forward(
-            img_torch_255,
-            False,
-            resize_to_HW=(rgb_np.shape[0], rgb_np.shape[1]),
-        )
+        if self.gpu_nms:
+            bb2d, scores2d, label_ints, _ = self._owl_forward_gpu_nms(
+                img_tensor,
+                False,
+            )
+        else:
+            img_torch_255 = img_tensor * 255.0
+            bb2d, scores2d, label_ints, _ = self.owl.forward(
+                img_torch_255,
+                False,
+                resize_to_HW=(rgb_np.shape[0], rgb_np.shape[1]),
+            )
         self._sync_if_cuda()
         t_owl_ms = (time.perf_counter() - t0) * 1000.0
         response["timings_ms"]["owl"] = t_owl_ms
@@ -647,6 +697,112 @@ class InferenceRuntime:
             )
         return out
 
+    def _owl_forward_gpu_nms(self, image_torch, rotated=False):
+        """Run OWLv2 from a [0, 1] image and retain candidates on CUDA for NMS."""
+        torch = self.torch
+        if image_torch.ndim != 4 or image_torch.shape[0] != 1:
+            raise ValueError("OWL input must have shape 1xCxHxW")
+        with torch.no_grad():
+            input_image = image_torch
+            if rotated:
+                input_image = torch.rot90(input_image, k=3, dims=(2, 3))
+            height, width = input_image.shape[2:]
+
+            pixel_values = input_image
+            if pixel_values.shape[2:] != self.owl.native_size:
+                interp_mode = "bilinear" if self.device == "mps" else "bicubic"
+                pixel_values = self.F.interpolate(
+                    pixel_values,
+                    size=self.owl.native_size,
+                    mode=interp_mode,
+                    align_corners=False,
+                )
+            else:
+                # The protocol tensor originates from an HWC NumPy image and
+                # therefore arrives with channels-last strides. The legacy
+                # interpolate produced contiguous NCHW; preserve that layout
+                # so the compiled OWL convolution selects the same kernels and
+                # produces identical results.
+                pixel_values = pixel_values.contiguous()
+            mean = self.owl.image_mean.to(pixel_values.device)
+            std = self.owl.image_std.to(pixel_values.device)
+            pixel_values = (pixel_values - mean) / std
+            pixel_values = pixel_values.to(self.device)
+            if self.owl.use_bfloat16:
+                pixel_values = pixel_values.to(dtype=torch.bfloat16)
+
+            logits, pred_boxes = self.owl.vision_detector(
+                pixel_values,
+                self.owl.text_embeddings,
+                self.owl.query_mask,
+            )
+            logits = logits.float()
+            pred_boxes = pred_boxes.float()
+            scores_all, labels_all = torch.max(logits[0], dim=-1)
+            scores_all = torch.sigmoid(scores_all)
+
+            keep = scores_all > self.owl.min_confidence
+            scores = scores_all[keep]
+            labels = labels_all[keep]
+            boxes_cxcywh = pred_boxes[0, keep]
+            empty_return = (
+                torch.zeros((0, 4)),
+                torch.zeros(0),
+                torch.zeros(0),
+                None,
+            )
+            if boxes_cxcywh.shape[0] == 0:
+                return empty_return
+
+            cx, cy, box_width, box_height = boxes_cxcywh.unbind(-1)
+            x1 = (cx - box_width / 2) * width
+            y1 = (cy - box_height / 2) * height
+            x2 = (cx + box_width / 2) * width
+            y2 = (cy + box_height / 2) * height
+            boxes = torch.stack([x1, y1, x2, y2], dim=-1)
+
+            too_big = (x2 - x1 > 0.9 * width) | (y2 - y1 > 0.9 * height)
+            too_small = (x2 - x1 < 0.05 * width) | (y2 - y1 < 0.05 * height)
+            keep = ~(too_big | too_small)
+            boxes = boxes[keep]
+            scores = scores[keep]
+            labels = labels[keep]
+            if boxes.shape[0] == 0:
+                return empty_return
+
+            if self.owl.nms_iou_threshold < 1.0:
+                keep = self._batched_nms(
+                    boxes,
+                    scores,
+                    labels,
+                    self.owl.nms_iou_threshold,
+                )
+                # The legacy per-class implementation returns surviving
+                # candidates in original patch order, not score order.
+                keep = torch.sort(keep).values
+                boxes = boxes[keep]
+                scores = scores[keep]
+                labels = labels[keep]
+            if boxes.shape[0] == 0:
+                return empty_return
+
+            boxes = boxes[:, [0, 2, 1, 3]]
+            if rotated:
+                x1, x2, y1, y2 = (
+                    boxes[:, 0],
+                    boxes[:, 1],
+                    boxes[:, 2],
+                    boxes[:, 3],
+                )
+                boxes = torch.stack(
+                    [y1, y2, width - x2, width - x1],
+                    dim=-1,
+                )
+
+            # Downstream robot-mask filtering is CPU/NumPy.  Transfer only the
+            # final compact result after GPU filtering and NMS.
+            return boxes.cpu(), scores.cpu(), labels.cpu(), None
+
     def _image_to_numpy(self, image: dict, require_rgb: bool):
         np = self.np
         width = int(image["width"])
@@ -758,7 +914,29 @@ class InferenceRuntime:
     def _prepare_inputs_with_patch_depth(self, datum: dict):
         torch = self.torch
         inputs = {}
-        inputs.update(self.boxernet.process_camera(datum))
+        if self.single_gpu_upload and datum["img0"].device.type == "cuda":
+            # Avoid BoxerNet.process_camera's img.max() assertion: on a CUDA
+            # image it introduces a device-wide scalar synchronization.  The
+            # protocol conversion above already guarantees the [0, 1] range.
+            img = datum["img0"]
+            if img.ndim == 3:
+                img = img.unsqueeze(0)
+            cam_data = datum["cam0"]._data
+            pose_data = datum["T_world_rig0"]._data
+            if cam_data.ndim == 1:
+                cam_data = cam_data.unsqueeze(0)
+            if pose_data.ndim == 1:
+                pose_data = pose_data.unsqueeze(0)
+            inputs.update(
+                {
+                    "img0": img,
+                    "cam0": self.CameraTW(cam_data),
+                    "T_world_rig0": self.PoseTW(pose_data),
+                    "rotated0": datum["rotated0"],
+                }
+            )
+        else:
+            inputs.update(self.boxernet.process_camera(datum))
         bb2d = datum["bb2d"]
         if bb2d.ndim == 2:
             bb2d = bb2d.unsqueeze(0)

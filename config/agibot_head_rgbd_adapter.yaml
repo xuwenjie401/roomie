@@ -14,6 +14,9 @@ roomie_agibot_head_rgbd_adapter:
     depth_min_m: 0.1
     depth_max_m: 6.0
     sync_tolerance_sec: 0.002
+    # Mapping-matched RGB bypasses this cap. Unpaired RGB uses latest-only
+    # admission to feed detection without starving RGB-D registration.
+    independent_rgb_max_fps: 5.0
 
     # genie_bag_player already publishes the calibrated transforms on
     # /tf_static. Enable this when connecting directly to a source which does

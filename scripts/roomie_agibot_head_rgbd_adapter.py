@@ -3,6 +3,8 @@
 
 from __future__ import annotations
 
+import array as array_module
+from collections.abc import Mapping
 from collections import OrderedDict, deque
 from dataclasses import dataclass
 import math
@@ -61,6 +63,148 @@ class HeadRgbdCalibration:
     rotation_color_depth: np.ndarray
     translation_color_depth: np.ndarray
     static_transforms: tuple[StaticTransform, ...]
+
+
+@dataclass
+class BufferedColorFrame:
+    message: Image
+    emitted: bool = False
+    independent_consumed: bool = False
+
+
+@dataclass(frozen=True)
+class MatchedRgbdFrame:
+    color: Image
+    depth: Image
+    color_was_emitted: bool
+    delta_ns: int
+
+
+class RgbdPairScheduler:
+    """Bounded one-to-one timestamp join with latest-only RGB admission."""
+
+    def __init__(self, tolerance_ns: int, queue_size: int) -> None:
+        self.tolerance_ns = max(0, int(tolerance_ns))
+        self.queue_size = max(2, int(queue_size))
+        self.color_buffer: OrderedDict[int, BufferedColorFrame] = OrderedDict()
+        self.depth_buffer: OrderedDict[int, Image] = OrderedDict()
+        self.completed_depth_stamps: set[int] = set()
+        self.completed_depth_order: deque[int] = deque()
+        self.color_expirations = 0
+        self.depth_expirations = 0
+        self.independent_coalesced = 0
+        self.invalid_stamps = 0
+
+    def add_color(self, message: Image) -> MatchedRgbdFrame | None:
+        stamp_ns = _stamp_nanoseconds(message)
+        if stamp_ns <= 0:
+            self.invalid_stamps += 1
+            return None
+        existing = self.color_buffer.get(stamp_ns)
+        if existing is None:
+            self.color_buffer[stamp_ns] = BufferedColorFrame(message=message)
+        else:
+            existing.message = message
+            self.color_buffer.move_to_end(stamp_ns)
+        self._trim_color_buffer()
+
+        depth_stamp_ns = self._nearest_stamp(stamp_ns, self.depth_buffer)
+        if depth_stamp_ns is None:
+            return None
+        color = self.color_buffer.pop(stamp_ns)
+        depth = self.depth_buffer.pop(depth_stamp_ns)
+        self._remember_completed_depth(depth_stamp_ns)
+        return MatchedRgbdFrame(
+            color=color.message,
+            depth=depth,
+            color_was_emitted=color.emitted,
+            delta_ns=abs(stamp_ns - depth_stamp_ns),
+        )
+
+    def add_depth(self, message: Image) -> MatchedRgbdFrame | None:
+        stamp_ns = _stamp_nanoseconds(message)
+        if stamp_ns <= 0:
+            self.invalid_stamps += 1
+            return None
+        if stamp_ns in self.completed_depth_stamps:
+            return None
+        self.depth_buffer[stamp_ns] = message
+        self.depth_buffer.move_to_end(stamp_ns)
+        self._trim_depth_buffer()
+
+        color_stamp_ns = self._nearest_color_stamp(stamp_ns)
+        if color_stamp_ns is None:
+            return None
+        color = self.color_buffer.pop(color_stamp_ns)
+        depth = self.depth_buffer.pop(stamp_ns)
+        self._remember_completed_depth(stamp_ns)
+        return MatchedRgbdFrame(
+            color=color.message,
+            depth=depth,
+            color_was_emitted=color.emitted,
+            delta_ns=abs(color_stamp_ns - stamp_ns),
+        )
+
+    def take_latest_independent_color(self) -> tuple[int, Image] | None:
+        selected_stamp_ns = None
+        for stamp_ns in reversed(self.color_buffer):
+            frame = self.color_buffer[stamp_ns]
+            if not frame.independent_consumed:
+                selected_stamp_ns = stamp_ns
+                break
+        if selected_stamp_ns is None:
+            return None
+
+        for stamp_ns, frame in self.color_buffer.items():
+            if stamp_ns == selected_stamp_ns or frame.independent_consumed:
+                continue
+            frame.independent_consumed = True
+            self.independent_coalesced += 1
+        selected = self.color_buffer[selected_stamp_ns]
+        selected.independent_consumed = True
+        return selected_stamp_ns, selected.message
+
+    def mark_color_emitted(self, stamp_ns: int) -> None:
+        frame = self.color_buffer.get(stamp_ns)
+        if frame is not None:
+            frame.emitted = True
+
+    def discard_color(self, stamp_ns: int) -> None:
+        self.color_buffer.pop(stamp_ns, None)
+
+    def _nearest_color_stamp(self, stamp_ns: int) -> int | None:
+        return self._nearest_stamp(stamp_ns, self.color_buffer)
+
+    def _nearest_stamp(
+        self,
+        stamp_ns: int,
+        candidates: Mapping[int, Any],
+    ) -> int | None:
+        if stamp_ns in candidates:
+            return stamp_ns
+        if self.tolerance_ns <= 0 or not candidates:
+            return None
+        nearest = min(candidates, key=lambda candidate: abs(candidate - stamp_ns))
+        if abs(nearest - stamp_ns) <= self.tolerance_ns:
+            return nearest
+        return None
+
+    def _trim_color_buffer(self) -> None:
+        while len(self.color_buffer) > self.queue_size:
+            self.color_buffer.popitem(last=False)
+            self.color_expirations += 1
+
+    def _trim_depth_buffer(self) -> None:
+        while len(self.depth_buffer) > self.queue_size:
+            self.depth_buffer.popitem(last=False)
+            self.depth_expirations += 1
+
+    def _remember_completed_depth(self, stamp_ns: int) -> None:
+        self.completed_depth_stamps.add(stamp_ns)
+        self.completed_depth_order.append(stamp_ns)
+        while len(self.completed_depth_order) > self.queue_size * 4:
+            expired = self.completed_depth_order.popleft()
+            self.completed_depth_stamps.discard(expired)
 
 
 def _finite_float(value: Any, context: str) -> float:
@@ -432,7 +576,9 @@ def _image_message(
     message.encoding = encoding
     message.is_bigendian = 0
     message.step = int(compact.strides[0])
-    message.data = compact.tobytes()
+    payload = array_module.array("B")
+    payload.frombytes(memoryview(compact).cast("B"))
+    message.data = payload
     return message
 
 
@@ -521,6 +667,15 @@ class AgibotHeadRgbdAdapter(Node):
             2,
             int(self.declare_parameter("sync_queue_size", 60).value),
         )
+        self.independent_rgb_max_fps = max(
+            0.0,
+            float(self.declare_parameter("independent_rgb_max_fps", 5.0).value),
+        )
+        self.independent_rgb_period_sec = (
+            1.0 / self.independent_rgb_max_fps
+            if self.independent_rgb_max_fps > 0.0
+            else 0.0
+        )
         publish_static_tf = bool(
             self.declare_parameter("publish_static_tf", False).value
         )
@@ -578,27 +733,45 @@ class AgibotHeadRgbdAdapter(Node):
             sensor_qos,
         )
 
-        self.color_buffer: OrderedDict[int, Image] = OrderedDict()
-        self.depth_buffer: OrderedDict[int, Image] = OrderedDict()
-        self.emitted_stamps: set[int] = set()
-        self.emitted_stamp_order: deque[int] = deque()
         self.color_messages = 0
         self.depth_messages = 0
+        self.color_outputs = 0
+        self.depth_outputs = 0
+        self.pair_matches = 0
         self.matched_pairs = 0
+        self.paired_color_outputs = 0
+        self.independent_color_outputs = 0
+        self.pair_processing_failures = 0
         self.processing_errors = 0
-        self.last_processing_ms = 0.0
+        self.last_color_processing_ms = 0.0
+        self.last_depth_processing_ms = 0.0
+        self.last_sync_delta_ms = 0.0
+        self.max_sync_delta_ms = 0.0
+        self.last_color_output_time: float | None = None
+        self.scheduler = RgbdPairScheduler(
+            self.sync_tolerance_ns,
+            self.sync_queue_size,
+        )
 
         self.static_broadcaster = None
         if publish_static_tf:
             self.static_broadcaster = StaticTransformBroadcaster(self)
             self.static_broadcaster.sendTransform(self._static_transform_messages())
 
+        self.independent_rgb_timer = None
+        if self.independent_rgb_period_sec > 0.0:
+            self.independent_rgb_timer = self.create_timer(
+                max(0.001, min(0.05, self.independent_rgb_period_sec)),
+                self._try_emit_independent_color,
+            )
         self.status_timer = self.create_timer(status_period_sec, self._log_status)
         self.get_logger().info(
             "AgiBot head RGB-D adapter ready: "
             f"{color_topic} + {depth_topic} -> {self.output_color_topic} + "
             f"{self.output_depth_topic}; frame={self.output_frame}; "
             f"sync_tolerance={self.sync_tolerance_ns / 1e6:.3f}ms; "
+            f"independent_rgb_max_fps={self.independent_rgb_max_fps:.2f}; "
+            "mapping pairs have priority; "
             "sensor_qos=BEST_EFFORT"
         )
 
@@ -623,76 +796,60 @@ class AgibotHeadRgbdAdapter(Node):
 
     def _handle_color(self, message: Image) -> None:
         self.color_messages += 1
-        self._insert_and_match(message, self.color_buffer, self.depth_buffer)
+        pair = self.scheduler.add_color(message)
+        if pair is not None:
+            self._process_matched_pair(pair)
+            return
+        self._try_emit_independent_color()
 
     def _handle_depth(self, message: Image) -> None:
         self.depth_messages += 1
-        self._insert_and_match(message, self.depth_buffer, self.color_buffer)
+        pair = self.scheduler.add_depth(message)
+        if pair is not None:
+            self._process_matched_pair(pair)
 
-    def _insert_and_match(
-        self,
-        message: Image,
-        own_buffer: OrderedDict[int, Image],
-        other_buffer: OrderedDict[int, Image],
-    ) -> None:
-        stamp_ns = _stamp_nanoseconds(message)
-        if stamp_ns <= 0 or stamp_ns in self.emitted_stamps:
-            return
-        own_buffer[stamp_ns] = message
-        own_buffer.move_to_end(stamp_ns)
-        while len(own_buffer) > self.sync_queue_size:
-            own_buffer.popitem(last=False)
-
-        match_stamp = self._nearest_stamp(stamp_ns, other_buffer)
-        if match_stamp is None:
-            return
-        own = own_buffer.pop(stamp_ns, None)
-        other = other_buffer.pop(match_stamp, None)
-        if own is None or other is None:
-            return
-        if own is message and own_buffer is self.color_buffer:
-            color_message, depth_message = own, other
-        elif own is message and own_buffer is self.depth_buffer:
-            color_message, depth_message = other, own
-        elif own_buffer is self.color_buffer:
-            color_message, depth_message = own, other
+    def _process_matched_pair(self, pair: MatchedRgbdFrame) -> None:
+        self.pair_matches += 1
+        self.last_sync_delta_ms = pair.delta_ns / 1e6
+        self.max_sync_delta_ms = max(
+            self.max_sync_delta_ms,
+            self.last_sync_delta_ms,
+        )
+        if not pair.color_was_emitted:
+            if not self._process_color(pair.color):
+                self.pair_processing_failures += 1
+                return
+            self.paired_color_outputs += 1
+        if self._process_depth(pair.depth, pair.color.header.stamp):
+            self.matched_pairs += 1
         else:
-            color_message, depth_message = other, own
-        output_stamp_ns = _stamp_nanoseconds(depth_message)
-        if output_stamp_ns in self.emitted_stamps:
+            self.pair_processing_failures += 1
+
+    def _try_emit_independent_color(self) -> None:
+        now = time.perf_counter()
+        if (
+            self.independent_rgb_period_sec > 0.0
+            and self.last_color_output_time is not None
+            and now - self.last_color_output_time < self.independent_rgb_period_sec
+        ):
             return
-        self._remember_emitted_stamp(output_stamp_ns)
-        self._process_pair(color_message, depth_message)
+        candidate = self.scheduler.take_latest_independent_color()
+        if candidate is None:
+            return
+        stamp_ns, message = candidate
+        if self._process_color(message):
+            self.scheduler.mark_color_emitted(stamp_ns)
+            self.independent_color_outputs += 1
+        else:
+            # An invalid RGB must never later authorize its matching depth.
+            self.scheduler.discard_color(stamp_ns)
 
-    def _nearest_stamp(
-        self,
-        stamp_ns: int,
-        candidates: OrderedDict[int, Image],
-    ) -> int | None:
-        if stamp_ns in candidates:
-            return stamp_ns
-        if self.sync_tolerance_ns <= 0 or not candidates:
-            return None
-        nearest = min(candidates, key=lambda candidate: abs(candidate - stamp_ns))
-        if abs(nearest - stamp_ns) <= self.sync_tolerance_ns:
-            return nearest
-        return None
-
-    def _remember_emitted_stamp(self, stamp_ns: int) -> None:
-        self.emitted_stamps.add(stamp_ns)
-        self.emitted_stamp_order.append(stamp_ns)
-        while len(self.emitted_stamp_order) > self.sync_queue_size * 4:
-            expired = self.emitted_stamp_order.popleft()
-            self.emitted_stamps.discard(expired)
-
-    def _process_pair(self, color_message: Image, depth_message: Image) -> None:
+    def _process_color(self, color_message: Image) -> bool:
         started = time.perf_counter()
         try:
             color_bgr = _color_message_to_bgr(color_message)
-            depth_m = _depth_message_to_meters(depth_message, self.depth_scale)
             rectified_color = self.registrar.rectify_color(color_bgr)
-            registered_depth = self.registrar.register_depth(depth_m)
-            stamp = depth_message.header.stamp
+            stamp = color_message.header.stamp
 
             camera_info = _camera_info_message(
                 self.calibration.color,
@@ -705,29 +862,63 @@ class AgibotHeadRgbdAdapter(Node):
                 self.output_frame,
                 stamp,
             )
+            self.camera_info_publisher.publish(camera_info)
+            self.color_publisher.publish(color_output)
+            self.color_outputs += 1
+            self.last_color_output_time = time.perf_counter()
+            return True
+        except Exception as error:
+            self.processing_errors += 1
+            self.get_logger().error(f"failed to rectify RGB frame: {error}")
+            return False
+        finally:
+            self.last_color_processing_ms = (
+                time.perf_counter() - started
+            ) * 1000.0
+
+    def _process_depth(self, depth_message: Image, output_stamp: Any) -> bool:
+        started = time.perf_counter()
+        try:
+            depth_m = _depth_message_to_meters(depth_message, self.depth_scale)
+            registered_depth = self.registrar.register_depth(depth_m)
             depth_output = _image_message(
                 registered_depth.astype(np.float32, copy=False),
                 "32FC1",
                 self.output_frame,
-                stamp,
+                output_stamp,
             )
-            self.camera_info_publisher.publish(camera_info)
-            self.color_publisher.publish(color_output)
             self.depth_publisher.publish(depth_output)
-            self.matched_pairs += 1
+            self.depth_outputs += 1
+            return True
         except Exception as error:
             self.processing_errors += 1
-            self.get_logger().error(f"failed to register RGB-D pair: {error}")
-        self.last_processing_ms = (time.perf_counter() - started) * 1000.0
+            self.get_logger().error(f"failed to register depth frame: {error}")
+            return False
+        finally:
+            self.last_depth_processing_ms = (
+                time.perf_counter() - started
+            ) * 1000.0
 
     def _log_status(self) -> None:
         self.get_logger().info(
             "status "
             f"color={self.color_messages} depth={self.depth_messages} "
-            f"matched={self.matched_pairs} errors={self.processing_errors} "
-            f"buffer_color={len(self.color_buffer)} "
-            f"buffer_depth={len(self.depth_buffer)} "
-            f"last_processing={self.last_processing_ms:.1f}ms"
+            f"color_out={self.color_outputs} depth_out={self.depth_outputs} "
+            f"pair_matches={self.pair_matches} matched={self.matched_pairs} "
+            f"paired_color_out={self.paired_color_outputs} "
+            f"independent_color_out={self.independent_color_outputs} "
+            f"independent_coalesced={self.scheduler.independent_coalesced} "
+            f"buffer_color={len(self.scheduler.color_buffer)} "
+            f"buffer_depth={len(self.scheduler.depth_buffer)} "
+            f"expired_color={self.scheduler.color_expirations} "
+            f"expired_depth={self.scheduler.depth_expirations} "
+            f"invalid_stamps={self.scheduler.invalid_stamps} "
+            f"pair_failures={self.pair_processing_failures} "
+            f"errors={self.processing_errors} "
+            f"last_sync_delta={self.last_sync_delta_ms:.3f}ms "
+            f"max_sync_delta={self.max_sync_delta_ms:.3f}ms "
+            f"last_color_processing={self.last_color_processing_ms:.1f}ms "
+            f"last_depth_processing={self.last_depth_processing_ms:.1f}ms"
         )
 
 

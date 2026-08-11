@@ -18,6 +18,13 @@ class MapProjector {
 
   virtual bool enqueueFrameBundle(FrameBundlePtr frame) = 0;
   virtual std::optional<PatchDepth> projectPatchDepth(const FrameBundle& frame) = 0;
+  // Non-blocking projection against the most recently published immutable
+  // surface. Independent RGB detections use this path and never wait for an
+  // exact commit of their own sensor timestamp.
+  virtual std::optional<PatchDepth> projectLatestPatchDepth(
+      const FrameBundle& frame) {
+    return projectPatchDepth(frame);
+  }
   // Non-blocking exact-commit projection seam used by PerceptionScheduler.
   // Legacy/test projectors may keep implementing only the original method;
   // production MapThread validates and projects the supplied pinned commit.

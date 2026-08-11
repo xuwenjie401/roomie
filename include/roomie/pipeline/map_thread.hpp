@@ -30,6 +30,8 @@ class MapThread : public WorkerThread, public MapProjector {
 
   bool enqueueFrameBundle(FrameBundlePtr frame) override;
   std::optional<PatchDepth> projectPatchDepth(const FrameBundle& frame) override;
+  std::optional<PatchDepth> projectLatestPatchDepth(
+      const FrameBundle& frame) override;
   std::optional<PatchDepth> projectPatchDepth(
       const FrameBundle& frame, const MapCommit& commit) override;
   bool cancelPerceptionCandidate(FrameBundlePtr frame,

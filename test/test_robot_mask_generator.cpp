@@ -322,5 +322,112 @@ TEST(RobotMaskGeneratorTest,
   executor.remove_node(io_node);
 }
 
+TEST(RobotMaskGeneratorTest,
+     RosIoEmitsOnlineDetectionBeforeDepthAndBuffersRgbForMappingJoin) {
+  ScopedRclcppInit rclcpp_init;
+  auto io_node =
+      std::make_shared<rclcpp::Node>("roomie_independent_rgb_io_test");
+  auto publisher_node =
+      std::make_shared<rclcpp::Node>("roomie_independent_rgb_publisher_test");
+
+  ThreadSafeQueue<FrameBundlePtr> mapping_queue(4);
+  ThreadSafeQueue<FrameBundlePtr> detection_queue(4);
+  RosIoThread ros_io(mapping_queue, detection_queue);
+  auto generator = std::make_shared<RobotMaskGenerator>(generatorConfig());
+
+  RosIoSubscriptionConfig config;
+  config.world_frame = "map";
+  config.tf_topic.clear();
+  config.tf_static_topic = "/roomie/test/independent_rgb/tf_static";
+  config.map_mode = MapMode::kOnline;
+  config.max_perception_fps = 0.0;
+  config.robot_mask_generator = generator;
+  RosCameraSubscriptionConfig camera;
+  camera.camera_id = "head_color";
+  camera.camera_frame = "head_color";
+  camera.rgb_topic = "/roomie/test/independent_rgb/head_color";
+  camera.depth_topic = "/roomie/test/independent_rgb/head_depth";
+  camera.fallback_intrinsics =
+      CameraIntrinsics{640, 400, 305.2087402344f, 305.0057678223f,
+                       318.5672912598f, 204.0587768555f};
+  camera.enable_mapping = true;
+  camera.enable_detection = true;
+  config.cameras.push_back(camera);
+  ros_io.configure(config);
+  ros_io.attachNode(*io_node);
+
+  const auto image_publisher =
+      publisher_node->create_publisher<sensor_msgs::msg::Image>(
+          camera.rgb_topic, rclcpp::QoS(4).best_effort().durability_volatile());
+  const auto depth_publisher =
+      publisher_node->create_publisher<sensor_msgs::msg::Image>(
+          camera.depth_topic,
+          rclcpp::QoS(4).best_effort().durability_volatile());
+  const auto tf_publisher =
+      publisher_node->create_publisher<tf2_msgs::msg::TFMessage>(
+          config.tf_static_topic,
+          rclcpp::QoS(100).transient_local().reliable());
+
+  rclcpp::executors::SingleThreadedExecutor executor;
+  executor.add_node(io_node);
+  executor.add_node(publisher_node);
+  ASSERT_TRUE(spinUntil(
+      &executor,
+      [&]() {
+        return image_publisher->get_subscription_count() == 1 &&
+               depth_publisher->get_subscription_count() == 1 &&
+               tf_publisher->get_subscription_count() == 1;
+      },
+      std::chrono::seconds(2)));
+
+  tf2_msgs::msg::TFMessage transforms;
+  transforms.transforms.push_back(identityTransform("map", "head_color"));
+  for (const std::string& frame : generator->requiredFrames()) {
+    transforms.transforms.push_back(
+        identityTransform(generator->rootFrame(), frame));
+  }
+  tf_publisher->publish(transforms);
+
+  FrameBundlePtr first_detection;
+  image_publisher->publish(rgbImage(10));
+  ASSERT_TRUE(spinUntil(
+      &executor,
+      [&]() { return detection_queue.tryPop(&first_detection); },
+      std::chrono::seconds(2)));
+  ASSERT_TRUE(first_detection);
+  EXPECT_EQ(first_detection->provenance.sensor_time_ns, 10000000000LL);
+  EXPECT_FALSE(first_detection->depth);
+  EXPECT_FALSE(first_detection->perception_candidate);
+  FrameBundlePtr mapping_frame;
+  EXPECT_FALSE(mapping_queue.tryPop(&mapping_frame));
+
+  // A newer RGB must not overwrite the older image retained for the delayed
+  // depth join.
+  FrameBundlePtr second_detection;
+  image_publisher->publish(rgbImage(11));
+  ASSERT_TRUE(spinUntil(
+      &executor,
+      [&]() { return detection_queue.tryPop(&second_detection); },
+      std::chrono::seconds(2)));
+  ASSERT_TRUE(second_detection);
+  EXPECT_EQ(second_detection->provenance.sensor_time_ns, 11000000000LL);
+  EXPECT_FALSE(mapping_queue.tryPop(&mapping_frame));
+
+  depth_publisher->publish(depthImage(10));
+  ASSERT_TRUE(spinUntil(
+      &executor,
+      [&]() { return mapping_queue.tryPop(&mapping_frame); },
+      std::chrono::seconds(2)));
+  ASSERT_TRUE(mapping_frame);
+  ASSERT_TRUE(mapping_frame->depth);
+  EXPECT_EQ(mapping_frame->provenance.sensor_time_ns, 10000000000LL);
+  EXPECT_EQ(mapping_frame->provenance.frame_id,
+            first_detection->provenance.frame_id);
+  EXPECT_EQ(mapping_frame->sync.rgb_depth_delta_ns, 0);
+
+  executor.remove_node(publisher_node);
+  executor.remove_node(io_node);
+}
+
 }  // namespace
 }  // namespace roomie

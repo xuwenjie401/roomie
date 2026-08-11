@@ -130,6 +130,10 @@ def generate_launch_description():
                         "calibration_file": calibration_file,
                         "color_topic": color_topic,
                         "depth_topic": depth_topic,
+                        "independent_rgb_max_fps": ParameterValue(
+                            boxer_max_inference_fps,
+                            value_type=float,
+                        ),
                         "publish_static_tf": ParameterValue(
                             publish_static_tf,
                             value_type=bool,

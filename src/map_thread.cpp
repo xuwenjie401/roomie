@@ -278,6 +278,37 @@ std::optional<PatchDepth> MapThread::projectPatchDepth(const FrameBundle& frame)
                               project_total_start);
 }
 
+std::optional<PatchDepth> MapThread::projectLatestPatchDepth(
+    const FrameBundle& frame) {
+  if (config_.freeze_tsdf_map) {
+    return projectPatchDepth(frame);
+  }
+
+  ++projection_requests_;
+  const auto project_total_start = std::chrono::steady_clock::now();
+  const std::shared_ptr<const PublishedSurface> published =
+      std::atomic_load(&latest_published_surface_);
+  SurfaceSnapshotPtr pinned_surface;
+  MapBackendSnapshot diagnostics;
+  FrameProvenance provenance = frame.provenance;
+  if (published) {
+    pinned_surface = published->snapshot;
+    diagnostics = published->diagnostics;
+  }
+  if (pinned_surface) {
+    provenance.map = pinned_surface->mapStamp();
+    provenance.surface = pinned_surface->surfaceStamp();
+    provenance.map_mode = MapMode::kOnline;
+    provenance.includes_current_frame = false;
+    provenance.causality_verified = true;
+  }
+  return projectPinnedSurface(frame,
+                              std::move(pinned_surface),
+                              std::move(diagnostics),
+                              std::move(provenance),
+                              project_total_start);
+}
+
 std::optional<PatchDepth> MapThread::projectPatchDepth(
     const FrameBundle& frame, const MapCommit& commit) {
   ++projection_requests_;

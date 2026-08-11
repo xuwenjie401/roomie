@@ -187,6 +187,26 @@ class FakeAsyncMapProjector final : public MapProjector {
     return std::nullopt;
   }
 
+  std::optional<PatchDepth> projectLatestPatchDepth(
+      const FrameBundle& frame) override {
+    ++latest_projection_calls;
+    PatchDepth patch;
+    patch.valid_patches = latest_valid_patches.load();
+    patch.projected_points = patch.valid_patches;
+    patch.provenance = frame.provenance;
+    patch.provenance.map_mode = MapMode::kOnline;
+    patch.provenance.map.map_epoch = RunId{21, 22};
+    patch.provenance.map.map_revision = 7;
+    patch.provenance.map.integrated_through_ns =
+        frame.provenance.sensor_time_ns - 1;
+    patch.provenance.surface.map_epoch = patch.provenance.map.map_epoch;
+    patch.provenance.surface.surface_revision = 7;
+    patch.provenance.surface.source_map_revision = 7;
+    patch.provenance.includes_current_frame = false;
+    patch.provenance.causality_verified = true;
+    return patch;
+  }
+
   std::optional<PatchDepth> projectPatchDepth(
       const FrameBundle& frame, const MapCommit& commit) override {
     ++exact_projection_calls;
@@ -221,7 +241,9 @@ class FakeAsyncMapProjector final : public MapProjector {
   }
 
   std::atomic_int blocking_projection_calls{0};
+  std::atomic_int latest_projection_calls{0};
   std::atomic_int exact_projection_calls{0};
+  std::atomic_int latest_valid_patches{PatchDepth::kSize};
   mutable std::mutex mutex_;
   std::vector<std::pair<FrameId, std::string>> cancellations;
 };
@@ -670,6 +692,133 @@ TEST(MapCausalBarrier, SupersededQueuedCandidateCancelsProtectedMapWork) {
 
   actor.stop();
   queue.stop();
+}
+
+TEST(MapCausalBarrier, LatestProjectionDoesNotWaitForIndependentFrameCommit) {
+  ThreadSafeQueue<FrameBundlePtr> queue(2, ChannelPolicy::kReliableBlocking);
+  PipelineConfig config;
+  auto backend = std::make_unique<FakeRevisionMapBackend>();
+  MapThread actor(queue, config, std::move(backend));
+  FrameBundlePtr mapped = frameBundle(26, 2600);
+  std::const_pointer_cast<FrameBundle>(mapped)->perception_candidate = false;
+  ASSERT_TRUE(queue.push(mapped).accepted());
+  actor.start();
+  ASSERT_TRUE(waitForMapRevision(actor, 1));
+
+  FrameBundlePtr independent = frameBundle(27, 2700);
+  std::const_pointer_cast<FrameBundle>(independent)->perception_candidate = false;
+  const auto projection_start = std::chrono::steady_clock::now();
+  const auto patch = actor.projectLatestPatchDepth(*independent);
+  const auto projection_elapsed =
+      std::chrono::steady_clock::now() - projection_start;
+  ASSERT_TRUE(patch);
+  EXPECT_LT(projection_elapsed, std::chrono::milliseconds(100));
+  EXPECT_EQ(patch->provenance.map.map_revision, 1U);
+  EXPECT_FALSE(patch->provenance.includes_current_frame);
+  EXPECT_TRUE(patch->provenance.causality_verified);
+
+  actor.stop();
+  queue.stop();
+}
+
+TEST(DetectionBridgeAsyncJoin,
+     IndependentOnlineRgbUsesLatestSurfaceWithoutWaitingForCommit) {
+  ScopedRclcppInit rclcpp_init;
+  auto node =
+      std::make_shared<rclcpp::Node>("roomie_independent_rgb_bridge_test");
+  ThreadSafeQueue<FrameBundlePtr> detections(
+      2,
+      ChannelPolicy::kLatestByKey,
+      [](const FrameBundlePtr& lhs, const FrameBundlePtr& rhs) {
+        return lhs && rhs && lhs->camera_id == rhs->camera_id;
+      });
+  ThreadSafeQueue<InferenceResponse> reducer_responses(
+      2, ChannelPolicy::kReliableBlocking);
+  FakeAsyncMapProjector projector;
+  FakeAsyncInferenceBackend backend;
+  PipelineConfig config;
+  config.boxer_input_size = 8;
+  config.min_patch_coverage_ratio = 0.01f;
+  config.file_logging_period_sec = 60.0;
+  DetectionBridgeThread bridge(*node,
+                               detections,
+                               reducer_responses,
+                               projector,
+                               backend,
+                               config);
+
+  FrameBundlePtr frame = frameBundle(34, 3400, std::chrono::seconds(2));
+  auto mutable_frame = std::const_pointer_cast<FrameBundle>(frame);
+  mutable_frame->camera_id = "camera";
+  mutable_frame->perception_candidate = false;
+  ASSERT_TRUE(detections.push(frame));
+  bridge.start();
+  ASSERT_TRUE(backend.waitForRequests(1, std::chrono::milliseconds(150)));
+  const InferenceRequest request = backend.request(0);
+  EXPECT_EQ(projector.latest_projection_calls.load(), 1);
+  EXPECT_EQ(projector.exact_projection_calls.load(), 0);
+  EXPECT_EQ(projector.blocking_projection_calls.load(), 0);
+  EXPECT_FALSE(request.provenance.includes_current_frame);
+  EXPECT_TRUE(request.provenance.causality_verified);
+  EXPECT_EQ(request.patch_depth.map_commit_wait_ms, 0.0);
+
+  backend.complete(request);
+  InferenceResponse forwarded;
+  ASSERT_TRUE(waitForInferenceResponse(
+      &reducer_responses, &forwarded, std::chrono::milliseconds(150)));
+  bridge.stop();
+  detections.stop();
+  reducer_responses.stop();
+  node.reset();
+}
+
+TEST(DetectionBridgeAsyncJoin,
+     IndependentOnlineRgbStillRejectsLowLatestMapCoverage) {
+  ScopedRclcppInit rclcpp_init;
+  auto node = std::make_shared<rclcpp::Node>(
+      "roomie_independent_rgb_low_coverage_test");
+  ThreadSafeQueue<FrameBundlePtr> detections(
+      1,
+      ChannelPolicy::kLatestByKey,
+      [](const FrameBundlePtr& lhs, const FrameBundlePtr& rhs) {
+        return lhs && rhs && lhs->camera_id == rhs->camera_id;
+      });
+  ThreadSafeQueue<InferenceResponse> reducer_responses(
+      1, ChannelPolicy::kReliableBlocking);
+  FakeAsyncMapProjector projector;
+  projector.latest_valid_patches.store(0);
+  FakeAsyncInferenceBackend backend;
+  PipelineConfig config;
+  config.boxer_input_size = 8;
+  config.min_patch_coverage_ratio = 0.01f;
+  config.file_logging_period_sec = 60.0;
+  DetectionBridgeThread bridge(*node,
+                               detections,
+                               reducer_responses,
+                               projector,
+                               backend,
+                               config);
+
+  FrameBundlePtr frame = frameBundle(35, 3500, std::chrono::seconds(2));
+  auto mutable_frame = std::const_pointer_cast<FrameBundle>(frame);
+  mutable_frame->camera_id = "camera";
+  mutable_frame->perception_candidate = false;
+  ASSERT_TRUE(detections.push(frame));
+  bridge.start();
+  const auto deadline =
+      std::chrono::steady_clock::now() + std::chrono::milliseconds(150);
+  while (projector.latest_projection_calls.load() == 0 &&
+         std::chrono::steady_clock::now() < deadline) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
+  EXPECT_EQ(projector.latest_projection_calls.load(), 1);
+  EXPECT_FALSE(backend.waitForRequests(1, std::chrono::milliseconds(30)));
+  EXPECT_FALSE(bridge.perceptionBusy());
+
+  bridge.stop();
+  detections.stop();
+  reducer_responses.stop();
+  node.reset();
 }
 
 TEST(DetectionBridgeAsyncJoin,

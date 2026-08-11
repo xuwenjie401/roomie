@@ -228,6 +228,9 @@ struct FrameBundle {
   Eigen::Isometry3f T_world_camera = Eigen::Isometry3f::Identity();
   std::uint64_t calibration_revision = 0;
   SyncDiagnostics sync;
+  // True only when detection requires this exact frame's include-current map
+  // commit. RGB-independent detection leaves this false and uses the latest
+  // already-published surface.
   bool perception_candidate = false;
 };
 

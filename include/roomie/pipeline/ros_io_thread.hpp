@@ -4,6 +4,7 @@
 #include <condition_variable>
 #include <cstdint>
 #include <functional>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -83,6 +84,17 @@ class RosIoThread : public WorkerThread {
         std::chrono::steady_clock::time_point::min();
   };
 
+  struct BufferedRgbFrame {
+    std::shared_ptr<const ImageBuffer> rgb;
+    std::shared_ptr<const ImageBuffer> robot_mask;
+    CameraIntrinsics intrinsics;
+    std::chrono::steady_clock::time_point ingest_time =
+        std::chrono::steady_clock::time_point::min();
+    std::uint64_t calibration_revision = 0;
+    bool mapping_consumed = false;
+    bool detection_consumed = false;
+  };
+
   struct CameraState {
     RosCameraSubscriptionConfig config;
     std::shared_ptr<const ImageBuffer> latest_rgb;
@@ -96,6 +108,11 @@ class RosIoThread : public WorkerThread {
     TimeNanoseconds latest_pose_time_ns = 0;
     std::chrono::steady_clock::time_point latest_rgb_ingest_time =
         std::chrono::steady_clock::time_point::min();
+    // Detection consumes each ready RGB frame immediately. Mapping joins the
+    // same bounded RGB history with independently arriving registered depth.
+    std::map<TimeNanoseconds, BufferedRgbFrame> buffered_rgb_frames;
+    std::map<TimeNanoseconds, std::shared_ptr<const DepthBuffer>>
+        buffered_depth_frames;
     std::unordered_map<TimeNanoseconds, LogicalFrameIdentity> logical_frames;
     std::chrono::steady_clock::time_point last_perception_admission_time =
         std::chrono::steady_clock::time_point::min();
@@ -131,7 +148,12 @@ class RosIoThread : public WorkerThread {
   void maybeLogStatusLocked();
   FrameProvenance frameProvenanceLocked(CameraState* state,
                                         TimeNanoseconds time_ns,
+                                        std::chrono::steady_clock::time_point
+                                            observed_ingest_time,
                                         std::chrono::steady_clock::time_point* ingest_time);
+  std::optional<TimeNanoseconds> closestBufferedRgbTimeLocked(
+      const CameraState& state, TimeNanoseconds depth_time_ns) const;
+  void pruneBufferedFramesLocked(CameraState* state);
   std::pair<FrameBundlePtr, FrameBundlePtr> makeFrameBundlesLocked(
       const std::string& camera_id, TimeNanoseconds time_ns);
   void enqueueBundles(FrameBundlePtr mapping_bundle,

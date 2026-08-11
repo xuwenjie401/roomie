@@ -424,7 +424,8 @@ void DetectionBridgeThread::pollActiveCandidate() {
     return;
   }
 
-  if (active_frame_->provenance.map_mode == MapMode::kFrozen) {
+  if (active_frame_->provenance.map_mode == MapMode::kFrozen ||
+      !active_frame_->perception_candidate) {
     processReadyCandidate(active_frame_, nullptr, 0.0, 0.0);
     return;
   }
@@ -468,7 +469,9 @@ void DetectionBridgeThread::processReadyCandidate(
   const auto projection_start = std::chrono::steady_clock::now();
   std::optional<PatchDepth> patch_depth =
       commit ? map_projector_.projectPatchDepth(*frame, *commit)
-             : map_projector_.projectPatchDepth(*frame);
+             : (frame->provenance.map_mode == MapMode::kOnline
+                    ? map_projector_.projectLatestPatchDepth(*frame)
+                    : map_projector_.projectPatchDepth(*frame));
   const double projection_ms =
       elapsedMs(projection_start, std::chrono::steady_clock::now());
   if (!patch_depth) {
