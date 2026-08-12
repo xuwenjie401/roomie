@@ -464,10 +464,6 @@ def create_navigation_task_registry(
             "explicit_furniture_matches": explicit_matches,
             "explicit_furniture_unique": len(explicit_matches) == 1,
             "furniture_candidates": furniture_candidates,
-            "instructions": (
-                "Choose only ids in this response. Objects without a furniture relation "
-                "cannot directly provide a navigation target."
-            ),
         }
         evidence.primary_response = response
         return ToolResult(response)
@@ -476,24 +472,34 @@ def create_navigation_task_registry(
         ToolSpec(
             name="locate_navigation_target",
             description=(
-                "Primary one-shot navigation lookup. It searches the stable scene, "
-                "joins target candidates to canonical in/on furniture relations, and "
-                "returns explicit requested-furniture matches plus exploration options."
+                "Required first step for navigation-target selection. Search the stable "
+                "scene for the requested object, resolve any explicitly named furniture "
+                "or place separately, and return object candidates with canonical "
+                "in/on/self furniture destinations plus valid exploration furniture."
             ),
             parameters_json_schema={
                 "type": "object",
                 "properties": {
                     "target_description": {
                         "type": "string",
-                        "description": "English semantic description of the object to retrieve.",
+                        "description": (
+                            "English semantic description of the requested object only; "
+                            "exclude any explicitly named furniture or place."
+                        ),
                     },
                     "requested_furniture_description": {
                         "type": "string",
-                        "description": "English furniture/place phrase explicitly stated by the user.",
+                        "description": (
+                            "English furniture or place phrase explicitly stated by the "
+                            "user. Omit when the user did not name one."
+                        ),
                     },
                     "reference_id": {
                         "type": "string",
-                        "description": "Optional exact curated reference_id from the runtime prompt.",
+                        "description": (
+                            "Exact curated reference_id listed in the runtime prompt for "
+                            "this requested item. Omit when none is listed."
+                        ),
                     },
                 },
                 "required": ["target_description"],
@@ -511,9 +517,11 @@ def create_navigation_task_registry(
         ToolSpec(
             name="inspect_navigation_candidates",
             description=(
-                "Optional single evidence check for up to four object ids already "
-                "returned by locate_navigation_target. It attaches historical scene "
-                "snapshots and, when requested, curated reference views."
+                "Use only when locate_navigation_target leaves a material identity "
+                "ambiguity. Inspect historical snapshots for up to four returned object "
+                "ids and, when reference_id is provided, attach the curated reference "
+                "views for visual comparison. This is identity evidence, not current-camera "
+                "evidence."
             ),
             parameters_json_schema={
                 "type": "object",
@@ -523,8 +531,18 @@ def create_navigation_task_registry(
                         "items": {"type": "integer"},
                         "minItems": 1,
                         "maxItems": 4,
+                        "description": (
+                            "One to four candidate object ids returned by "
+                            "locate_navigation_target."
+                        ),
                     },
-                    "reference_id": {"type": "string"},
+                    "reference_id": {
+                        "type": "string",
+                        "description": (
+                            "Optional exact curated reference_id listed in the runtime "
+                            "prompt for this requested item."
+                        ),
+                    },
                 },
                 "required": ["object_ids"],
             },
@@ -650,12 +668,6 @@ def create_find_object_in_view_task_registry(
             "candidates": candidates,
             "strong_match_object_id": strong_match_id,
             "strong_match_is_unique": strong_match_id is not None,
-            "instructions": (
-                "FOUND may use the unique strong match directly. Otherwise inspect the "
-                "latest retained three-camera 2D detections once. If identity remains "
-                "uncertain and candidates exist, historical/reference evidence for at "
-                "most four candidates may also be inspected once."
-            ),
         }
         evidence.primary_response = response
         return ToolResult(response)
@@ -664,22 +676,27 @@ def create_find_object_in_view_task_registry(
         ToolSpec(
             name="find_objects_in_view",
             description=(
-                "Primary one-shot in-view lookup. It semantically searches stable "
-                "scene objects, samples the latest retained head-camera geometry once, "
-                "applies the any-3D-bbox-corner frustum rule, and returns projected ROIs. "
-                "Camera metadata says whether the sample is fresh or cached during a "
-                "sensor/bag pause."
+                "Required first step for in-view object finding. Search stable scene "
+                "objects and return the bounded head-view candidates, their projected "
+                "ROIs, structured identity strength, and camera freshness metadata. "
+                "This tool does not inspect RGB or establish occlusion-free visibility."
             ),
             parameters_json_schema={
                 "type": "object",
                 "properties": {
                     "target_description": {
                         "type": "string",
-                        "description": "English semantic description of the target object.",
+                        "description": (
+                            "English semantic description of the requested object, "
+                            "including useful appearance or category details."
+                        ),
                     },
                     "reference_id": {
                         "type": "string",
-                        "description": "Optional exact curated reference_id from the runtime prompt.",
+                        "description": (
+                            "Exact curated reference_id listed in the runtime prompt for "
+                            "this requested item. Omit when none is listed."
+                        ),
                     },
                 },
                 "required": ["target_description"],
@@ -771,10 +788,11 @@ def create_find_object_in_view_task_registry(
         ToolSpec(
             name="inspect_latest_2d_detections",
             description=(
-                "Optional one-shot VLM inspection of the latest retained 2D detector "
-                "results for head_color, hand_left_color, and hand_right_color. It "
-                "returns exact label/score/bbox data and attaches each available "
-                "detector-annotated RGB image. Call only after find_objects_in_view."
+                "Use after find_objects_in_view when its structured identity evidence is "
+                "not sufficient. Return exact detector labels, scores, boxes, timestamps, "
+                "and the last retained annotated RGB frame for each available head or "
+                "hand camera. Camera frames are independently timestamped and are not a "
+                "synchronized capture."
             ),
             parameters_json_schema={
                 "type": "object",
@@ -803,9 +821,10 @@ def create_find_object_in_view_task_registry(
         ToolSpec(
             name="inspect_in_view_candidates",
             description=(
-                "Optional single VLM evidence check for up to four ids already proven "
-                "inside the sampled frustum. It uses historical scene snapshots and "
-                "optional curated references, never the current RGB pixels."
+                "Use only when identity remains ambiguous among candidates returned by "
+                "find_objects_in_view. Inspect historical scene snapshots for up to four "
+                "candidate ids and, when reference_id is provided, attach curated "
+                "reference views for comparison. This tool never inspects current RGB."
             ),
             parameters_json_schema={
                 "type": "object",
@@ -815,8 +834,18 @@ def create_find_object_in_view_task_registry(
                         "items": {"type": "integer"},
                         "minItems": 1,
                         "maxItems": 4,
+                        "description": (
+                            "One to four plausible object ids returned by "
+                            "find_objects_in_view."
+                        ),
                     },
-                    "reference_id": {"type": "string"},
+                    "reference_id": {
+                        "type": "string",
+                        "description": (
+                            "Optional exact curated reference_id listed in the runtime "
+                            "prompt for this requested item."
+                        ),
+                    },
                 },
                 "required": ["object_ids"],
             },

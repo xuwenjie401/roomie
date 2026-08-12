@@ -600,6 +600,76 @@ class SceneQaToolTests(unittest.TestCase):
         document = json.loads(session_log.path.read_text(encoding="utf-8"))
         self.assertEqual(document["messages"][1]["task"], "navigation")
 
+    def test_viewer_action_mode_routes_ask_through_action_bridge(self) -> None:
+        class FakeActionBridge:
+            def __init__(self) -> None:
+                self.requests: list[dict] = []
+
+            def request(self, **kwargs):
+                self.requests.append(kwargs)
+                return {
+                    "reasoning": "through action",
+                    "answer": {"status": 1, "reason": "not found"},
+                    "history": {"request_transport": "ros_action"},
+                    "highlight_groups": [],
+                    "provider": kwargs["provider"],
+                    "task": kwargs["task"],
+                    "model": "test",
+                }
+
+        session_log = SceneQaSessionLog(
+            Path(self.tmp.name) / "web_action_logs",
+            started_time_s=1.0,
+        )
+        runtime = QaRuntime(1, session_log, ProgressLog())
+        runtime.agents[("gemini", "find_object_in_view")] = object()
+        runtime.provider_status = {
+            "gemini": {
+                "available": True,
+                "model": "test",
+                "tasks": {"find_object_in_view": {"available": True}},
+            }
+        }
+        bridge = FakeActionBridge()
+        payload = json.dumps(
+            {
+                "query": "找黄色瓶子",
+                "provider": "gemini",
+                "task": "find_object_in_view",
+                "allow_follow_up_question": True,
+            }
+        ).encode("utf-8")
+        handler = object.__new__(roomie_scene_qa_viewer.Handler)
+        handler.path = "/ask"
+        handler.headers = {"Content-Length": str(len(payload))}
+        handler.rfile = io.BytesIO(payload)
+        sent: list[tuple[int, dict]] = []
+        handler._send_json = lambda body, status=200: sent.append((status, body))
+        handler.server = SimpleNamespace(
+            default_provider="gemini",
+            default_task="scene_qa",
+            current_runtime=lambda: runtime,
+            qa_action_bridge=bridge,
+            action_max_duration_sec=12.0,
+        )
+
+        handler.do_POST()
+
+        self.assertEqual(sent[0][0], 200)
+        self.assertEqual(sent[0][1]["history"]["request_transport"], "ros_action")
+        self.assertEqual(
+            bridge.requests,
+            [
+                {
+                    "task": "find_object_in_view",
+                    "query": "找黄色瓶子",
+                    "provider": "gemini",
+                    "allow_follow_up_question": True,
+                    "max_duration_s": 12.0,
+                }
+            ],
+        )
+
     def test_gemini_loop_executes_local_tool_with_fake_client(self) -> None:
         class FakeCall:
             name = "search_objects"

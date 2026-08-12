@@ -35,6 +35,10 @@ from roomie_dsg_viewer import (  # noqa: E402
     resolve_points_from_config,
 )
 from scene_qa.config import SceneQaConfig, default_qa_config_path  # noqa: E402
+from scene_qa.action_bridge import (  # noqa: E402
+    QaActionBridgeError,
+    RosQaActionBridge,
+)
 from scene_qa.doubao_agent import DoubaoSceneQaAgent  # noqa: E402
 from scene_qa.embeddings import ObjectSearchIndex  # noqa: E402
 from scene_qa.gemini_agent import (  # noqa: E402
@@ -172,6 +176,15 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--service", default="/roomie/query_scene", help="live QueryScene service")
     parser.add_argument("--service-timeout-sec", type=float, default=10.0)
+    parser.add_argument(
+        "--request-transport",
+        choices=["direct", "actions"],
+        default="direct",
+        help="execute Web QA directly or through ROS 2 actions",
+    )
+    parser.add_argument("--action-prefix", default="/roomie")
+    parser.add_argument("--action-server-timeout-sec", type=float, default=5.0)
+    parser.add_argument("--action-max-duration-sec", type=float, default=0.0)
     parser.add_argument(
         "--config",
         type=Path,
@@ -2549,6 +2562,25 @@ class Handler(BaseHTTPRequestHandler):
                     status=503,
                 )
                 return
+            action_bridge = getattr(self.server, "qa_action_bridge", None)
+            if action_bridge is not None:
+                try:
+                    body = action_bridge.request(
+                        task=task,
+                        query=query,
+                        provider=provider,
+                        allow_follow_up_question=allow_follow_up_question,
+                        max_duration_s=float(
+                            getattr(self.server, "action_max_duration_sec", 0.0)
+                        ),
+                    )
+                    self._send_json(body)
+                except QaActionBridgeError as exc:
+                    self._send_json(
+                        {"error": str(exc), "status": exc.status},
+                        status=exc.http_status,
+                    )
+                return
             request_lock = runtime.qa_lock
             acquired = request_lock.acquire(blocking=False)
             if not acquired:
@@ -3023,14 +3055,27 @@ def main() -> int:
             f"using {default_provider}.",
             file=sys.stderr,
         )
-    graph_data["qa"] = {
-        "default_provider": default_provider,
-        "default_task": default_task,
-        "providers": initial_runtime.provider_status,
-        "tasks": initial_runtime.task_status,
-    }
+    def qa_graph_payload(runtime: QaRuntime) -> dict[str, Any]:
+        payload: dict[str, Any] = {
+            "default_provider": default_provider,
+            "default_task": default_task,
+            "providers": runtime.provider_status,
+            "tasks": runtime.task_status,
+        }
+        if args.request_transport == "actions":
+            prefix = args.action_prefix.strip().rstrip("/")
+            payload["request_transport"] = "ros_action"
+            payload["action_names"] = {
+                task: f"{prefix}/{task}" for task in TASK_NAMES
+            }
+        else:
+            payload["request_transport"] = "direct"
+        return payload
+
+    graph_data["qa"] = qa_graph_payload(initial_runtime)
 
     server: ThreadingHTTPServer | None = None
+    qa_action_bridge: RosQaActionBridge | None = None
     try:
         server = ThreadingHTTPServer((args.host, args.port), Handler)
         server.daemon_threads = True
@@ -3086,6 +3131,191 @@ def main() -> int:
                 )
                 return new_runtime
 
+        action_execution_lock = threading.Lock()
+        action_execution_runtimes: dict[str, QaRuntime] = {}
+
+        def execute_runtime_request(
+            runtime: QaRuntime,
+            *,
+            query: str,
+            provider: str,
+            task: str,
+            allow_follow_up_question: bool,
+        ) -> dict[str, Any]:
+            provider = provider.strip().lower() or default_provider
+            if provider not in runtime.provider_status:
+                raise QaActionBridgeError(
+                    f"unknown model provider: {provider}",
+                    status="unknown_provider",
+                    http_status=400,
+                )
+            agent = runtime.agents.get((provider, task))
+            if agent is None:
+                task_state = (
+                    runtime.provider_status.get(provider, {})
+                    .get("tasks", {})
+                    .get(task, {})
+                )
+                raise QaActionBridgeError(
+                    str(
+                        task_state.get("error")
+                        or f"{task} is unavailable with {provider}"
+                    ),
+                    status="task_unavailable",
+                    http_status=503,
+                )
+            if not runtime.qa_lock.acquire(blocking=False):
+                raise QaActionBridgeError(
+                    "another scene QA request is still running",
+                    status="qa_busy",
+                    http_status=409,
+                )
+            turn_finished = False
+            started_time_s = time.time()
+            try:
+                if runtime.retired or not is_current_runtime(runtime):
+                    raise QaActionBridgeError(
+                        "QA was reset; retry the question",
+                        status="qa_reset",
+                        http_status=409,
+                    )
+                request_event = runtime.add_progress(
+                    {
+                        "phase": "request_start",
+                        "message": f"{task} question received by {provider}.",
+                        "provider": provider,
+                        "task": task,
+                        "transport": "ros_action",
+                    }
+                )
+                progress_after = int(request_event.get("id", 1)) - 1
+                model = str(
+                    runtime.provider_status.get(provider, {}).get("model") or ""
+                )
+                turn_index = scene_qa_log.begin_turn(
+                    query=query,
+                    provider=provider,
+                    model=model,
+                    started_time_s=started_time_s,
+                    task=task,
+                )
+                runtime.activate_turn(
+                    turn_index,
+                    started_time_s=started_time_s,
+                    progress_after=progress_after,
+                )
+                if task == TASK_NAVIGATION:
+                    response = agent.answer_query(
+                        query,
+                        allow_follow_up_question=allow_follow_up_question,
+                    )
+                else:
+                    response = agent.answer_query(query)
+                response.history["task"] = task
+                if task == TASK_NAVIGATION:
+                    response.history["allow_follow_up_question"] = (
+                        allow_follow_up_question
+                    )
+                body = {
+                    "reasoning": response.reasoning,
+                    "answer": response.answer,
+                    "raw_text": response.raw_text,
+                    "history": response.history,
+                    "highlight_groups": highlight_groups_from_history(response.history),
+                    "provider": provider,
+                    "task": task,
+                    "model": response.history.get("model"),
+                }
+                runtime.add_progress(
+                    {
+                        "phase": "request_done",
+                        "message": f"{provider} {task} answer ready.",
+                        "provider": provider,
+                        "task": task,
+                        "transport": "ros_action",
+                    }
+                )
+                turn_finished = runtime.finish_turn(
+                    response={
+                        "reasoning": response.reasoning,
+                        "answer": response.answer,
+                        "raw_text": response.raw_text,
+                    },
+                    history=response.history,
+                )
+                if not is_current_runtime(runtime):
+                    raise QaActionBridgeError(
+                        "question result discarded after reset",
+                        status="qa_reset",
+                        http_status=409,
+                    )
+                return body
+            except QaActionBridgeError:
+                raise
+            except Exception as exc:
+                runtime.add_progress(
+                    {"phase": "request_error", "message": f"{type(exc).__name__}: {exc}"}
+                )
+                if not turn_finished:
+                    history = getattr(exc, "scene_qa_history", None)
+                    if not isinstance(history, dict):
+                        history = {}
+                    runtime.finish_turn(history=history, error=exc)
+                status = 409 if isinstance(exc, SceneQaCancelledError) else 500
+                raise QaActionBridgeError(
+                    f"{type(exc).__name__}: {exc}",
+                    status=(
+                        "action_cancelled"
+                        if isinstance(exc, SceneQaCancelledError)
+                        else "qa_execution_failed"
+                    ),
+                    http_status=status,
+                ) from exc
+            finally:
+                runtime.qa_lock.release()
+                if runtime.retired:
+                    runtime.close_resources()
+                else:
+                    runtime.cancel_event.clear()
+
+        def execute_action_goal(message: dict[str, Any]) -> dict[str, Any]:
+            task = str(message.get("task") or "").strip().lower()
+            if task not in TASK_NAMES:
+                raise QaActionBridgeError(
+                    f"unknown QA task: {task}",
+                    status="unknown_task",
+                    http_status=400,
+                )
+            execution_id = str(message.get("execution_id") or "")
+            runtime = current_runtime()
+            with action_execution_lock:
+                action_execution_runtimes[execution_id] = runtime
+            try:
+                body = execute_runtime_request(
+                    runtime,
+                    query=str(message.get("query") or "").strip(),
+                    provider=str(message.get("provider") or ""),
+                    task=task,
+                    allow_follow_up_question=bool(
+                        message.get("allow_follow_up_question", True)
+                    ),
+                )
+                answer = body.get("answer")
+                return {
+                    "body": body,
+                    "structured_result": answer if isinstance(answer, dict) else {},
+                }
+            finally:
+                with action_execution_lock:
+                    action_execution_runtimes.pop(execution_id, None)
+
+        def cancel_action_goal(message: dict[str, Any]) -> None:
+            execution_id = str(message.get("execution_id") or "")
+            with action_execution_lock:
+                runtime = action_execution_runtimes.get(execution_id)
+            if runtime is not None:
+                runtime.cancel_event.set()
+
         live_snapshot_paths: dict[int, Path] = {}
         live_snapshot_lock = threading.Lock()
         point_cloud_lock = threading.Lock()
@@ -3093,12 +3323,7 @@ def main() -> int:
         def read_graph() -> dict[str, Any]:
             if offline:
                 runtime = current_runtime()
-                graph_data["qa"] = {
-                    "default_provider": default_provider,
-                    "default_task": default_task,
-                    "providers": runtime.provider_status,
-                    "tasks": runtime.task_status,
-                }
+                graph_data["qa"] = qa_graph_payload(runtime)
                 return graph_data
             try:
                 client = LiveSceneQueryClient(
@@ -3110,12 +3335,7 @@ def main() -> int:
                 payload = live_graph_payload(args.service)
                 payload["load_error"] = f"{type(exc).__name__}: {exc}"
             runtime = current_runtime()
-            payload["qa"] = {
-                "default_provider": default_provider,
-                "default_task": default_task,
-                "providers": runtime.provider_status,
-                "tasks": runtime.task_status,
-            }
+            payload["qa"] = qa_graph_payload(runtime)
             return payload
 
         def read_object_details(object_id: int) -> dict[str, Any]:
@@ -3215,6 +3435,18 @@ def main() -> int:
                         "error": f"{type(exc).__name__}: {exc}",
                     }
 
+        if args.action_max_duration_sec < 0.0:
+            raise ValueError("action_max_duration_sec must be non-negative")
+        if args.request_transport == "actions":
+            qa_action_bridge = RosQaActionBridge(
+                execute_callback=execute_action_goal,
+                cancel_callback=cancel_action_goal,
+                action_prefix=args.action_prefix,
+                server_timeout_sec=args.action_server_timeout_sec,
+            )
+            graph_data["qa"]["request_transport"] = "ros_action"
+            graph_data["qa"]["action_names"] = qa_action_bridge.action_names
+
         server.snapshot_paths = snapshot_paths  # type: ignore[attr-defined]
         server.points_meta_json = json.dumps(points_meta(point_cloud), separators=(",", ":")).encode("utf-8")  # type: ignore[attr-defined]
         server.points_bytes = point_cloud.points.astype("<f4", copy=False).tobytes()  # type: ignore[attr-defined]
@@ -3223,6 +3455,8 @@ def main() -> int:
         server.progress_log = progress_log  # type: ignore[attr-defined]
         server.default_provider = default_provider  # type: ignore[attr-defined]
         server.default_task = default_task  # type: ignore[attr-defined]
+        server.qa_action_bridge = qa_action_bridge  # type: ignore[attr-defined]
+        server.action_max_duration_sec = float(args.action_max_duration_sec)  # type: ignore[attr-defined]
         server.scene_qa_log = scene_qa_log  # type: ignore[attr-defined]
         server.current_runtime = current_runtime  # type: ignore[attr-defined]
         server.is_current_runtime = is_current_runtime  # type: ignore[attr-defined]
@@ -3244,6 +3478,12 @@ def main() -> int:
                 for provider, task in initial_runtime.agents
             )
         )
+        if qa_action_bridge is not None:
+            print(
+                "QA request transport: ROS 2 actions ("
+                + ", ".join(qa_action_bridge.action_names.values())
+                + ")"
+            )
         if args.browser == "auto" and not args.no_browser:
             webbrowser.open(url)
         server.serve_forever()
@@ -3254,6 +3494,8 @@ def main() -> int:
             server.server_close()
         current_runtime = initial_runtime if server is None else server.current_runtime()  # type: ignore[attr-defined]
         current_runtime.cancel()
+        if qa_action_bridge is not None:
+            qa_action_bridge.close()
         current_runtime.close_resources()
         if point_sampler is not None:
             point_sampler.close()

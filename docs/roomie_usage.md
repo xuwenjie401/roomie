@@ -14,7 +14,8 @@ source /home/lindenbot/RealityLab/map_ws/install/setup.bash
 source /home/lindenbot/RealityLab/tools_ws/install/setup.bash
 ```
 
-若使用 Conda，建议编译时明确指定系统 Python，避免 `ament` Python 环境冲突。
+即使当前终端激活了 Conda，Roomie 的 CMake 也会默认使用
+`/usr/bin/python3` 生成 ROS 2 接口，避免 `ament` Python ABI 冲突。
 
 Scene QA 使用独立的 `jarvis` Conda 环境；本机默认路径为
 `/home/lindenbot/miniconda3/envs/jarvis/bin/python`。Gemini 需要
@@ -51,16 +52,15 @@ cd /home/lindenbot/RealityLab/jarvis
 
 colcon build \
   --packages-select roomie \
-  --symlink-install \
-  --cmake-args \
-    -DROOMIE_ENABLE_NVBLOX=ON \
-    -DPython3_EXECUTABLE=/usr/bin/python3 \
-    -Dnvblox_DIR=/home/lindenbot/RealityLab/map_ws/install/nvblox_ros/share/nvblox/cmake
+  --symlink-install
 
 source install/setup.bash
 ```
 
-仅使用 CPU 地图后端时，可以将 `ROOMIE_ENABLE_NVBLOX` 设置为 `OFF`。
+Roomie 默认构建完整的 NVBlox 地图后端。如果旧的 CMake cache 曾将
+`ROOMIE_ENABLE_NVBLOX` 设为 `OFF`，需要一次性增加 `--cmake-clean-cache`；
+后续使用上述简单命令即可。仅使用 CPU 地图后端时，可显式传入
+`--cmake-args -DROOMIE_ENABLE_NVBLOX=OFF`。
 
 当前 workspace 是 `--symlink-install`：`share/roomie/config`、launch 和 Python
 入口通常链接回源码。可用下面的命令确认具体文件：
@@ -689,7 +689,7 @@ ros2 run roomie roomie_scene_qa.py --once --task find_object_in_view \
 对应参数位于 `config/scene_qa/config.json`，也可用 `--in-view-*` CLI 参数覆盖。
 当前数据和最后有效缓存均不可用时任务失败退出，不会伪装成“未找到”。
 
-`roomie_agibot_live_with_qa.launch.py` 默认启动的 Web UI 也提供 `Scene QA`、
+`roomie_agibot_live_with_qa.launch.py` 启动的 Web UI 提供 `Scene QA`、
 `Navigation` 和 `In-view find` 三种模式。Navigation 模式可逐次选择是否允许在多个
 目的地间反问；Web 请求会按所选模式切换独立 system prompt 和有界工具集。启动时可用
 `qa_default_task:=scene_qa|navigation|find_object_in_view` 指定浏览器初始模式，例如：
@@ -698,6 +698,36 @@ ros2 run roomie roomie_scene_qa.py --once --task find_object_in_view \
 ros2 launch roomie roomie_agibot_live_with_qa.launch.py \
   qa_default_task:=find_object_in_view
 ```
+
+该 launch 是正式入口：浏览器的 `POST /ask` 响应格式与原来一致，但每个有效
+问答都会先发送 ROS 2 Action goal，再由对应 Action Server 执行 VLM 问答。进程同时
+注册下列三个 server：
+
+- `/roomie/scene_qa` (`roomie_msgs/action/RoomieSceneQA`)
+- `/roomie/navigation` (`roomie_msgs/action/RoomieNavigation`)
+- `/roomie/find_object_in_view` (`roomie_msgs/action/FindObjectInView`)
+
+可以使用 `ros2 action list -t` 检查。外部 Action Client 也可直接调用，例如：
+
+```bash
+ros2 action send_goal /roomie/find_object_in_view \
+  roomie_msgs/action/FindObjectInView \
+  "{task_description: '视野内有没有黄色瓶子', provider: 'gemini', max_duration_s: 0.0}" \
+  --feedback
+```
+
+`provider` 可为 `gemini`、`doubao` 或空字符串（使用 Web viewer 的默认 provider）；
+`max_duration_s: 0.0` 表示不设 Action 超时。三个 server 会并行注册，但共享同一套
+QA runtime，因此一次只执行一个 VLM 问答；并发 goal 会由忙状态保护拒绝。
+
+如需临时回退到原来的 Web 进程内直接调用路径，使用保留的兼容入口：
+
+```bash
+ros2 launch roomie roomie_agibot_live_with_qa_direct.launch.py
+```
+
+`roomie_agibot_live_with_qa_actions.launch.py` 仅作为早期 Action 入口名的兼容别名，
+行为与正式入口相同。
 
 离线 viewer 中 `In-view find` 会被禁用，因为它必须读取当前 Image、CameraInfo 和 TF。
 

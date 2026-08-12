@@ -72,10 +72,7 @@ backend，允许 head 的待处理旧帧被更新或丢弃。
 
 ```bash
 cd /home/lindenbot/RealityLab/jarvis
-colcon build --packages-select roomie --symlink-install \
-  --cmake-args -DROOMIE_ENABLE_NVBLOX=ON \
-  -DPython3_EXECUTABLE=/usr/bin/python3 \
-  -Dnvblox_DIR=/home/lindenbot/RealityLab/map_ws/install/nvblox_ros/share/nvblox/cmake
+colcon build --packages-select roomie --symlink-install
 source install/setup.bash
 ```
 

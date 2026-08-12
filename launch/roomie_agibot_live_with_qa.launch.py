@@ -42,7 +42,11 @@ def default_qa_python() -> str:
     return str(jarvis_python) if jarvis_python.exists() else sys.executable
 
 
-def generate_launch_description() -> LaunchDescription:
+def generate_launch_description(
+    qa_request_transport: str = "actions",
+) -> LaunchDescription:
+    if qa_request_transport not in {"direct", "actions"}:
+        raise ValueError("qa_request_transport must be direct or actions")
     share = Path(get_package_share_directory("roomie"))
     mapping_launch = share / "launch" / "roomie_agibot_live.launch.py"
 
@@ -120,6 +124,8 @@ def generate_launch_description() -> LaunchDescription:
             qa_point_topic,
             "--live-max-points",
             qa_live_max_points,
+            "--request-transport",
+            qa_request_transport,
         ],
         output="screen",
         emulate_tty=True,

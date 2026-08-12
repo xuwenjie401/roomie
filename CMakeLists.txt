@@ -1,4 +1,28 @@
 cmake_minimum_required(VERSION 3.16)
+
+# ROS 2 Humble and the installed binary dependencies use the host toolchain.
+# Conda base exports CC/CXX pointing at a private sysroot, which hides system
+# packages such as spdlog. Keep a zero-argument colcon build on the compatible
+# host compilers while still honoring explicit -D CMake compiler/toolchain
+# selections.
+if(NOT DEFINED CMAKE_TOOLCHAIN_FILE)
+  if(NOT DEFINED CMAKE_C_COMPILER)
+    set(CMAKE_C_COMPILER "/usr/bin/gcc" CACHE FILEPATH
+        "Default C compiler for the Roomie ROS 2 build")
+  endif()
+  if(NOT DEFINED CMAKE_CXX_COMPILER)
+    set(CMAKE_CXX_COMPILER "/usr/bin/g++" CACHE FILEPATH
+        "Default C++ compiler for the Roomie ROS 2 build")
+  endif()
+endif()
+
+# Select the ROS-compatible Python ABI before ament packages can discover the
+# active Conda interpreter. Override ROOMIE_PYTHON_EXECUTABLE when needed.
+set(ROOMIE_PYTHON_EXECUTABLE "/usr/bin/python3" CACHE FILEPATH
+    "Python interpreter used to build Roomie ROS 2 interfaces")
+set(Python3_EXECUTABLE "${ROOMIE_PYTHON_EXECUTABLE}" CACHE FILEPATH
+    "Python interpreter used by CMake FindPython3" FORCE)
+
 project(roomie)
 
 set(CMAKE_CXX_STANDARD 17)
@@ -9,7 +33,7 @@ if(CMAKE_COMPILER_IS_GNUCXX OR CMAKE_CXX_COMPILER_ID MATCHES "Clang")
   add_compile_options(-Wall -Wextra -Wpedantic)
 endif()
 
-option(ROOMIE_ENABLE_NVBLOX "Build the nvblox-backed map backend" OFF)
+option(ROOMIE_ENABLE_NVBLOX "Build the nvblox-backed map backend" ON)
 set(ROOMIE_NVBLOX_SOURCE_DIR
     "/home/lindenbot/RealityLab/map_ws/src/nvblox"
     CACHE PATH
@@ -316,6 +340,9 @@ if(BUILD_TESTING)
                         TIMEOUT 30)
   ament_add_pytest_test(test_detection_view_worker_ros
                         test/test_detection_view_worker_ros.py
+                        TIMEOUT 30)
+  ament_add_pytest_test(test_qa_action_bridge_ros
+                        test/test_qa_action_bridge_ros.py
                         TIMEOUT 30)
   ament_add_gtest(test_embedding_runtime_actor
                   test/test_embedding_runtime_actor.cpp)

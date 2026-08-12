@@ -277,15 +277,19 @@ def create_default_tool_registry(
         ToolSpec(
             name="search_objects",
             description=(
-                "Find objects by semantic description using the local object embedding index. "
-                "Use this first for object identity, color, material, or descriptive queries."
+                "Use first to find scene objects by meaning or appearance. Return ranked "
+                "stable object candidates with semantic scores; semantic similarity is "
+                "candidate evidence, not exact identity confirmation."
             ),
             parameters_json_schema={
                 "type": "object",
                 "properties": {
                     "description": {
                         "type": "string",
-                        "description": "Detailed semantic description of the object(s) to find.",
+                        "description": (
+                            "English description of the requested object, including useful "
+                            "category, color, material, or appearance details."
+                        ),
                     },
                     "top_k": {
                         "type": "integer",
@@ -322,8 +326,9 @@ def create_default_tool_registry(
         ToolSpec(
             name="get_object",
             description=(
-                "Return detailed lightweight metadata for one object id, including room, "
-                "geometry, snapshot metadata, and nearby objects."
+                "Use after obtaining a concrete object_id to inspect that object's "
+                "structured metadata, room, geometry, snapshot metadata, and optional "
+                "nearby objects. This does not attach the snapshot image."
             ),
             parameters_json_schema={
                 "type": "object",
@@ -362,9 +367,9 @@ def create_default_tool_registry(
         ToolSpec(
             name="list_rooms",
             description=(
-                "List all manually annotated rooms/regions with bounds, object counts, "
-                "and representative objects. If no explicit room exists, all stable "
-                "scene objects are assigned to the queryable room-0."
+                "Use for room-level questions or before restricting a query to a room. "
+                "Return canonical rooms with bounds and member ids; when no explicit room "
+                "exists, return the implicit room-0."
             ),
             parameters_json_schema={"type": "object", "properties": {}},
             handler=list_rooms,
@@ -424,8 +429,9 @@ def create_default_tool_registry(
         ToolSpec(
             name="get_objects_in_room",
             description=(
-                "Return objects in a specific room. If description is provided, rank room "
-                "objects semantically against that description."
+                "Use with a room_id from list_rooms to list that room's objects. When an "
+                "object description is supplied, return semantic candidates restricted "
+                "to the room."
             ),
             parameters_json_schema={
                 "type": "object",
@@ -489,8 +495,9 @@ def create_default_tool_registry(
         ToolSpec(
             name="get_objects_near",
             description=(
-                "Return objects within a metric radius of either an object id or an explicit "
-                "3D position. Use for spatial proximity questions."
+                "Use for metric proximity questions. Return objects within radius_m of "
+                "either one anchor object_id or one explicit world position. Proximity is "
+                "not evidence of an in/on relation."
             ),
             parameters_json_schema={
                 "type": "object",
@@ -541,9 +548,9 @@ def create_default_tool_registry(
         ToolSpec(
             name="list_furniture",
             description=(
-                "List canonical furniture roles and their underlying object metadata. "
-                "Use for questions about desks, tables, sofas, chairs, shelves, beds, "
-                "cabinets, nightstands, or drawers."
+                "Use first for furniture identity or in/on-furniture questions. Return "
+                "canonical furniture roles with their same-id object metadata; optionally "
+                "filter by an exact normalized furniture class."
             ),
             parameters_json_schema={
                 "type": "object",
@@ -585,9 +592,10 @@ def create_default_tool_registry(
         ToolSpec(
             name="get_objects_related",
             description=(
-                "Return all stable objects canonically classified as in or on one "
-                "furniture object. Each object includes relation='in' or relation='on'; "
-                "this is a containment/support query, not a proximity query."
+                "Use after list_furniture to retrieve stable objects canonically related "
+                "to one furniture_id. Each result explicitly states relation='in' or "
+                "relation='on'; this is authoritative containment/support evidence, not "
+                "a proximity result."
             ),
             parameters_json_schema={
                 "type": "object",
@@ -626,8 +634,9 @@ def create_default_tool_registry(
         ToolSpec(
             name="get_relations",
             description=(
-                "Return canonical scene relations, including object/furniture 'in' and "
-                "'on' relations and room containment."
+                "Use to inspect canonical typed relations for one object or across the "
+                "scene, optionally filtered by relation type and direction. Return stored "
+                "relations only; do not infer unstated relations."
             ),
             parameters_json_schema={
                 "type": "object",
@@ -655,8 +664,8 @@ def create_default_tool_registry(
         ToolSpec(
             name="compare_objects",
             description=(
-                "Return compact metadata for several candidate object ids side by side. "
-                "Use after search_objects when candidates need disambiguation."
+                "Use after search_objects when several known object ids need structured "
+                "comparison. Return their metadata side by side without attaching images."
             ),
             parameters_json_schema={
                 "type": "object",
@@ -731,8 +740,9 @@ def create_default_tool_registry(
         ToolSpec(
             name="inspect_snapshot",
             description=(
-                "Attach the object's snapshot image for visual inspection by Gemini. "
-                "Use this when labels/descriptions are ambiguous or the answer depends on visual details."
+                "Use for a known object_id when identity or visual attributes remain "
+                "ambiguous after structured inspection. Attach that object's historical "
+                "scene snapshot; it is not a current camera observation."
             ),
             parameters_json_schema={
                 "type": "object",
@@ -807,16 +817,19 @@ def create_live_tool_registry(
         ToolSpec(
             name="search_objects",
             description=(
-                "Find objects by semantic description in the live Roomie scene. "
-                "The QA-visible set contains stable publishable objects regardless "
-                "of active state. Results are pinned to this answer's scene revision."
+                "Use first to find scene objects by meaning or appearance. Return ranked "
+                "stable object candidates with semantic scores from this answer's pinned "
+                "scene revision; semantic similarity is not exact identity confirmation."
             ),
             parameters_json_schema={
                 "type": "object",
                 "properties": {
                     "description": {
                         "type": "string",
-                        "description": "Detailed semantic object description.",
+                        "description": (
+                            "English description of the requested object, including useful "
+                            "category, color, material, or appearance details."
+                        ),
                     },
                     "top_k": {"type": "integer"},
                     "room_id": {
@@ -856,14 +869,21 @@ def create_live_tool_registry(
         ToolSpec(
             name="get_object",
             description=(
-                "Return metadata for one live object and optionally nearby objects "
-                "from the same pinned scene revision."
+                "Use after obtaining a concrete object_id to inspect that object's "
+                "structured metadata and optional nearby objects from the same pinned "
+                "scene revision. This does not attach the snapshot image."
             ),
             parameters_json_schema={
                 "type": "object",
                 "properties": {
-                    "object_id": {"type": "integer"},
-                    "include_neighbors": {"type": "boolean"},
+                    "object_id": {
+                        "type": "integer",
+                        "description": "Concrete Roomie object id returned by a scene tool.",
+                    },
+                    "include_neighbors": {
+                        "type": "boolean",
+                        "description": "Whether to include nearby objects within 1 meter.",
+                    },
                 },
                 "required": ["object_id"],
             },
@@ -879,8 +899,9 @@ def create_live_tool_registry(
         ToolSpec(
             name="list_rooms",
             description=(
-                "List canonical rooms and their live object ids. If no explicit room "
-                "exists, all stable scene objects are assigned to the queryable room-0."
+                "Use for room-level questions or before restricting a query to a room. "
+                "Return canonical rooms with member ids; when no explicit room exists, "
+                "return the implicit room-0."
             ),
             parameters_json_schema={"type": "object", "properties": {}},
             handler=list_rooms,
@@ -937,8 +958,9 @@ def create_live_tool_registry(
         ToolSpec(
             name="get_objects_in_room",
             description=(
-                "Return live objects in a canonical room; optionally rank them by "
-                "a semantic description."
+                "Use with a room_id from list_rooms to list that room's objects. When an "
+                "object description is supplied, return semantic candidates restricted "
+                "to the room."
             ),
             parameters_json_schema={
                 "type": "object",
@@ -947,8 +969,17 @@ def create_live_tool_registry(
                         "type": "string",
                         "description": "Canonical room id returned by list_rooms.",
                     },
-                    "description": {"type": "string"},
-                    "top_k": {"type": "integer"},
+                    "description": {
+                        "type": "string",
+                        "description": (
+                            "Optional English object description for semantic search "
+                            "within the room."
+                        ),
+                    },
+                    "top_k": {
+                        "type": "integer",
+                        "description": "Maximum number of objects to return.",
+                    },
                 },
                 "required": ["room_id"],
             },
@@ -1006,20 +1037,32 @@ def create_live_tool_registry(
         ToolSpec(
             name="get_objects_near",
             description=(
-                "Return live objects within a metric radius of an object or world position."
+                "Use for metric proximity questions. Return objects within radius_m of "
+                "either one anchor object_id or one explicit world position. Proximity is "
+                "not evidence of an in/on relation."
             ),
             parameters_json_schema={
                 "type": "object",
                 "properties": {
-                    "radius_m": {"type": "number"},
-                    "object_id": {"type": "integer"},
+                    "radius_m": {
+                        "type": "number",
+                        "description": "Search radius in meters.",
+                    },
+                    "object_id": {
+                        "type": "integer",
+                        "description": "Optional object id used as the search center.",
+                    },
                     "position": {
                         "type": "array",
                         "items": {"type": "number"},
                         "minItems": 3,
                         "maxItems": 3,
+                        "description": "Optional explicit world position [x, y, z].",
                     },
-                    "top_k": {"type": "integer"},
+                    "top_k": {
+                        "type": "integer",
+                        "description": "Maximum number of objects to return.",
+                    },
                 },
                 "required": ["radius_m"],
             },
@@ -1061,7 +1104,9 @@ def create_live_tool_registry(
         ToolSpec(
             name="list_furniture",
             description=(
-                "List live canonical furniture roles and their same-id object metadata."
+                "Use first for furniture identity or in/on-furniture questions. Return "
+                "canonical furniture roles with their same-id object metadata; optionally "
+                "filter by an exact normalized furniture class."
             ),
             parameters_json_schema={
                 "type": "object",
@@ -1132,9 +1177,10 @@ def create_live_tool_registry(
         ToolSpec(
             name="get_objects_related",
             description=(
-                "Return all stable objects canonically classified as in or on one "
-                "furniture object. Each object includes relation='in' or relation='on'; "
-                "this is a containment/support query, not a proximity query."
+                "Use after list_furniture to retrieve stable objects canonically related "
+                "to one furniture_id. Each result explicitly states relation='in' or "
+                "relation='on'; this is authoritative containment/support evidence, not "
+                "a proximity result."
             ),
             parameters_json_schema={
                 "type": "object",
@@ -1175,8 +1221,9 @@ def create_live_tool_registry(
         ToolSpec(
             name="get_relations",
             description=(
-                "Return live canonical object, furniture, and room relations from the "
-                "same pinned scene revision."
+                "Use to inspect canonical typed relations for one object or across the "
+                "pinned scene revision, optionally filtered by relation type and "
+                "direction. Return stored relations only; do not infer unstated relations."
             ),
             parameters_json_schema={
                 "type": "object",
@@ -1207,11 +1254,18 @@ def create_live_tool_registry(
     registry.register(
         ToolSpec(
             name="compare_objects",
-            description="Compare metadata for several live object candidates.",
+            description=(
+                "Use after search_objects when several known object ids need structured "
+                "comparison. Return their metadata side by side without attaching images."
+            ),
             parameters_json_schema={
                 "type": "object",
                 "properties": {
-                    "object_ids": {"type": "array", "items": {"type": "integer"}}
+                    "object_ids": {
+                        "type": "array",
+                        "items": {"type": "integer"},
+                        "description": "Concrete object ids returned by scene tools.",
+                    }
                 },
                 "required": ["object_ids"],
             },
@@ -1240,14 +1294,25 @@ def create_live_tool_registry(
         ToolSpec(
             name="inspect_snapshot",
             description=(
-                "Attach a snapshot asset resolved by the live pinned scene token."
+                "Use for a known object_id when identity or visual attributes remain "
+                "ambiguous after structured inspection. Attach that object's historical "
+                "scene snapshot; it is not a current camera observation."
             ),
             parameters_json_schema={
                 "type": "object",
                 "properties": {
-                    "object_id": {"type": "integer"},
-                    "crop": {"type": "boolean"},
-                    "draw_bbox": {"type": "boolean"},
+                    "object_id": {
+                        "type": "integer",
+                        "description": "Concrete object id returned by a scene tool.",
+                    },
+                    "crop": {
+                        "type": "boolean",
+                        "description": "Whether to crop around the object's snapshot bbox.",
+                    },
+                    "draw_bbox": {
+                        "type": "boolean",
+                        "description": "Whether to draw the snapshot bbox on the image.",
+                    },
                 },
                 "required": ["object_id"],
             },
