@@ -99,6 +99,14 @@ def test_output_messages_use_rectified_geometry_and_camera_frame() -> None:
 
 
 def test_pipeline_configs_enable_detection_only_hand_cameras() -> None:
+    confirmation_bypass_labels = [
+        "medicine_carton",
+        "labeled_package",
+        "printed_carton",
+        "box",
+        "bottled_water",
+        "plastic_bag",
+    ]
     for name in (
         "pipeline_agibot_head_mapping.yaml",
         "pipeline_genie_live.yaml",
@@ -113,6 +121,11 @@ def test_pipeline_configs_enable_detection_only_hand_cameras() -> None:
         ]
         queues = document["roomie_pipeline_node"]["ros__parameters"]["queues"]
         assert queues["detection_queue_size"] >= 3
+        instance = document["roomie_pipeline_node"]["ros__parameters"]["instance"]
+        assert (
+            instance["presence_confirmation_bypass_labels"]
+            == confirmation_bypass_labels
+        )
 
 
 def test_adapter_defaults_disabled_and_skips_before_image_processing() -> None:

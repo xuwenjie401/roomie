@@ -7,18 +7,24 @@ import json
 from pathlib import Path
 from typing import Any
 
+from .object_references import default_object_reference_root
+
 
 DEFAULT_DESCRIBED_JSON = Path(
     "/home/lindenbot/Datasets/output/jarvis_home/instances/latest.dam_described.json"
 )
 DEFAULT_EMBEDDING_MODEL = Path("/home/lindenbot/hugging_face/sentence_t5_large")
 DEFAULT_GEMINI_MODEL = "gemini-flash-latest"
-DEFAULT_DOUBAO_MODEL = "doubao-seed-2-0-lite-260428"
+DEFAULT_DOUBAO_MODEL = "doubao-seed-2-0-lite-260215"
 DEFAULT_DOUBAO_BASE_URL = "https://ark.cn-beijing.volces.com/api/v3"
 DEFAULT_DOUBAO_THINKING_TYPE = "disabled"
 DOUBAO_THINKING_TYPES = frozenset({"enabled", "disabled", "auto"})
 DEFAULT_QA_CONFIG_NAME = "config.json"
 DEFAULT_SYSTEM_PROMPT_PATH = Path("prompts/system.txt")
+DEFAULT_NAVIGATION_SYSTEM_PROMPT_PATH = Path("prompts/navigation.txt")
+DEFAULT_FIND_OBJECT_IN_VIEW_SYSTEM_PROMPT_PATH = Path(
+    "prompts/find_object_in_view.txt"
+)
 FALLBACK_SYSTEM_PROMPT = """You are a scene understanding assistant for a Roomie 3D scene graph.
 
 Use the provided tools to inspect the scene. Answer in the same language as the user.
@@ -105,7 +111,23 @@ class SceneQaConfig:
     max_output_tokens: int = 4096
     snapshot_max_side_px: int = 1024
     snapshot_bbox_pad_px: int = 8
+    object_reference_root: Path = field(default_factory=default_object_reference_root)
+    object_reference_max_scene_objects: int = 4
     system_prompt_path: Path = DEFAULT_SYSTEM_PROMPT_PATH
+    navigation_system_prompt_path: Path = DEFAULT_NAVIGATION_SYSTEM_PROMPT_PATH
+    find_object_in_view_system_prompt_path: Path = (
+        DEFAULT_FIND_OBJECT_IN_VIEW_SYSTEM_PROMPT_PATH
+    )
+    in_view_image_topic: str = "/roomie/input/head_color/image_rect"
+    in_view_camera_info_topic: str = "/roomie/input/head_color/camera_info"
+    in_view_detection_image_topic: str = "/roomie/detections_2d_image"
+    in_view_detection_result_topic: str = "/roomie/detections_2d"
+    in_view_world_frame: str = "map"
+    in_view_camera_frame: str = "head_color"
+    in_view_min_depth_m: float = 0.1
+    in_view_max_depth_m: float = 6.0
+    in_view_sensor_timeout_s: float = 1.0
+    in_view_tf_tolerance_s: float = 0.2
     _config_dir: Path | None = field(default=None, repr=False, compare=False)
 
     def resolved_graph_json(self) -> Path:
@@ -114,12 +136,26 @@ class SceneQaConfig:
     def resolved_embedding_model(self) -> Path:
         return self.embedding_model.expanduser().resolve()
 
+    def resolved_object_reference_root(self) -> Path:
+        path = self.object_reference_root.expanduser()
+        if path.is_absolute():
+            return path.resolve()
+        base = self._config_dir or default_qa_config_path().parent
+        return (base / path).resolve()
+
     def resolved_system_prompt_path(self) -> Path:
         path = self.system_prompt_path.expanduser()
         if path.is_absolute():
             return path.resolve()
         base = self._config_dir or default_qa_config_path().parent
         return (base / path).resolve()
+
+    def system_prompt_path_for_task(self, task: str) -> Path:
+        if task == "navigation":
+            return self.navigation_system_prompt_path
+        if task == "find_object_in_view":
+            return self.find_object_in_view_system_prompt_path
+        return self.system_prompt_path
 
     def load_system_prompt(self) -> str:
         path = self.resolved_system_prompt_path()
@@ -175,8 +211,58 @@ class SceneQaConfig:
             snapshot_bbox_pad_px=_int_or_default(
                 data.get("snapshot_bbox_pad_px"), defaults.snapshot_bbox_pad_px
             ),
+            object_reference_root=_path_or_default(
+                data.get("object_reference_root"), defaults.object_reference_root
+            ),
+            object_reference_max_scene_objects=_int_or_default(
+                data.get("object_reference_max_scene_objects"),
+                defaults.object_reference_max_scene_objects,
+            ),
             system_prompt_path=_path_or_default(
                 data.get("system_prompt_path"), defaults.system_prompt_path
+            ),
+            navigation_system_prompt_path=_path_or_default(
+                data.get("navigation_system_prompt_path"),
+                defaults.navigation_system_prompt_path,
+            ),
+            find_object_in_view_system_prompt_path=_path_or_default(
+                data.get("find_object_in_view_system_prompt_path"),
+                defaults.find_object_in_view_system_prompt_path,
+            ),
+            in_view_image_topic=str(
+                data.get("in_view_image_topic") or defaults.in_view_image_topic
+            ),
+            in_view_camera_info_topic=str(
+                data.get("in_view_camera_info_topic")
+                or defaults.in_view_camera_info_topic
+            ),
+            in_view_detection_image_topic=str(
+                data.get("in_view_detection_image_topic")
+                or defaults.in_view_detection_image_topic
+            ),
+            in_view_detection_result_topic=str(
+                data.get("in_view_detection_result_topic")
+                or defaults.in_view_detection_result_topic
+            ),
+            in_view_world_frame=str(
+                data.get("in_view_world_frame") or defaults.in_view_world_frame
+            ),
+            in_view_camera_frame=str(
+                data.get("in_view_camera_frame") or defaults.in_view_camera_frame
+            ),
+            in_view_min_depth_m=_float_or_default(
+                data.get("in_view_min_depth_m"), defaults.in_view_min_depth_m
+            ),
+            in_view_max_depth_m=_float_or_default(
+                data.get("in_view_max_depth_m"), defaults.in_view_max_depth_m
+            ),
+            in_view_sensor_timeout_s=_float_or_default(
+                data.get("in_view_sensor_timeout_s"),
+                defaults.in_view_sensor_timeout_s,
+            ),
+            in_view_tf_tolerance_s=_float_or_default(
+                data.get("in_view_tf_tolerance_s"),
+                defaults.in_view_tf_tolerance_s,
             ),
             _config_dir=config_dir,
         )

@@ -15,6 +15,12 @@ from .config import SceneQaConfig
 from .embeddings import ObjectSearchIndex
 from .graph_store import GraphStore, _as_vec3, _round
 from .live_query import LiveSceneQueryClient
+from .object_references import (
+    ObjectReferenceCatalog,
+    ObjectReferenceCatalogLoad,
+    PublishedObjectReference,
+    reference_catalog_prompt,
+)
 
 
 IMPLICIT_ROOM_ID = "room-0"
@@ -85,11 +91,13 @@ class ToolRegistry:
         begin_answer: Callable[[], dict[str, Any] | None] | None = None,
         end_answer: Callable[[], None] | None = None,
         answer_metadata: Callable[[], dict[str, Any] | None] | None = None,
+        system_prompt_suffix: str = "",
     ):
         self._tools: dict[str, ToolSpec] = {}
         self._begin_answer = begin_answer
         self._end_answer = end_answer
         self._answer_metadata = answer_metadata
+        self._system_prompt_suffix = system_prompt_suffix.strip()
 
     def register(self, spec: ToolSpec) -> None:
         self._tools[spec.name] = spec
@@ -111,7 +119,9 @@ class ToolRegistry:
             return self._tools[name].handler(**(args or {}))
         except Exception as exc:
             status = getattr(exc, "status", None)
-            if status in FATAL_SCENE_QUERY_STATUSES:
+            if status in FATAL_SCENE_QUERY_STATUSES or str(status or "").startswith(
+                "camera_"
+            ):
                 raise
             response = {"error": f"{type(exc).__name__}: {exc}"}
             if status:
@@ -130,6 +140,12 @@ class ToolRegistry:
 
     def answer_metadata(self) -> dict[str, Any] | None:
         return self._answer_metadata() if self._answer_metadata is not None else None
+
+    def system_prompt(self, base_prompt: str) -> str:
+        base = base_prompt.strip()
+        if not self._system_prompt_suffix:
+            return base
+        return f"{base}\n\n{self._system_prompt_suffix}"
 
 
 def _implicit_room(
@@ -209,8 +225,15 @@ def create_default_tool_registry(
     graph: GraphStore,
     search_index: ObjectSearchIndex,
     config: SceneQaConfig,
+    reference_catalog_load: ObjectReferenceCatalogLoad | None = None,
 ) -> ToolRegistry:
-    registry = ToolRegistry()
+    registry = ToolRegistry(
+        system_prompt_suffix=(
+            reference_catalog_prompt(reference_catalog_load)
+            if reference_catalog_load is not None
+            else ""
+        )
+    )
 
     def room_to_dict(room_id: int) -> dict[str, Any]:
         data = graph.room_to_dict(graph.get_room(room_id))
@@ -730,12 +753,17 @@ def create_default_tool_registry(
         )
     )
 
+    if reference_catalog_load is not None and reference_catalog_load.catalog is not None:
+        _register_offline_reference_tools(
+            registry, reference_catalog_load.catalog, graph, config
+        )
     return registry
 
 
 def create_live_tool_registry(
     client: LiveSceneQueryClient,
     config: SceneQaConfig,
+    reference_catalog_load: ObjectReferenceCatalogLoad | None = None,
 ) -> ToolRegistry:
     """Create Gemini tools backed exclusively by the live query gateway."""
 
@@ -743,6 +771,11 @@ def create_live_tool_registry(
         begin_answer=client.begin_answer,
         end_answer=client.end_answer,
         answer_metadata=client.session_metadata,
+        system_prompt_suffix=(
+            reference_catalog_prompt(reference_catalog_load)
+            if reference_catalog_load is not None
+            else ""
+        ),
     )
 
     def search_objects(
@@ -1222,6 +1255,10 @@ def create_live_tool_registry(
         )
     )
 
+    if reference_catalog_load is not None and reference_catalog_load.catalog is not None:
+        _register_live_reference_tools(
+            registry, reference_catalog_load.catalog, client, config
+        )
     return registry
 
 
@@ -1332,3 +1369,329 @@ def _asset_path(asset: dict[str, Any]) -> Path | None:
     if not parsed.scheme:
         return Path(uri).expanduser()
     return None
+
+
+def _reference_attachments(
+    reference: PublishedObjectReference,
+) -> list[MediaAttachment]:
+    attachments = []
+    for image in reference.images:
+        label = (
+            f"REFERENCE reference_id={reference.reference_id!r}, "
+            f"name={reference.name!r}, rank={image.rank}, "
+            f"view={image.view_label!r}."
+        )
+        attachments.append(
+            MediaAttachment(
+                data=image.path.read_bytes(),
+                mime_type="image/jpeg",
+                summary={
+                    "role": "reference",
+                    "label": label,
+                    "reference_id": reference.reference_id,
+                    "reference_name": reference.name,
+                    **image.metadata(),
+                },
+            )
+        )
+    return attachments
+
+
+def _register_reference_inspection_tool(
+    registry: ToolRegistry,
+    catalog: ObjectReferenceCatalog,
+) -> None:
+    def inspect_object_reference(reference_id: str) -> ToolResult:
+        reference = catalog.get(str(reference_id))
+        media = _reference_attachments(reference)
+        return ToolResult(
+            {
+                "catalog_build_id": catalog.build_id,
+                "reference": reference.metadata(),
+                "image_attached_count": len(media),
+                "media_order": [dict(item.summary) for item in media],
+                "message": (
+                    "These are curated visual reference views, not scene observations."
+                ),
+            },
+            media,
+        )
+
+    registry.register(
+        ToolSpec(
+            name="inspect_object_reference",
+            description=(
+                "Attach the three curated views for one exact local reference_id. "
+                "This only inspects the scene-independent reference; it does not "
+                "search or inspect scene objects."
+            ),
+            parameters_json_schema={
+                "type": "object",
+                "properties": {
+                    "reference_id": {
+                        "type": "string",
+                        "description": (
+                            "Exact reference_id listed in the runtime system prompt."
+                        ),
+                    }
+                },
+                "required": ["reference_id"],
+            },
+            handler=inspect_object_reference,
+        )
+    )
+
+
+def _validated_comparison_object_ids(
+    object_ids: Any,
+    maximum: int,
+) -> list[int]:
+    if not isinstance(object_ids, list) or not object_ids:
+        raise ValueError("object_ids must be a non-empty array")
+    unique = []
+    seen: set[int] = set()
+    for value in object_ids:
+        if isinstance(value, bool):
+            raise ValueError("object_ids must contain integers")
+        try:
+            object_id = int(value)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("object_ids must contain integers") from exc
+        if object_id not in seen:
+            seen.add(object_id)
+            unique.append(object_id)
+    if len(unique) > maximum:
+        raise ValueError(f"at most {maximum} unique object_ids may be compared")
+    return unique
+
+
+def _comparison_snapshot_attachment(
+    metadata: dict[str, Any],
+    attachment: MediaAttachment,
+    object_id: int,
+) -> MediaAttachment:
+    label = f"SCENE OBJECT object_id={object_id}; cropped object snapshot."
+    return MediaAttachment(
+        data=attachment.data,
+        mime_type=attachment.mime_type,
+        summary={
+            **attachment.summary,
+            "role": "scene_object",
+            "label": label,
+            "object_id": object_id,
+            "snapshot": metadata,
+        },
+    )
+
+
+def _offline_comparison_snapshot(
+    graph: GraphStore,
+    object_id: int,
+    config: SceneQaConfig,
+) -> tuple[dict[str, Any], MediaAttachment] | None:
+    record = graph.get_object(object_id)
+    image_path = graph.snapshot_image_path(record)
+    if image_path is None or record.snapshot is None:
+        return None
+    bbox = record.snapshot.get("bbox_xyxy")
+    with Image.open(image_path) as stream:
+        image = stream.convert("RGB")
+    original_size = image.size
+    crop_box = None
+    if isinstance(bbox, list) and len(bbox) >= 4:
+        x0, y0, x1, y1 = [float(value) for value in bbox[:4]]
+        left = max(0, int(math.floor(min(x0, x1) - config.snapshot_bbox_pad_px)))
+        top = max(0, int(math.floor(min(y0, y1) - config.snapshot_bbox_pad_px)))
+        right = min(
+            image.width,
+            int(math.ceil(max(x0, x1) + config.snapshot_bbox_pad_px)),
+        )
+        bottom = min(
+            image.height,
+            int(math.ceil(max(y0, y1) + config.snapshot_bbox_pad_px)),
+        )
+        if right > left and bottom > top:
+            crop_box = (left, top, right, bottom)
+    if crop_box is not None:
+        image = image.crop(crop_box)
+    max_side = max(64, int(config.snapshot_max_side_px))
+    if max(image.size) > max_side:
+        image.thumbnail((max_side, max_side))
+    buffer = io.BytesIO()
+    image.save(buffer, format="JPEG", quality=90)
+    metadata = {
+        "image_path": str(image_path),
+        "original_size": list(original_size),
+        "returned_size": list(image.size),
+        "cropped": crop_box is not None,
+        "bbox_drawn": False,
+    }
+    attachment = MediaAttachment(
+        data=buffer.getvalue(),
+        mime_type="image/jpeg",
+        summary={
+            "mime_type": "image/jpeg",
+            "bytes": buffer.tell(),
+            "returned_size": list(image.size),
+        },
+    )
+    return metadata, attachment
+
+
+def _register_offline_reference_tools(
+    registry: ToolRegistry,
+    catalog: ObjectReferenceCatalog,
+    graph: GraphStore,
+    config: SceneQaConfig,
+) -> None:
+    _register_reference_inspection_tool(registry, catalog)
+    maximum = max(1, min(16, int(config.object_reference_max_scene_objects)))
+
+    def compare_scene_objects_to_reference(
+        reference_id: str,
+        object_ids: list[int],
+    ) -> ToolResult:
+        reference = catalog.get(str(reference_id))
+        ids = _validated_comparison_object_ids(object_ids, maximum)
+        scene_objects = []
+        media = _reference_attachments(reference)
+        for object_id in ids:
+            record = graph.get_object(object_id)
+            if not record.publishable:
+                raise ValueError(f"object {object_id} is not query-visible")
+            item = graph.object_to_dict(record)
+            snapshot = _offline_comparison_snapshot(graph, object_id, config)
+            item["comparison_snapshot_attached"] = snapshot is not None
+            if snapshot is not None:
+                item["comparison_snapshot"] = snapshot[0]
+                media.append(
+                    _comparison_snapshot_attachment(snapshot[0], snapshot[1], object_id)
+                )
+            scene_objects.append(item)
+        return _comparison_tool_result(catalog, reference, scene_objects, media)
+
+    _register_comparison_spec(
+        registry, compare_scene_objects_to_reference, maximum
+    )
+
+
+def _register_live_reference_tools(
+    registry: ToolRegistry,
+    catalog: ObjectReferenceCatalog,
+    client: LiveSceneQueryClient,
+    config: SceneQaConfig,
+) -> None:
+    _register_reference_inspection_tool(registry, catalog)
+    maximum = max(1, min(16, int(config.object_reference_max_scene_objects)))
+
+    def compare_scene_objects_to_reference(
+        reference_id: str,
+        object_ids: list[int],
+    ) -> ToolResult:
+        reference = catalog.get(str(reference_id))
+        ids = _validated_comparison_object_ids(object_ids, maximum)
+        calls = []
+        for object_id in ids:
+            calls.extend(
+                [
+                    {"method": "get_object", "params": {"object_id": object_id}},
+                    {
+                        "method": "inspect_snapshot",
+                        "params": {"object_id": object_id},
+                    },
+                ]
+            )
+        values = client.call_many(calls)
+        scene_objects = []
+        media = _reference_attachments(reference)
+        for index, object_id in enumerate(ids):
+            item = _live_object(values[index * 2])
+            if item.get("publishable") is False:
+                raise ValueError(f"object {object_id} is not query-visible")
+            snapshot = _live_snapshot_media(
+                values[index * 2 + 1], config, crop=True, draw_bbox=False
+            )
+            item["comparison_snapshot_attached"] = snapshot is not None
+            if snapshot is not None:
+                item["comparison_snapshot"] = snapshot[0]
+                media.append(
+                    _comparison_snapshot_attachment(snapshot[0], snapshot[1], object_id)
+                )
+            scene_objects.append(item)
+        result = _comparison_tool_result(catalog, reference, scene_objects, media)
+        session = registry.answer_metadata()
+        if session is not None:
+            result.response["read_session"] = session
+        return result
+
+    _register_comparison_spec(
+        registry, compare_scene_objects_to_reference, maximum
+    )
+
+
+def _comparison_tool_result(
+    catalog: ObjectReferenceCatalog,
+    reference: PublishedObjectReference,
+    scene_objects: list[dict[str, Any]],
+    media: list[MediaAttachment],
+) -> ToolResult:
+    attached_scene_ids = [
+        int(item["object_id"])
+        for item in scene_objects
+        if item.get("comparison_snapshot_attached")
+        and isinstance(item.get("object_id"), int)
+    ]
+    return ToolResult(
+        {
+            "catalog_build_id": catalog.build_id,
+            "reference": reference.metadata(),
+            "scene_object_count": len(scene_objects),
+            "scene_objects": scene_objects,
+            "scene_snapshot_attached_object_ids": attached_scene_ids,
+            "media_order": [dict(item.summary) for item in media],
+            "instruction": (
+                "Compare only the labeled media evidence. This tool supplies evidence "
+                "but does not decide whether any scene object matches the reference."
+            ),
+        },
+        media,
+    )
+
+
+def _register_comparison_spec(
+    registry: ToolRegistry,
+    handler: Callable[..., ToolResult],
+    maximum: int,
+) -> None:
+    registry.register(
+        ToolSpec(
+            name="compare_scene_objects_to_reference",
+            description=(
+                "Attach one exact curated reference together with snapshots and "
+                "metadata for already-selected concrete scene object ids. This tool "
+                "does not search for candidates and does not decide identity."
+            ),
+            parameters_json_schema={
+                "type": "object",
+                "properties": {
+                    "reference_id": {
+                        "type": "string",
+                        "description": (
+                            "Exact reference_id listed in the runtime system prompt."
+                        ),
+                    },
+                    "object_ids": {
+                        "type": "array",
+                        "items": {"type": "integer"},
+                        "minItems": 1,
+                        "maxItems": maximum,
+                        "description": (
+                            "Concrete scene object ids already found with scene tools."
+                        ),
+                    },
+                },
+                "required": ["reference_id", "object_ids"],
+            },
+            handler=handler,
+        )
+    )

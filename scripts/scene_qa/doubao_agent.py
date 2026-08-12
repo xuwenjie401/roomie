@@ -307,6 +307,14 @@ class DoubaoSceneQaAgent:
                         }
                     ]
                     for media in tool_result.media:
+                        media_label = str(media.summary.get("label") or "").strip()
+                        if media_label:
+                            content.append(
+                                {
+                                    "type": "input_text",
+                                    "text": media_label,
+                                }
+                            )
                         encoded = base64.b64encode(media.data).decode("ascii")
                         content.append(
                             {
@@ -355,7 +363,9 @@ class DoubaoSceneQaAgent:
         payload: dict[str, Any] = {
             "model": self.config.doubao_model,
             "input": input_value,
-            "instructions": self.config.load_system_prompt(),
+            "instructions": self.registry.system_prompt(
+                self.config.load_system_prompt()
+            ),
             "temperature": self.config.temperature,
             "max_output_tokens": self.config.max_output_tokens,
             "thinking": {"type": self.config.doubao_thinking_type},
@@ -519,6 +529,13 @@ class DoubaoSceneQaAgent:
             )
         if name == "inspect_snapshot":
             return f"loading snapshot for object #{args.get('object_id')}"
+        if name == "inspect_object_reference":
+            return f"loading object reference {args.get('reference_id')}"
+        if name == "compare_scene_objects_to_reference":
+            return (
+                f"loading reference {args.get('reference_id')} with scene objects "
+                f"{args.get('object_ids')}"
+            )
         if name == "get_object":
             return f"loading object metadata for #{args.get('object_id')}"
         if name == "list_rooms":

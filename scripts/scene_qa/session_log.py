@@ -91,6 +91,7 @@ class SceneQaSessionLog:
         provider: str,
         model: str | None,
         started_time_s: float,
+        task: str | None = None,
     ) -> int:
         started = float(started_time_s)
         with self._lock:
@@ -111,6 +112,9 @@ class SceneQaSessionLog:
                 "duration_ms": None,
                 "vlm_trace": {},
             }
+            if task:
+                user_message["task"] = task
+                assistant_message["task"] = task
             self._document["messages"].extend([user_message, assistant_message])
             self._assistant_positions[turn_index] = len(self._document["messages"]) - 1
             self._document["turn_count"] = turn_index
@@ -205,12 +209,14 @@ class SceneQaSessionLog:
         error: BaseException | None = None,
         progress_events: list[dict[str, Any]] | None = None,
         completed_time_s: float | None = None,
+        task: str | None = None,
     ) -> int:
         turn_index = self.begin_turn(
             query=query,
             provider=provider,
             model=model,
             started_time_s=started_time_s,
+            task=task,
         )
         self.finish_turn(
             turn_index,

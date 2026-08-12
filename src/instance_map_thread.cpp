@@ -134,6 +134,8 @@ PresenceEvidenceConfig presenceEvidenceConfig(const PipelineConfig& config) {
       config.instance_presence_same_viewpoint_min_confidence;
   result.same_viewpoint_min_bbox_quality =
       config.instance_presence_same_viewpoint_min_bbox_quality;
+  result.confirmation_bypass_labels =
+      config.instance_presence_confirmation_bypass_labels;
   result.min_negative_frames = config.instance_presence_min_negative_frames;
   result.min_depth_samples = config.instance_presence_min_depth_samples;
   result.min_valid_depth_coverage =

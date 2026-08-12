@@ -18,6 +18,7 @@ roomie_pipeline_node:
       tf_static_topic: /tf_static
       tsdf_output_topic: /roomie/map_surface
       detection_debug_image_topic: /roomie/detections_2d_image
+      detections_2d_topic: /roomie/detections_2d
       raw_detections_topic: /roomie/raw_detections
       object_markers_topic: /roomie/objects
       instance_markers_topic: /roomie/instances
@@ -142,6 +143,11 @@ roomie_pipeline_node:
       presence_same_viewpoint_max_distance_m: 2.5
       presence_same_viewpoint_min_confidence: 0.85
       presence_same_viewpoint_min_bbox_quality: 0.80
+      # These low-threshold classes may confirm from repeated same-track
+      # observations without viewpoint diversity or strict 0.85/0.80 quality.
+      # The positive-frame, interruption, and existence-belief gates still apply.
+      presence_confirmation_bypass_labels:
+        [medicine_carton, labeled_package, printed_carton, box, bottled_water, plastic_bag]
       presence_min_negative_frames: 3
       presence_min_depth_samples: 32
       presence_min_valid_depth_coverage: 0.50

@@ -25,6 +25,7 @@ struct PipelineConfig {
   std::string tf_static_topic = "/tf_static";
   std::string tsdf_output_topic = "/roomie/map_surface";
   std::string detection_debug_image_topic = "/roomie/detections_2d_image";
+  std::string detections_2d_topic = "/roomie/detections_2d";
   std::string raw_detections_topic = "/roomie/raw_detections";
   std::string object_markers_topic = "/roomie/objects";
   std::string instance_markers_topic = "/roomie/instances";
@@ -145,6 +146,10 @@ struct PipelineConfig {
   float instance_presence_same_viewpoint_max_distance_m = 2.5f;
   float instance_presence_same_viewpoint_min_confidence = 0.85f;
   float instance_presence_same_viewpoint_min_bbox_quality = 0.80f;
+  // Repeated positive observations of these classes may bypass the
+  // distinct-viewpoint / strict same-viewpoint-quality promotion clause.
+  // Positive-frame count, interruption, and existence-belief checks remain.
+  std::vector<std::string> instance_presence_confirmation_bypass_labels;
   int instance_presence_min_negative_frames = 3;
   int instance_presence_min_depth_samples = 32;
   float instance_presence_min_valid_depth_coverage = 0.50f;

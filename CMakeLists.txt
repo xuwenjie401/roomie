@@ -215,6 +215,7 @@ install(PROGRAMS
   scripts/roomie_dsg_viewer.py
   scripts/roomie_offline_scene_editor.py
   scripts/roomie_offline_room_partition_ui.py
+  scripts/roomie_object_reference_editor.py
   scripts/roomie_scene_qa.py
   scripts/roomie_scene_qa_viewer.py
   DESTINATION lib/${PROJECT_NAME})
@@ -304,6 +305,18 @@ if(BUILD_TESTING)
                         APPEND_ENV
                           "PYTHONPATH=${CMAKE_CURRENT_BINARY_DIR}/rosidl_generator_py")
   ament_add_pytest_test(test_scene_qa test/test_scene_qa.py TIMEOUT 60)
+  ament_add_pytest_test(test_object_references
+                        test/test_object_references.py
+                        TIMEOUT 60)
+  ament_add_pytest_test(test_roomie_tasks
+                        test/test_roomie_tasks.py
+                        TIMEOUT 60)
+  ament_add_pytest_test(test_camera_view_worker_ros
+                        test/test_camera_view_worker_ros.py
+                        TIMEOUT 30)
+  ament_add_pytest_test(test_detection_view_worker_ros
+                        test/test_detection_view_worker_ros.py
+                        TIMEOUT 30)
   ament_add_gtest(test_embedding_runtime_actor
                   test/test_embedding_runtime_actor.cpp)
   target_link_libraries(test_embedding_runtime_actor roomie_pipeline)

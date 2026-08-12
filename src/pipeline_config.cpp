@@ -56,6 +56,8 @@ PipelineConfig PipelineConfig::declareAndLoad(rclcpp::Node& node) {
       "topics.tsdf_output_topic", config.tsdf_output_topic);
   config.detection_debug_image_topic = node.declare_parameter<std::string>(
       "topics.detection_debug_image_topic", config.detection_debug_image_topic);
+  config.detections_2d_topic = node.declare_parameter<std::string>(
+      "topics.detections_2d_topic", config.detections_2d_topic);
   config.raw_detections_topic = node.declare_parameter<std::string>(
       "topics.raw_detections_topic", config.raw_detections_topic);
   config.object_markers_topic = node.declare_parameter<std::string>(
@@ -558,6 +560,10 @@ PipelineConfig PipelineConfig::declareAndLoad(rclcpp::Node& node) {
   config.instance_presence_same_viewpoint_min_bbox_quality = unit_interval(
       "instance.presence_same_viewpoint_min_bbox_quality",
       config.instance_presence_same_viewpoint_min_bbox_quality);
+  config.instance_presence_confirmation_bypass_labels =
+      node.declare_parameter<std::vector<std::string>>(
+          "instance.presence_confirmation_bypass_labels",
+          config.instance_presence_confirmation_bypass_labels);
   config.instance_presence_min_negative_frames = positiveIntOrDefault(
       node.declare_parameter<int>("instance.presence_min_negative_frames",
                                   config.instance_presence_min_negative_frames),

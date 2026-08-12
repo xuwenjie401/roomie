@@ -200,7 +200,7 @@ class SceneQaToolTests(unittest.TestCase):
     def test_scene_qa_config_loads_json(self) -> None:
         self.assertEqual(
             SceneQaConfig().doubao_model,
-            "doubao-seed-2-0-lite-260428",
+            "doubao-seed-2-0-lite-260215",
         )
         self.assertEqual(SceneQaConfig().doubao_thinking_type, "disabled")
         prompt_dir = Path(self.tmp.name) / "prompts"
@@ -408,6 +408,7 @@ class SceneQaToolTests(unittest.TestCase):
             query="有几个房间？",
             provider="gemini",
             model="gemini-test-model",
+            task="scene_qa",
             started_time_s=2.0,
             completed_time_s=3.0,
             response={
@@ -438,6 +439,7 @@ class SceneQaToolTests(unittest.TestCase):
             ["user", "assistant", "user", "assistant"],
         )
         first_answer = document["messages"][1]
+        self.assertEqual(first_answer["task"], "scene_qa")
         self.assertEqual(first_answer["content"], "当前仅有一个房间")
         tool_call = first_answer["vlm_trace"]["iterations"][0]["function_calls"][0]
         self.assertEqual(tool_call["name"], "list_rooms")
@@ -531,6 +533,72 @@ class SceneQaToolTests(unittest.TestCase):
             assistant["vlm_trace"]["iterations"][0]["model_text"],
             "planning",
         )
+
+    def test_viewer_routes_navigation_task_and_follow_up_policy(self) -> None:
+        class FakeNavigationAgent:
+            def __init__(self) -> None:
+                self.calls: list[tuple[str, bool | None]] = []
+
+            def answer_query(
+                self,
+                query: str,
+                *,
+                allow_follow_up_question: bool | None = None,
+            ) -> SimpleNamespace:
+                self.calls.append((query, allow_follow_up_question))
+                return SimpleNamespace(
+                    reasoning="selected destination",
+                    answer={"status": 0, "target_furniture": {"furniture_id": 3}},
+                    raw_text="{}",
+                    history={"provider": "gemini", "model": "test", "iterations": []},
+                )
+
+        session_log = SceneQaSessionLog(
+            Path(self.tmp.name) / "web_task_logs",
+            started_time_s=1.0,
+        )
+        runtime = QaRuntime(1, session_log, ProgressLog())
+        agent = FakeNavigationAgent()
+        runtime.agents[("gemini", "navigation")] = agent
+        runtime.provider_status = {
+            "gemini": {
+                "available": True,
+                "model": "test",
+                "tasks": {"navigation": {"available": True}},
+            }
+        }
+        runtime.task_status = {"navigation": {"available": True}}
+        payload = json.dumps(
+            {
+                "query": "帮我拿药",
+                "provider": "gemini",
+                "task": "navigation",
+                "allow_follow_up_question": False,
+            }
+        ).encode("utf-8")
+        handler = object.__new__(roomie_scene_qa_viewer.Handler)
+        handler.path = "/ask"
+        handler.headers = {"Content-Length": str(len(payload))}
+        handler.rfile = io.BytesIO(payload)
+        sent: list[tuple[int, dict]] = []
+        handler._send_json = lambda body, status=200: sent.append((status, body))
+        handler.server = SimpleNamespace(
+            default_provider="gemini",
+            default_task="scene_qa",
+            current_runtime=lambda: runtime,
+            is_current_runtime=lambda candidate: candidate is runtime,
+            scene_qa_log=session_log,
+            progress_log=runtime.progress_log,
+        )
+
+        handler.do_POST()
+
+        self.assertEqual(agent.calls, [("帮我拿药", False)])
+        self.assertEqual(sent[0][0], 200)
+        self.assertEqual(sent[0][1]["task"], "navigation")
+        self.assertEqual(sent[0][1]["answer"]["status"], 0)
+        document = json.loads(session_log.path.read_text(encoding="utf-8"))
+        self.assertEqual(document["messages"][1]["task"], "navigation")
 
     def test_gemini_loop_executes_local_tool_with_fake_client(self) -> None:
         class FakeCall:
@@ -1310,11 +1378,16 @@ class LiveSceneQaTests(unittest.TestCase):
         self.assertIsNone(args.offline_json)
         self.assertEqual(args.service, "/roomie/query_scene")
         self.assertEqual(args.default_provider, "gemini")
+        self.assertEqual(args.default_task, "scene_qa")
         self.assertFalse(hasattr(args, "session_ttl_ms"))
         self.assertFalse(hasattr(args, "log_dir"))
         self.assertEqual(roomie_scene_qa_viewer.LIVE_READ_SESSION_TTL_MS, 300_000)
         self.assertIn('data-provider="gemini"', roomie_scene_qa_viewer.HTML)
         self.assertIn('data-provider="doubao"', roomie_scene_qa_viewer.HTML)
+        self.assertIn('data-task="scene_qa"', roomie_scene_qa_viewer.HTML)
+        self.assertIn('data-task="navigation"', roomie_scene_qa_viewer.HTML)
+        self.assertIn('data-task="find_object_in_view"', roomie_scene_qa_viewer.HTML)
+        self.assertIn('id="allowFollowUp"', roomie_scene_qa_viewer.HTML)
         self.assertIn('id="resetBtn"', roomie_scene_qa_viewer.HTML)
         self.assertIn('id="objectDetails"', roomie_scene_qa_viewer.HTML)
         self.assertIn('id="refreshSceneBtn"', roomie_scene_qa_viewer.HTML)
@@ -1323,7 +1396,26 @@ class LiveSceneQaTests(unittest.TestCase):
         self.assertIn("reference.bbox_xyxy", roomie_scene_qa_viewer.HTML)
         self.assertIn("red box = object 2D bbox", roomie_scene_qa_viewer.HTML)
         self.assertIn("fetch('/reset'", roomie_scene_qa_viewer.HTML)
-        self.assertIn("JSON.stringify({query, provider})", roomie_scene_qa_viewer.HTML)
+        self.assertIn(
+            "JSON.stringify({query, provider, task, allow_follow_up_question})",
+            roomie_scene_qa_viewer.HTML,
+        )
+        navigation_config = roomie_scene_qa_viewer.config_for_task(
+            SceneQaConfig(max_iterations=9),
+            "navigation",
+            explicit_max_iterations=None,
+        )
+        self.assertEqual(navigation_config.max_iterations, 3)
+        self.assertEqual(navigation_config.system_prompt_path.name, "navigation.txt")
+        in_view_config = roomie_scene_qa_viewer.config_for_task(
+            SceneQaConfig(max_iterations=9),
+            "find_object_in_view",
+            explicit_max_iterations=None,
+        )
+        self.assertEqual(in_view_config.max_iterations, 4)
+        self.assertEqual(
+            in_view_config.system_prompt_path.name, "find_object_in_view.txt"
+        )
         payload = live_graph_payload(args.service)
         self.assertTrue(payload["live"])
         self.assertEqual(payload["objects"], [])
@@ -1335,6 +1427,41 @@ class LiveSceneQaTests(unittest.TestCase):
         ):
             offline_args = roomie_scene_qa_viewer.parse_args()
         self.assertEqual(offline_args.offline_json, Path("/tmp/scene.json"))
+
+    def test_persistent_camera_sampler_starts_before_first_sample(self) -> None:
+        class FakeSampler:
+            def __init__(self) -> None:
+                self.sample_calls = 0
+                self.closed = False
+
+            def sample(self):
+                self.sample_calls += 1
+                return "cached-view"
+
+            def close(self) -> None:
+                self.closed = True
+
+        fake = FakeSampler()
+        config = SceneQaConfig()
+        with patch.object(
+            roomie_scene_qa_viewer,
+            "RosCameraViewSampler",
+            return_value=fake,
+        ) as constructor:
+            resource = roomie_scene_qa_viewer.PersistentCameraViewSampler(config)
+
+        constructor.assert_called_once_with(
+            image_topic=config.in_view_image_topic,
+            camera_info_topic=config.in_view_camera_info_topic,
+            world_frame=config.in_view_world_frame,
+            camera_frame=config.in_view_camera_frame,
+            timeout_sec=config.in_view_sensor_timeout_s,
+            tf_tolerance_sec=config.in_view_tf_tolerance_s,
+        )
+        self.assertEqual(fake.sample_calls, 0)
+        self.assertEqual(resource.sample(), "cached-view")
+        resource.close()
+        self.assertTrue(fake.closed)
 
     def test_live_point_cloud_worker_samples_xyz_and_rgb(self) -> None:
         fields = [

@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+from dataclasses import dataclass, field
 import json
 from pathlib import Path
 import sys
@@ -18,18 +19,42 @@ from scene_qa import (  # noqa: E402
     GeminiSceneQaAgent,
     GraphStore,
     LiveSceneQueryClient,
+    RosCameraViewSampler,
+    RosLatest2dDetectionsSampler,
     RosQuerySceneTransport,
     SceneQaConfig,
+    StructuredTaskAgent,
+    TASK_FIND_OBJECT_IN_VIEW,
+    TASK_NAMES,
+    TASK_NAVIGATION,
+    TASK_SCENE_QA,
+    TaskEvidence,
     create_default_tool_registry,
+    create_find_object_in_view_task_registry,
     create_live_tool_registry,
+    create_navigation_task_registry,
 )
 from scene_qa.config import DEFAULT_EMBEDDING_MODEL  # noqa: E402
 from scene_qa.config import default_qa_config_path  # noqa: E402
 from scene_qa.embeddings import ObjectSearchIndex  # noqa: E402
+from scene_qa.object_references import (  # noqa: E402
+    try_load_object_reference_catalog,
+)
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--task",
+        choices=TASK_NAMES,
+        default=TASK_SCENE_QA,
+        help="task profile and bounded tool set (default: scene_qa)",
+    )
+    parser.add_argument(
+        "--no-follow-up-question",
+        action="store_true",
+        help="navigation: choose the best destination instead of asking for confirmation",
+    )
     parser.add_argument(
         "query",
         nargs="*",
@@ -109,6 +134,22 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-output-tokens", type=int, default=None)
     parser.add_argument("--snapshot-max-side-px", type=int, default=None)
     parser.add_argument("--snapshot-bbox-pad-px", type=int, default=None)
+    parser.add_argument("--in-view-image-topic", default=None)
+    parser.add_argument("--in-view-camera-info-topic", default=None)
+    parser.add_argument("--in-view-detection-image-topic", default=None)
+    parser.add_argument("--in-view-detection-result-topic", default=None)
+    parser.add_argument("--in-view-world-frame", default=None)
+    parser.add_argument("--in-view-camera-frame", default=None)
+    parser.add_argument("--in-view-min-depth-m", type=float, default=None)
+    parser.add_argument("--in-view-max-depth-m", type=float, default=None)
+    parser.add_argument("--in-view-sensor-timeout-s", type=float, default=None)
+    parser.add_argument("--in-view-tf-tolerance-s", type=float, default=None)
+    parser.add_argument(
+        "--object-reference-root",
+        type=Path,
+        default=None,
+        help="local curated object-reference root; overrides QA config",
+    )
     parser.add_argument(
         "--dump-history",
         type=Path,
@@ -152,7 +193,13 @@ def apply_cli_overrides(config: SceneQaConfig, args: argparse.Namespace) -> Scen
         device=args.device or config.device,
         top_k=args.top_k if args.top_k is not None else config.top_k,
         max_iterations=(
-            args.max_iterations if args.max_iterations is not None else config.max_iterations
+            args.max_iterations
+            if args.max_iterations is not None
+            else (
+                4
+                if args.task == TASK_FIND_OBJECT_IN_VIEW
+                else (3 if args.task == TASK_NAVIGATION else config.max_iterations)
+            )
         ),
         temperature=args.temperature if args.temperature is not None else config.temperature,
         max_output_tokens=(
@@ -170,16 +217,95 @@ def apply_cli_overrides(config: SceneQaConfig, args: argparse.Namespace) -> Scen
             if args.snapshot_bbox_pad_px is not None
             else config.snapshot_bbox_pad_px
         ),
-        system_prompt_path=config.system_prompt_path,
+        object_reference_root=(
+            args.object_reference_root
+            if args.object_reference_root is not None
+            else config.object_reference_root
+        ),
+        object_reference_max_scene_objects=config.object_reference_max_scene_objects,
+        system_prompt_path=config.system_prompt_path_for_task(args.task),
+        navigation_system_prompt_path=config.navigation_system_prompt_path,
+        find_object_in_view_system_prompt_path=(
+            config.find_object_in_view_system_prompt_path
+        ),
+        in_view_image_topic=(
+            args.in_view_image_topic or config.in_view_image_topic
+        ),
+        in_view_camera_info_topic=(
+            args.in_view_camera_info_topic or config.in_view_camera_info_topic
+        ),
+        in_view_detection_image_topic=(
+            args.in_view_detection_image_topic
+            or config.in_view_detection_image_topic
+        ),
+        in_view_detection_result_topic=(
+            args.in_view_detection_result_topic
+            or config.in_view_detection_result_topic
+        ),
+        in_view_world_frame=(
+            args.in_view_world_frame or config.in_view_world_frame
+        ),
+        in_view_camera_frame=(
+            args.in_view_camera_frame
+            if args.in_view_camera_frame is not None
+            else config.in_view_camera_frame
+        ),
+        in_view_min_depth_m=(
+            args.in_view_min_depth_m
+            if args.in_view_min_depth_m is not None
+            else config.in_view_min_depth_m
+        ),
+        in_view_max_depth_m=(
+            args.in_view_max_depth_m
+            if args.in_view_max_depth_m is not None
+            else config.in_view_max_depth_m
+        ),
+        in_view_sensor_timeout_s=(
+            args.in_view_sensor_timeout_s
+            if args.in_view_sensor_timeout_s is not None
+            else config.in_view_sensor_timeout_s
+        ),
+        in_view_tf_tolerance_s=(
+            args.in_view_tf_tolerance_s
+            if args.in_view_tf_tolerance_s is not None
+            else config.in_view_tf_tolerance_s
+        ),
         _config_dir=config._config_dir,
     )
+
+
+@dataclass
+class RuntimeResources:
+    values: list[Any] = field(default_factory=list)
+
+    def add(self, value: Any) -> Any:
+        self.values.append(value)
+        return value
+
+    def close(self) -> None:
+        for value in reversed(self.values):
+            close = getattr(value, "close", None)
+            if callable(close):
+                try:
+                    close()
+                except Exception:
+                    pass
 
 
 def build_agent(
     args: argparse.Namespace,
     config: SceneQaConfig,
-) -> tuple[Any, RosQuerySceneTransport | None]:
-    transport = None
+) -> tuple[Any, RuntimeResources]:
+    if args.task == TASK_FIND_OBJECT_IN_VIEW and args.offline_json is not None:
+        raise ValueError("find_object_in_view requires the live scene and current ROS camera")
+    resources = RuntimeResources()
+    reference_catalog_load = try_load_object_reference_catalog(
+        config.resolved_object_reference_root()
+    )
+    print(
+        f"Object reference catalog: {reference_catalog_load.status}",
+        file=sys.stderr,
+    )
     if args.offline_json is not None:
         graph = GraphStore.load(config.resolved_graph_json())
         search_index = ObjectSearchIndex(
@@ -188,18 +314,67 @@ def build_agent(
             backend=config.embedding_backend,
             device=config.device,
         )
-        registry = create_default_tool_registry(graph, search_index, config)
+        base_registry = create_default_tool_registry(
+            graph, search_index, config, reference_catalog_load
+        )
     else:
         graph = None
-        transport = RosQuerySceneTransport(
-            service_name=args.service,
-            timeout_sec=args.service_timeout_sec,
+        transport = resources.add(
+            RosQuerySceneTransport(
+                service_name=args.service,
+                timeout_sec=args.service_timeout_sec,
+            )
         )
-        live_client = LiveSceneQueryClient(
-            transport,
-            session_ttl_ms=args.session_ttl_ms,
-        )
-        registry = create_live_tool_registry(live_client, config)
+        try:
+            live_client = LiveSceneQueryClient(
+                transport,
+                session_ttl_ms=args.session_ttl_ms,
+            )
+            base_registry = create_live_tool_registry(
+                live_client, config, reference_catalog_load
+            )
+        except Exception:
+            resources.close()
+            raise
+    try:
+        evidence = None
+        if args.task == TASK_NAVIGATION:
+            evidence = TaskEvidence(args.task)
+            registry = create_navigation_task_registry(
+                base_registry, config, evidence, reference_catalog_load
+            )
+        elif args.task == TASK_FIND_OBJECT_IN_VIEW:
+            evidence = TaskEvidence(args.task)
+            camera_sampler = resources.add(
+                RosCameraViewSampler(
+                    image_topic=config.in_view_image_topic,
+                    camera_info_topic=config.in_view_camera_info_topic,
+                    world_frame=config.in_view_world_frame,
+                    camera_frame=config.in_view_camera_frame,
+                    timeout_sec=config.in_view_sensor_timeout_s,
+                    tf_tolerance_sec=config.in_view_tf_tolerance_s,
+                )
+            )
+            detection_sampler = resources.add(
+                RosLatest2dDetectionsSampler(
+                    image_base_topic=config.in_view_detection_image_topic,
+                    result_base_topic=config.in_view_detection_result_topic,
+                    timeout_sec=config.in_view_sensor_timeout_s,
+                )
+            )
+            registry = create_find_object_in_view_task_registry(
+                base_registry,
+                config,
+                evidence,
+                camera_sampler,
+                reference_catalog_load,
+                detection_sampler=detection_sampler,
+            )
+        else:
+            registry = base_registry
+    except Exception:
+        resources.close()
+        raise
     try:
         if args.provider == "doubao":
             agent = DoubaoSceneQaAgent(
@@ -215,14 +390,26 @@ def build_agent(
                 config,
                 api_key=args.api_key,
             )
+        if evidence is not None:
+            agent = StructuredTaskAgent(
+                agent,
+                evidence,
+                task=args.task,
+                allow_follow_up_question=not args.no_follow_up_question,
+                world_frame=config.in_view_world_frame,
+            )
     except Exception:
-        if transport is not None:
-            transport.close()
+        resources.close()
         raise
-    return agent, transport
+    return agent, resources
 
 
 def response_payload(response: Any) -> dict[str, Any]:
+    if isinstance(response.answer, dict) and response.history.get("task") in {
+        TASK_NAVIGATION,
+        TASK_FIND_OBJECT_IN_VIEW,
+    }:
+        return response.answer
     return {"reasoning": response.reasoning, "answer": response.answer}
 
 
@@ -314,7 +501,7 @@ def main() -> int:
         return 2
 
     config = apply_cli_overrides(load_qa_config(args.qa_config), args)
-    agent, transport = build_agent(args, config)
+    agent, resources = build_agent(args, config)
 
     try:
         return run_query_loop(
@@ -324,8 +511,7 @@ def main() -> int:
             dump_history=args.dump_history,
         )
     finally:
-        if transport is not None:
-            transport.close()
+        resources.close()
 
 
 if __name__ == "__main__":

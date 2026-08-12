@@ -1,6 +1,7 @@
 #pragma once
 
 #include <string>
+#include <vector>
 
 #include "roomie/dsg/object_graph.hpp"
 
@@ -21,6 +22,7 @@ struct PresenceEvidenceConfig {
   float same_viewpoint_max_distance_m = 2.5f;
   float same_viewpoint_min_confidence = 0.85f;
   float same_viewpoint_min_bbox_quality = 0.80f;
+  std::vector<std::string> confirmation_bypass_labels;
   int min_negative_frames = 3;
   int min_depth_samples = 32;
   float min_valid_depth_coverage = 0.50f;

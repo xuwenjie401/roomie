@@ -13,6 +13,7 @@
 
 #include <opencv2/core.hpp>
 #include <opencv2/imgproc.hpp>
+#include <nlohmann/json.hpp>
 
 #include "roomie/pipeline/image_utils.hpp"
 #include "roomie/utils/run_logger.hpp"
@@ -26,8 +27,8 @@ double elapsedMs(std::chrono::steady_clock::time_point start,
   return std::chrono::duration<double, std::milli>(end - start).count();
 }
 
-std::string cameraDebugImageTopic(const std::string& base_topic,
-                                  const std::string& camera_id) {
+std::string cameraSpecificTopic(const std::string& base_topic,
+                                const std::string& camera_id) {
   return base_topic +
          ((!base_topic.empty() && base_topic.back() == '/') ? "" : "/") +
          camera_id;
@@ -222,34 +223,48 @@ DetectionBridgeThread::DetectionBridgeThread(
       logger_(node.get_logger().get_child("detection_bridge")),
       last_request_time_(std::chrono::steady_clock::time_point::min()),
       last_status_log_time_(std::chrono::steady_clock::now()) {
+  const auto latest_result_qos =
+      rclcpp::QoS(rclcpp::KeepLast(1)).reliable().transient_local();
   detection_debug_pub_ = node.create_publisher<sensor_msgs::msg::Image>(
       config_.detection_debug_image_topic,
-      rclcpp::QoS(1).reliable());
+      latest_result_qos);
+  detections_2d_pub_ = node.create_publisher<std_msgs::msg::String>(
+      config_.detections_2d_topic,
+      latest_result_qos);
   for (const std::string& camera_id :
        config_.additional_detection_camera_ids) {
     if (camera_id == config_.mapping_camera_id) {
       continue;
     }
-    const std::string topic =
-        cameraDebugImageTopic(config_.detection_debug_image_topic, camera_id);
+    const std::string topic = cameraSpecificTopic(
+        config_.detection_debug_image_topic, camera_id);
     additional_detection_debug_pubs_.emplace(
         camera_id,
         node.create_publisher<sensor_msgs::msg::Image>(
             topic,
-            rclcpp::QoS(1).reliable()));
+            latest_result_qos));
+    const std::string result_topic =
+        cameraSpecificTopic(config_.detections_2d_topic, camera_id);
+    additional_detections_2d_pubs_.emplace(
+        camera_id,
+        node.create_publisher<std_msgs::msg::String>(
+            result_topic,
+            latest_result_qos));
     RCLCPP_INFO(logger_,
-                "additional detection debug image: camera=%s topic=%s",
+                "additional 2D detection outputs: camera=%s image=%s result=%s",
                 camera_id.c_str(),
-                topic.c_str());
+                topic.c_str(),
+                result_topic.c_str());
   }
   raw_detection_pub_ = node.create_publisher<visualization_msgs::msg::MarkerArray>(
       config_.raw_detections_topic,
       rclcpp::QoS(1).reliable());
   if (config_.detection_enabled) {
     RCLCPP_INFO(logger_,
-                "detection bridge enabled: debug_image=%s raw_3d=%s max_fps=%.2f "
-                "min_patch_coverage=%.3f",
+                "detection bridge enabled: debug_image=%s detections_2d=%s "
+                "raw_3d=%s max_fps=%.2f min_patch_coverage=%.3f",
                 config_.detection_debug_image_topic.c_str(),
+                config_.detections_2d_topic.c_str(),
                 config_.raw_detections_topic.c_str(),
                 config_.max_inference_fps,
                 config_.min_patch_coverage_ratio);
@@ -958,6 +973,7 @@ void DetectionBridgeThread::forwardBackendResponses() {
       RunLogger::logGlobal("detection", stream.str());
     }
     publishDetectionDebugImage(response, pending);
+    publish2dDetectionResult(response);
     publishRawDetectionMarkers(response);
     const RequestId response_request_id = response.provenance.request_id;
     PushResult<InferenceResponse> push_result =
@@ -1091,6 +1107,46 @@ void DetectionBridgeThread::publishDetectionDebugImage(
   }
   publisher->publish(
       imageMessageFromBuffer(image, response.time_ns, response.camera_id));
+}
+
+void DetectionBridgeThread::publish2dDetectionResult(
+    const InferenceResponse& response) {
+  auto publisher = detections_2d_pub_;
+  if (response.camera_id != config_.mapping_camera_id) {
+    const auto found =
+        additional_detections_2d_pubs_.find(response.camera_id);
+    if (found == additional_detections_2d_pubs_.end()) {
+      return;
+    }
+    publisher = found->second;
+  }
+  if (!publisher) {
+    return;
+  }
+
+  const std::int64_t seconds = response.time_ns / 1000000000LL;
+  const std::int64_t nanoseconds = response.time_ns % 1000000000LL;
+  nlohmann::json detections = nlohmann::json::array();
+  for (const Raw2dDetection& detection : response.filtered_2d_detections) {
+    detections.push_back(
+        {{"label", detection.label},
+         {"semantic_id", detection.semantic_id},
+         {"score_2d", detection.score_2d},
+         {"bbox_xyxy", detection.box_xyxy}});
+  }
+  const nlohmann::json payload = {
+      {"schema_version", 1},
+      {"header",
+       {{"stamp", {{"sec", seconds}, {"nanosec", nanoseconds}}},
+        {"frame_id", response.camera_id}}},
+      {"camera_id", response.camera_id},
+      {"ok", response.ok},
+      {"error", response.error},
+      {"detection_count", detections.size()},
+      {"detections", std::move(detections)}};
+  std_msgs::msg::String message;
+  message.data = payload.dump();
+  publisher->publish(std::move(message));
 }
 
 void DetectionBridgeThread::publishRawDetectionMarkers(const InferenceResponse& response) {

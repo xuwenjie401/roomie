@@ -70,6 +70,7 @@ def generate_launch_description() -> LaunchDescription:
     qa_port = LaunchConfiguration("qa_port")
     qa_browser = LaunchConfiguration("qa_browser")
     qa_default_provider = LaunchConfiguration("qa_default_provider")
+    qa_default_task = LaunchConfiguration("qa_default_task")
     qa_point_topic = LaunchConfiguration("qa_point_topic")
     qa_live_max_points = LaunchConfiguration("qa_live_max_points")
 
@@ -113,6 +114,8 @@ def generate_launch_description() -> LaunchDescription:
             qa_browser,
             "--default-provider",
             qa_default_provider,
+            "--default-task",
+            qa_default_task,
             "--point-topic",
             qa_point_topic,
             "--live-max-points",
@@ -199,6 +202,14 @@ def generate_launch_description() -> LaunchDescription:
                 "qa_default_provider",
                 default_value="gemini",
                 description="Initial browser provider: gemini or doubao.",
+            ),
+            DeclareLaunchArgument(
+                "qa_default_task",
+                default_value="scene_qa",
+                description=(
+                    "Initial browser task: scene_qa, navigation, or "
+                    "find_object_in_view."
+                ),
             ),
             DeclareLaunchArgument(
                 "qa_point_topic",

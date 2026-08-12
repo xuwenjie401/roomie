@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cctype>
 #include <cmath>
 #include <limits>
 #include <tuple>
@@ -11,6 +12,44 @@ namespace {
 
 constexpr float kEpsilon = 1.0e-6f;
 constexpr float kPi = 3.14159265358979323846f;
+
+std::string normalizeConfirmationLabel(std::string label) {
+  std::string normalized;
+  normalized.reserve(label.size());
+  bool last_was_separator = false;
+  for (unsigned char character : label) {
+    if (std::isspace(character) || character == '-' || character == '_') {
+      if (!normalized.empty() && !last_was_separator) {
+        normalized.push_back('_');
+      }
+      last_was_separator = true;
+      continue;
+    }
+    normalized.push_back(
+        static_cast<char>(std::tolower(character)));
+    last_was_separator = false;
+  }
+  while (!normalized.empty() && normalized.back() == '_') {
+    normalized.pop_back();
+  }
+  return normalized;
+}
+
+bool bypassesViewpointConfirmation(const InstanceTrack& track,
+                                   const PresenceEvidenceConfig& config) {
+  const std::string normalized_track_label =
+      normalizeConfirmationLabel(track.label);
+  if (normalized_track_label.empty()) {
+    return false;
+  }
+  return std::any_of(
+      config.confirmation_bypass_labels.begin(),
+      config.confirmation_bypass_labels.end(),
+      [&normalized_track_label](const std::string& configured_label) {
+        return normalizeConfirmationLabel(configured_label) ==
+               normalized_track_label;
+      });
+}
 
 void retainWindow(std::vector<TimeNanoseconds>* values,
                   TimeNanoseconds now_ns,
@@ -504,8 +543,9 @@ bool hasPositivePresenceConfirmation(const InstanceTrack& track,
       required_frames > 1 &&
       sameViewpointHighQualityCount(track, eligible_frame_index, config) >=
           required_frames;
+  const bool class_bypass = bypassesViewpointConfirmation(track, config);
   return count >= required_frames &&
-         (viewpoint_confirmed || same_viewpoint_confirmed) &&
+         (class_bypass || viewpoint_confirmed || same_viewpoint_confirmed) &&
          track.positive_window_interruptions <= config.max_positive_interruptions &&
          track.existence_log_odds >= config.active_threshold;
 }

@@ -2,3 +2,4 @@ logs/
 /build/
 /install/
 **/__pycache__/
+/assets/object_references/

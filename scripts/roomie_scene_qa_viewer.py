@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+from dataclasses import replace
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 import mimetypes
@@ -46,9 +47,24 @@ from scene_qa.live_query import (  # noqa: E402
     RosPointCloudSampler,
     RosQuerySceneTransport,
 )
+from scene_qa.object_references import (  # noqa: E402
+    try_load_object_reference_catalog,
+)
+from scene_qa.camera_view import RosCameraViewSampler  # noqa: E402
+from scene_qa.detection_view import RosLatest2dDetectionsSampler  # noqa: E402
 from scene_qa.session_log import (  # noqa: E402
     SceneQaSessionLog,
     default_scene_qa_log_dir,
+)
+from scene_qa.tasks import (  # noqa: E402
+    TASK_FIND_OBJECT_IN_VIEW,
+    TASK_NAMES,
+    TASK_NAVIGATION,
+    TASK_SCENE_QA,
+    StructuredTaskAgent,
+    TaskEvidence,
+    create_find_object_in_view_task_registry,
+    create_navigation_task_registry,
 )
 from scene_qa.tools import create_default_tool_registry, create_live_tool_registry  # noqa: E402
 
@@ -65,6 +81,20 @@ PALETTE = [
 ]
 
 LIVE_READ_SESSION_TTL_MS = 300_000
+WEB_TASKS: dict[str, dict[str, str]] = {
+    TASK_SCENE_QA: {
+        "label": "Scene QA",
+        "description": "General scene-memory questions",
+    },
+    TASK_NAVIGATION: {
+        "label": "Navigation",
+        "description": "Select a furniture-level search destination",
+    },
+    TASK_FIND_OBJECT_IN_VIEW: {
+        "label": "In-view find",
+        "description": "Find an object whose 3D bbox enters the current camera frustum",
+    },
+}
 
 
 def collect_object_ids(value: Any) -> list[int]:
@@ -157,6 +187,12 @@ def parse_args() -> argparse.Namespace:
         default="gemini",
         help="initial provider selected in the browser",
     )
+    parser.add_argument(
+        "--default-task",
+        choices=TASK_NAMES,
+        default=TASK_SCENE_QA,
+        help="initial task mode selected in the browser",
+    )
     parser.add_argument("--embedding-model", type=Path, default=None, help="local SentenceTransformer checkpoint")
     parser.add_argument("--embedding-backend", choices=["embedding", "lexical"], default=None)
     parser.add_argument("--device", default=None, help="embedding device: auto, cuda, or cpu")
@@ -164,6 +200,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-iterations", type=int, default=None)
     parser.add_argument("--temperature", type=float, default=None)
     parser.add_argument("--max-output-tokens", type=int, default=None)
+    parser.add_argument(
+        "--object-reference-root",
+        type=Path,
+        default=None,
+        help="local curated object-reference root; overrides QA config",
+    )
     parser.add_argument("--points", type=Path, default=None, help="RGB point cloud: .nvblox, .ply, .pcd, .npy, .npz, or JSON")
     parser.add_argument("--no-points", action="store_true", help="disable point cloud loading")
     parser.add_argument("--max-points", type=int, default=700000, help="point cloud downsample limit")
@@ -249,8 +291,51 @@ def apply_cli_overrides(config: SceneQaConfig, args: argparse.Namespace) -> Scen
         max_output_tokens=args.max_output_tokens if args.max_output_tokens is not None else config.max_output_tokens,
         snapshot_max_side_px=config.snapshot_max_side_px,
         snapshot_bbox_pad_px=config.snapshot_bbox_pad_px,
+        object_reference_root=(
+            args.object_reference_root
+            if args.object_reference_root is not None
+            else config.object_reference_root
+        ),
+        object_reference_max_scene_objects=config.object_reference_max_scene_objects,
         system_prompt_path=config.system_prompt_path,
+        navigation_system_prompt_path=config.navigation_system_prompt_path,
+        find_object_in_view_system_prompt_path=(
+            config.find_object_in_view_system_prompt_path
+        ),
+        in_view_image_topic=config.in_view_image_topic,
+        in_view_camera_info_topic=config.in_view_camera_info_topic,
+        in_view_detection_image_topic=config.in_view_detection_image_topic,
+        in_view_detection_result_topic=config.in_view_detection_result_topic,
+        in_view_world_frame=config.in_view_world_frame,
+        in_view_camera_frame=config.in_view_camera_frame,
+        in_view_min_depth_m=config.in_view_min_depth_m,
+        in_view_max_depth_m=config.in_view_max_depth_m,
+        in_view_sensor_timeout_s=config.in_view_sensor_timeout_s,
+        in_view_tf_tolerance_s=config.in_view_tf_tolerance_s,
         _config_dir=config._config_dir,
+    )
+
+
+def config_for_task(
+    config: SceneQaConfig,
+    task: str,
+    *,
+    explicit_max_iterations: int | None,
+) -> SceneQaConfig:
+    """Select a task prompt and keep bounded tasks on a short model loop."""
+
+    if task not in TASK_NAMES:
+        raise ValueError(f"unknown QA task: {task}")
+    max_iterations = config.max_iterations
+    if explicit_max_iterations is None:
+        if task == TASK_FIND_OBJECT_IN_VIEW:
+            max_iterations = 4
+        elif task == TASK_NAVIGATION:
+            max_iterations = 3
+    return replace(
+        config,
+        system_prompt_path=config.system_prompt_path_for_task(task),
+        max_iterations=max_iterations,
     )
 
 
@@ -488,9 +573,12 @@ class QaRuntime:
         self.progress_log = progress_log
         self.qa_lock = threading.Lock()
         self.cancel_event = threading.Event()
-        self.agents: dict[str, Any] = {}
+        self.agents: dict[tuple[str, str], Any] = {}
         self.provider_status: dict[str, dict[str, Any]] = {}
+        self.task_status: dict[str, dict[str, Any]] = {}
         self.retired = False
+        self._resources: list[Any] = []
+        self._resources_closed = False
         self._state_lock = threading.Lock()
         self._active_turn: int | None = None
         self._active_started_time_s: float | None = None
@@ -559,6 +647,92 @@ class QaRuntime:
             error=SceneQaCancelledError("question was reset from the browser"),
             status="reset",
         )
+
+    def add_resource(self, resource: Any) -> Any:
+        with self._state_lock:
+            if self._resources_closed:
+                raise RuntimeError("QA runtime resources are already closed")
+            self._resources.append(resource)
+        return resource
+
+    def close_resources(self) -> None:
+        with self._state_lock:
+            if self._resources_closed:
+                return
+            self._resources_closed = True
+            resources = list(reversed(self._resources))
+            self._resources.clear()
+        for resource in resources:
+            close = getattr(resource, "close", None)
+            if callable(close):
+                try:
+                    close()
+                except Exception:
+                    pass
+
+
+class PersistentCameraViewSampler:
+    """Retain the last camera view even before the first in-view query."""
+
+    def __init__(self, config: SceneQaConfig) -> None:
+        self._lock = threading.Lock()
+        self._sampler: RosCameraViewSampler | None = RosCameraViewSampler(
+            image_topic=config.in_view_image_topic,
+            camera_info_topic=config.in_view_camera_info_topic,
+            world_frame=config.in_view_world_frame,
+            camera_frame=config.in_view_camera_frame,
+            timeout_sec=config.in_view_sensor_timeout_s,
+            tf_tolerance_sec=config.in_view_tf_tolerance_s,
+        )
+        self._closed = False
+
+    def sample(self):
+        with self._lock:
+            if self._closed:
+                raise RuntimeError("camera sampler is closed")
+            sampler = self._sampler
+            if sampler is None:
+                raise RuntimeError("camera sampler is unavailable")
+        return sampler.sample()
+
+    def close(self) -> None:
+        with self._lock:
+            self._closed = True
+            sampler = self._sampler
+            self._sampler = None
+        if sampler is not None:
+            sampler.close()
+
+
+class LazyLatest2dDetectionsSampler:
+    """Start the retained 2D detection bridge only when its VLM tool is called."""
+
+    def __init__(self, config: SceneQaConfig) -> None:
+        self._config = config
+        self._lock = threading.Lock()
+        self._sampler: RosLatest2dDetectionsSampler | None = None
+        self._closed = False
+
+    def sample(self):
+        with self._lock:
+            if self._closed:
+                raise RuntimeError("2D detection sampler is closed")
+            if self._sampler is None:
+                self._sampler = RosLatest2dDetectionsSampler(
+                    image_base_topic=self._config.in_view_detection_image_topic,
+                    result_base_topic=self._config.in_view_detection_result_topic,
+                    timeout_sec=self._config.in_view_sensor_timeout_s,
+                )
+            sampler = self._sampler
+        return sampler.sample()
+
+    def close(self) -> None:
+        with self._lock:
+            self._closed = True
+            sampler = self._sampler
+            self._sampler = None
+        if sampler is not None:
+            sampler.close()
 
 HTML = r"""<!doctype html>
 <html lang="en">
@@ -650,6 +824,47 @@ HTML = r"""<!doctype html>
       align-items: center;
       gap: 9px;
     }
+    .task-row {
+      display: grid;
+      gap: 5px;
+    }
+    .task-toggle {
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      padding: 3px;
+      border: 1px solid var(--line);
+      border-radius: 9px;
+      background: #f3f5f1;
+    }
+    button.task-button {
+      height: 31px;
+      border: 0;
+      background: transparent;
+      color: var(--muted);
+      font-size: 11px;
+      font-weight: 650;
+      padding: 0 6px;
+    }
+    button.task-button.active {
+      background: #fff;
+      color: var(--accent-2);
+      box-shadow: 0 1px 4px rgba(24, 37, 31, .14);
+    }
+    .task-status {
+      min-width: 0;
+      color: var(--muted);
+      font-size: 11px;
+    }
+    .task-options {
+      display: flex;
+      align-items: center;
+      gap: 7px;
+      min-height: 22px;
+      color: var(--muted);
+      font-size: 11px;
+    }
+    .task-options input { margin: 0; }
+    .task-options[hidden] { display: none; }
     .provider-toggle {
       display: inline-grid;
       grid-template-columns: repeat(2, minmax(74px, 1fr));
@@ -1062,6 +1277,18 @@ HTML = r"""<!doctype html>
       </header>
       <div class="ask-box">
         <textarea id="question" placeholder="Ask about objects, rooms, spatial relations, or visual details."></textarea>
+        <div class="task-row">
+          <div class="task-toggle" role="group" aria-label="QA task mode">
+            <button class="task-button active" type="button" data-task="scene_qa" aria-pressed="true">Scene QA</button>
+            <button class="task-button" type="button" data-task="navigation" aria-pressed="false">Navigation</button>
+            <button class="task-button" type="button" data-task="find_object_in_view" aria-pressed="false">In-view find</button>
+          </div>
+          <div class="task-status" id="taskStatus">General scene-memory questions</div>
+          <label class="task-options" id="navigationOptions" hidden>
+            <input id="allowFollowUp" type="checkbox" checked>
+            Allow a follow-up question when destinations are ambiguous
+          </label>
+        </div>
         <div class="provider-row">
           <div class="provider-toggle" role="group" aria-label="Model provider">
             <button class="provider-button active" type="button" data-provider="gemini" aria-pressed="true">Gemini</button>
@@ -1128,6 +1355,7 @@ HTML = r"""<!doctype html>
       selectionRequest: 0,
       sceneRetryTimer: null,
       provider: 'gemini',
+      task: 'scene_qa',
       yaw: 2.45,
       pitch: 0.72,
       distance: 8,
@@ -1164,8 +1392,12 @@ HTML = r"""<!doctype html>
     const traceList = document.getElementById('traceList');
     const progressList = document.getElementById('progressList');
     const providerStatus = document.getElementById('providerStatus');
+    const taskStatus = document.getElementById('taskStatus');
+    const navigationOptions = document.getElementById('navigationOptions');
+    const allowFollowUp = document.getElementById('allowFollowUp');
     const objectDetails = document.getElementById('objectDetails');
     const providerButtons = Array.from(document.querySelectorAll('[data-provider]'));
+    const taskButtons = Array.from(document.querySelectorAll('[data-task]'));
     const showPoints = document.getElementById('showPoints');
     const showRooms = document.getElementById('showRooms');
     const pointSize = document.getElementById('pointSize');
@@ -1185,32 +1417,92 @@ HTML = r"""<!doctype html>
     function providerInfo(name) {
       return state.graph?.qa?.providers?.[name] || null;
     }
+    function taskInfo(name) {
+      return state.graph?.qa?.tasks?.[name] || null;
+    }
+    function pairInfo(provider, task) {
+      return providerInfo(provider)?.tasks?.[task] || null;
+    }
+    function pairAvailable(provider, task) {
+      return pairInfo(provider, task)?.available === true;
+    }
     function selectProvider(name) {
-      const info = providerInfo(name);
-      if (!info || !info.available || state.asking) return;
+      if (!pairAvailable(name, state.task) || state.asking) return;
       state.provider = name;
-      for (const button of providerButtons) {
-        const active = button.dataset.provider === name;
-        button.classList.toggle('active', active);
-        button.setAttribute('aria-pressed', active ? 'true' : 'false');
+      updateProviderControls();
+    }
+    function selectTask(name) {
+      if (state.asking || !taskInfo(name)?.available) return;
+      let provider = state.provider;
+      if (!pairAvailable(provider, name)) {
+        provider = providerButtons
+          .map(button => button.dataset.provider)
+          .find(candidate => pairAvailable(candidate, name));
       }
-      providerStatus.textContent = `${info.label || name} · ${info.model || ''}`;
-      document.getElementById('answerLabel').textContent = `Final answer · ${info.label || name}`;
+      if (!provider) return;
+      state.task = name;
+      state.provider = provider;
+      updateProviderControls();
     }
     function updateProviderControls() {
+      const qa = state.graph?.qa;
+      let task = state.task;
+      let provider = state.provider;
+      if (!pairAvailable(provider, task)) {
+        task = qa?.default_task || task;
+        provider = qa?.default_provider || provider;
+      }
+      if (!pairAvailable(provider, task)) {
+        const availablePair = taskButtons.flatMap(taskButton =>
+          providerButtons.map(providerButton => ({
+            task: taskButton.dataset.task,
+            provider: providerButton.dataset.provider
+          }))
+        ).find(pair => pairAvailable(pair.provider, pair.task));
+        if (availablePair) {
+          task = availablePair.task;
+          provider = availablePair.provider;
+        }
+      }
+      state.task = task;
+      state.provider = provider;
+
       for (const button of providerButtons) {
         const info = providerInfo(button.dataset.provider);
-        button.disabled = state.asking || !info?.available;
-        button.title = info?.available ? (info.model || '') : (info?.error || 'Provider unavailable');
+        const pair = pairInfo(button.dataset.provider, state.task);
+        const active = button.dataset.provider === state.provider;
+        button.classList.toggle('active', active);
+        button.setAttribute('aria-pressed', active ? 'true' : 'false');
+        button.disabled = state.asking || !pair?.available;
+        button.title = pair?.available
+          ? (info?.model || '')
+          : (pair?.error || info?.error || 'Provider unavailable for this task');
       }
-      const preferred = providerInfo(state.provider)?.available
-        ? state.provider
-        : (state.graph?.qa?.default_provider || state.provider);
-      const available = providerInfo(preferred)?.available
-        ? preferred
-        : providerButtons.map(button => button.dataset.provider).find(name => providerInfo(name)?.available);
-      if (available) selectProvider(available);
-      else providerStatus.textContent = 'No model provider is available';
+      for (const button of taskButtons) {
+        const info = taskInfo(button.dataset.task);
+        const active = button.dataset.task === state.task;
+        button.classList.toggle('active', active);
+        button.setAttribute('aria-pressed', active ? 'true' : 'false');
+        button.disabled = state.asking || !info?.available;
+        button.title = info?.available
+          ? (info.description || '')
+          : (info?.error || 'Task unavailable');
+      }
+      const providerMeta = providerInfo(state.provider);
+      const taskInfoValue = taskInfo(state.task);
+      providerStatus.textContent = pairAvailable(state.provider, state.task)
+        ? `${providerMeta?.label || state.provider} · ${providerMeta?.model || ''}`
+        : 'No model provider is available';
+      taskStatus.textContent = taskInfoValue?.description || state.task;
+      navigationOptions.hidden = state.task !== 'navigation';
+      allowFollowUp.disabled = state.asking;
+      questionInput.placeholder = state.task === 'navigation'
+        ? 'Describe the object to retrieve and any explicitly requested place.'
+        : state.task === 'find_object_in_view'
+          ? 'Ask whether a target object is in the current 3D camera frustum.'
+          : 'Ask about objects, rooms, spatial relations, or visual details.';
+      document.getElementById('answerLabel').textContent =
+        `Final answer · ${taskInfoValue?.label || state.task} · ${providerMeta?.label || state.provider}`;
     }
     function fmt(value, digits = 3) {
       if (value === null || value === undefined || Number.isNaN(Number(value))) return '';
@@ -1915,6 +2207,8 @@ HTML = r"""<!doctype html>
       const query = questionInput.value.trim();
       if (!query) return;
       const provider = state.provider;
+      const task = state.task;
+      const allow_follow_up_question = allowFollowUp.checked;
       const controller = new AbortController();
       state.askController = controller;
       askBtn.disabled = true;
@@ -1932,13 +2226,14 @@ HTML = r"""<!doctype html>
         const response = await fetch('/ask', {
           method: 'POST',
           headers: {'Content-Type': 'application/json'},
-          body: JSON.stringify({query, provider}),
+          body: JSON.stringify({query, provider, task, allow_follow_up_question}),
           signal: controller.signal
         });
         const data = await response.json();
         if (!response.ok) throw new Error(data.error || response.statusText);
         state.lastHistory = data.history;
         state.provider = data.provider || provider;
+        state.task = data.task || task;
         mergeSceneFromHistory(data.history);
         document.getElementById('answerText').textContent = typeof data.answer === 'string' ? data.answer : JSON.stringify(data.answer, null, 2);
         document.getElementById('reasoningText').textContent = data.reasoning || '';
@@ -1976,6 +2271,8 @@ HTML = r"""<!doctype html>
         if (state.graph?.qa && data.providers) {
           state.graph.qa.providers = data.providers;
           state.graph.qa.default_provider = data.default_provider || state.provider;
+          state.graph.qa.tasks = data.tasks || state.graph.qa.tasks;
+          state.graph.qa.default_task = data.default_task || state.task;
         }
         state.progressEvents = [];
         state.lastEventId = 0;
@@ -2027,6 +2324,9 @@ HTML = r"""<!doctype html>
     for (const button of providerButtons) {
       button.addEventListener('click', () => selectProvider(button.dataset.provider));
     }
+    for (const button of taskButtons) {
+      button.addEventListener('click', () => selectTask(button.dataset.task));
+    }
     questionInput.addEventListener('keydown', event => {
       if ((event.metaKey || event.ctrlKey) && event.key === 'Enter') askQuestion();
     });
@@ -2059,6 +2359,7 @@ HTML = r"""<!doctype html>
         refreshSceneBtn.textContent = 'Refresh';
       }
       state.provider = state.graph?.qa?.default_provider || state.provider;
+      state.task = state.graph?.qa?.default_task || state.task;
       state.objects = (state.graph.objects || []).slice().sort((a, b) => Number(a.object_id) - Number(b.object_id));
       state.rooms = (state.graph.rooms || []).slice().sort((a, b) => Number(a.room_id) - Number(b.room_id));
       if (!state.objects.some(object => Number(object.object_id) === Number(state.selectedId))) {
@@ -2186,6 +2487,8 @@ class Handler(BaseHTTPRequestHandler):
         runtime: QaRuntime | None = None
         query = ""
         provider = ""
+        task = ""
+        allow_follow_up_question = True
         turn_finished = False
         try:
             length = int(self.headers.get("Content-Length", "0") or "0")
@@ -2200,8 +2503,22 @@ class Handler(BaseHTTPRequestHandler):
             provider = str(
                 payload.get("provider") or self.server.default_provider  # type: ignore[attr-defined]
             ).strip().lower()
+            task = str(
+                payload.get("task") or self.server.default_task  # type: ignore[attr-defined]
+            ).strip().lower()
+            if task not in TASK_NAMES:
+                self._send_json({"error": f"unknown QA task: {task}"}, status=400)
+                return
+            allow_value = payload.get("allow_follow_up_question", True)
+            if not isinstance(allow_value, bool):
+                self._send_json(
+                    {"error": "allow_follow_up_question must be a boolean"},
+                    status=400,
+                )
+                return
+            allow_follow_up_question = allow_value
             runtime = self.server.current_runtime()  # type: ignore[attr-defined]
-            if provider not in runtime.agents:
+            if provider not in runtime.provider_status:
                 provider_status = runtime.provider_status
                 known = provider_status.get(provider)
                 if known is not None:
@@ -2214,6 +2531,23 @@ class Handler(BaseHTTPRequestHandler):
                         {"error": f"unknown model provider: {provider}"},
                         status=400,
                     )
+                return
+            agent = runtime.agents.get((provider, task))
+            if agent is None:
+                task_state = (
+                    runtime.provider_status.get(provider, {})
+                    .get("tasks", {})
+                    .get(task, {})
+                )
+                self._send_json(
+                    {
+                        "error": str(
+                            task_state.get("error")
+                            or f"{task} is unavailable with {provider}"
+                        )
+                    },
+                    status=503,
+                )
                 return
             request_lock = runtime.qa_lock
             acquired = request_lock.acquire(blocking=False)
@@ -2230,8 +2564,9 @@ class Handler(BaseHTTPRequestHandler):
             request_event = runtime.add_progress(
                 {
                     "phase": "request_start",
-                    "message": f"Question received by {provider}.",
+                    "message": f"{task} question received by {provider}.",
                     "provider": provider,
+                    "task": task,
                 }
             )
             progress_after = int(request_event.get("id", 1)) - 1
@@ -2241,13 +2576,25 @@ class Handler(BaseHTTPRequestHandler):
                 provider=provider,
                 model=model,
                 started_time_s=started_time_s,
+                task=task,
             )
             runtime.activate_turn(
                 turn_index,
                 started_time_s=started_time_s,
                 progress_after=progress_after,
             )
-            response = runtime.agents[provider].answer_query(query)
+            if task == TASK_NAVIGATION:
+                response = agent.answer_query(
+                    query,
+                    allow_follow_up_question=allow_follow_up_question,
+                )
+            else:
+                response = agent.answer_query(query)
+            response.history["task"] = task
+            if task == TASK_NAVIGATION:
+                response.history["allow_follow_up_question"] = (
+                    allow_follow_up_question
+                )
             highlight_groups = highlight_groups_from_history(response.history)
             body = {
                 "reasoning": response.reasoning,
@@ -2256,13 +2603,15 @@ class Handler(BaseHTTPRequestHandler):
                 "history": response.history,
                 "highlight_groups": highlight_groups,
                 "provider": provider,
+                "task": task,
                 "model": response.history.get("model"),
             }
             runtime.add_progress(
                 {
                     "phase": "request_done",
-                    "message": f"{provider} answer ready.",
+                    "message": f"{provider} {task} answer ready.",
                     "provider": provider,
+                    "task": task,
                 }
             )
             turn_finished = runtime.finish_turn(
@@ -2286,7 +2635,14 @@ class Handler(BaseHTTPRequestHandler):
                 runtime.add_progress(
                     {"phase": "request_error", "message": f"{type(exc).__name__}: {exc}"}
                 )
-            if runtime is not None and acquired and query and provider and not turn_finished:
+            if (
+                runtime is not None
+                and acquired
+                and query
+                and provider
+                and task
+                and not turn_finished
+            ):
                 history = getattr(exc, "scene_qa_history", None)
                 if not isinstance(history, dict):
                     history = {}
@@ -2299,6 +2655,8 @@ class Handler(BaseHTTPRequestHandler):
         finally:
             if acquired and request_lock is not None:
                 request_lock.release()
+            if runtime is not None and runtime.retired:
+                runtime.close_resources()
 
     def _reset_qa(self) -> None:
         try:
@@ -2309,6 +2667,8 @@ class Handler(BaseHTTPRequestHandler):
                     "generation": runtime.generation,
                     "providers": runtime.provider_status,
                     "default_provider": self.server.default_provider,  # type: ignore[attr-defined]
+                    "tasks": runtime.task_status,
+                    "default_task": self.server.default_task,  # type: ignore[attr-defined]
                 }
             )
         except Exception as exc:
@@ -2461,59 +2821,178 @@ def main() -> int:
 
     def build_runtime(generation: int) -> QaRuntime:
         runtime = QaRuntime(generation, scene_qa_log, progress_log)
+        reference_catalog_load = try_load_object_reference_catalog(
+            qa_config.resolved_object_reference_root()
+        )
+        runtime.object_reference_status = reference_catalog_load.status
+        print(
+            f"Object reference catalog generation {generation}: "
+            f"{reference_catalog_load.status}",
+            file=sys.stderr,
+        )
         if offline:
-            def registry_factory():
-                return create_default_tool_registry(graph, search_index, qa_config)
+            def registry_factory(task_config: SceneQaConfig):
+                return create_default_tool_registry(
+                    graph, search_index, task_config, reference_catalog_load
+                )
         else:
-            def registry_factory():
+            def registry_factory(task_config: SceneQaConfig):
                 live_client = LiveSceneQueryClient(
                     call_live_scene,
                     session_ttl_ms=LIVE_READ_SESSION_TTL_MS,
                 )
-                return create_live_tool_registry(live_client, qa_config)
+                return create_live_tool_registry(
+                    live_client, task_config, reference_catalog_load
+                )
 
         runtime.provider_status = {
-            name: dict(status) for name, status in configured_providers.items()
+            name: {**status, "tasks": {}}
+            for name, status in configured_providers.items()
         }
-        provider_builders = {
-            "gemini": lambda: GeminiSceneQaAgent(
+        runtime.task_status = {
+            task: {
+                **WEB_TASKS[task],
+                "available": False,
+                "providers": {},
+            }
+            for task in TASK_NAMES
+        }
+        camera_sampler = (
+            None
+            if offline
+            else runtime.add_resource(PersistentCameraViewSampler(qa_config))
+        )
+        detection_sampler = (
+            None
+            if offline
+            else runtime.add_resource(LazyLatest2dDetectionsSampler(qa_config))
+        )
+
+        def make_inner_agent(
+            provider: str,
+            registry: Any,
+            task_config: SceneQaConfig,
+            shared_client: Any | None,
+        ) -> Any:
+            common = {
+                "progress_callback": runtime.add_progress,
+                "history_callback": runtime.checkpoint_history,
+                "cancel_event": runtime.cancel_event,
+            }
+            if provider == "gemini":
+                return GeminiSceneQaAgent(
+                    graph,
+                    registry,
+                    task_config,
+                    api_key=args.api_key,
+                    client=shared_client,
+                    **common,
+                )
+            return DoubaoSceneQaAgent(
                 graph,
-                registry_factory(),
-                qa_config,
-                api_key=args.api_key,
-                progress_callback=runtime.add_progress,
-                history_callback=runtime.checkpoint_history,
-                cancel_event=runtime.cancel_event,
-            ),
-            "doubao": lambda: DoubaoSceneQaAgent(
-                graph,
-                registry_factory(),
-                qa_config,
+                registry,
+                task_config,
                 api_key=args.doubao_api_key,
-                progress_callback=runtime.add_progress,
-                history_callback=runtime.checkpoint_history,
-                cancel_event=runtime.cancel_event,
-            ),
-        }
-        for provider, builder in provider_builders.items():
-            try:
-                runtime.agents[provider] = builder()
-                runtime.provider_status[provider]["available"] = True
+                client=shared_client,
+                **common,
+            )
+
+        for provider in configured_providers:
+            shared_client: Any | None = None
+            for task in TASK_NAMES:
+                task_state: dict[str, Any] = {"available": False}
+                runtime.provider_status[provider]["tasks"][task] = task_state
+                runtime.task_status[task]["providers"][provider] = False
+                if task == TASK_FIND_OBJECT_IN_VIEW and offline:
+                    task_state["error"] = (
+                        "find_object_in_view requires the live scene and current ROS camera"
+                    )
+                    continue
+                try:
+                    task_config = config_for_task(
+                        qa_config,
+                        task,
+                        explicit_max_iterations=args.max_iterations,
+                    )
+                    registry = registry_factory(task_config)
+                    evidence: TaskEvidence | None = None
+                    if task == TASK_NAVIGATION:
+                        evidence = TaskEvidence(task)
+                        registry = create_navigation_task_registry(
+                            registry,
+                            task_config,
+                            evidence,
+                            reference_catalog_load,
+                        )
+                    elif task == TASK_FIND_OBJECT_IN_VIEW:
+                        if camera_sampler is None:
+                            raise RuntimeError("current ROS camera is unavailable")
+                        evidence = TaskEvidence(task)
+                        registry = create_find_object_in_view_task_registry(
+                            registry,
+                            task_config,
+                            evidence,
+                            camera_sampler,
+                            reference_catalog_load,
+                            detection_sampler=detection_sampler,
+                        )
+                    inner = make_inner_agent(
+                        provider,
+                        registry,
+                        task_config,
+                        shared_client,
+                    )
+                    if shared_client is None:
+                        shared_client = getattr(inner, "_client", None)
+                    agent: Any = inner
+                    if evidence is not None:
+                        agent = StructuredTaskAgent(
+                            inner,
+                            evidence,
+                            task=task,
+                            world_frame=task_config.in_view_world_frame,
+                        )
+                    runtime.agents[(provider, task)] = agent
+                    task_state["available"] = True
+                    runtime.task_status[task]["providers"][provider] = True
+                    runtime.task_status[task]["available"] = True
+                except Exception as exc:
+                    task_state["error"] = f"{type(exc).__name__}: {exc}"
+                    print(
+                        f"QA {provider}/{task} unavailable: "
+                        f"{type(exc).__name__}: {exc}",
+                        file=sys.stderr,
+                    )
+            provider_available = any(
+                state.get("available")
+                for state in runtime.provider_status[provider]["tasks"].values()
+            )
+            runtime.provider_status[provider]["available"] = provider_available
+            if provider_available:
                 runtime.provider_status[provider].pop("error", None)
-            except Exception as exc:
-                runtime.provider_status[provider]["available"] = False
+            else:
+                errors = [
+                    str(state.get("error"))
+                    for state in runtime.provider_status[provider]["tasks"].values()
+                    if state.get("error")
+                ]
                 runtime.provider_status[provider]["error"] = (
-                    f"{type(exc).__name__}: {exc}"
+                    errors[0] if errors else "provider unavailable"
                 )
-                print(
-                    f"Scene QA provider {provider} unavailable: "
-                    f"{type(exc).__name__}: {exc}",
-                    file=sys.stderr,
-                )
+        for task, status in runtime.task_status.items():
+            if status.get("available"):
+                continue
+            errors = [
+                str(runtime.provider_status[provider]["tasks"][task].get("error"))
+                for provider in configured_providers
+                if runtime.provider_status[provider]["tasks"][task].get("error")
+            ]
+            status["error"] = errors[0] if errors else "task unavailable"
         return runtime
 
     initial_runtime = build_runtime(1)
     if not initial_runtime.agents:
+        initial_runtime.close_resources()
         if point_sampler is not None:
             point_sampler.close()
         if live_transport is not None:
@@ -2521,16 +3000,34 @@ def main() -> int:
         scene_qa_log.close()
         print("No Scene QA model provider is available.", file=sys.stderr)
         return 2
-    default_provider = args.default_provider
-    if default_provider not in initial_runtime.agents:
-        default_provider = next(iter(initial_runtime.agents))
+    default_task = args.default_task
+    if not initial_runtime.task_status.get(default_task, {}).get("available"):
+        default_task = next(
+            task
+            for task in TASK_NAMES
+            if initial_runtime.task_status.get(task, {}).get("available")
+        )
         print(
-            f"Requested default provider is unavailable; using {default_provider}.",
+            f"Requested default task is unavailable; using {default_task}.",
+            file=sys.stderr,
+        )
+    default_provider = args.default_provider
+    if (default_provider, default_task) not in initial_runtime.agents:
+        default_provider = next(
+            provider
+            for provider in configured_providers
+            if (provider, default_task) in initial_runtime.agents
+        )
+        print(
+            f"Requested default provider is unavailable for {default_task}; "
+            f"using {default_provider}.",
             file=sys.stderr,
         )
     graph_data["qa"] = {
         "default_provider": default_provider,
+        "default_task": default_task,
         "providers": initial_runtime.provider_status,
+        "tasks": initial_runtime.task_status,
     }
 
     server: ThreadingHTTPServer | None = None
@@ -2550,11 +3047,12 @@ def main() -> int:
                 return runtime_state["current"] is candidate
 
         def reset_runtime() -> QaRuntime:
-            nonlocal default_provider
+            nonlocal default_provider, default_task
             with reset_lock:
                 old_runtime = current_runtime()
                 new_runtime = build_runtime(old_runtime.generation + 1)
                 if not new_runtime.agents:
+                    new_runtime.close_resources()
                     raise RuntimeError("no Scene QA model provider is available after reset")
                 with runtime_lock:
                     if runtime_state["current"] is not old_runtime:
@@ -2562,9 +3060,22 @@ def main() -> int:
                     runtime_state["current"] = new_runtime
                 old_runtime.retired = True
                 old_runtime.cancel()
-                if default_provider not in new_runtime.agents:
-                    default_provider = next(iter(new_runtime.agents))
+                if not old_runtime.qa_lock.locked():
+                    old_runtime.close_resources()
+                if not new_runtime.task_status.get(default_task, {}).get("available"):
+                    default_task = next(
+                        task
+                        for task in TASK_NAMES
+                        if new_runtime.task_status.get(task, {}).get("available")
+                    )
+                if (default_provider, default_task) not in new_runtime.agents:
+                    default_provider = next(
+                        provider
+                        for provider in configured_providers
+                        if (provider, default_task) in new_runtime.agents
+                    )
                 server.default_provider = default_provider  # type: ignore[attr-defined]
+                server.default_task = default_task  # type: ignore[attr-defined]
                 progress_log.clear()
                 progress_log.add(
                     {
@@ -2581,6 +3092,13 @@ def main() -> int:
 
         def read_graph() -> dict[str, Any]:
             if offline:
+                runtime = current_runtime()
+                graph_data["qa"] = {
+                    "default_provider": default_provider,
+                    "default_task": default_task,
+                    "providers": runtime.provider_status,
+                    "tasks": runtime.task_status,
+                }
                 return graph_data
             try:
                 client = LiveSceneQueryClient(
@@ -2594,7 +3112,9 @@ def main() -> int:
             runtime = current_runtime()
             payload["qa"] = {
                 "default_provider": default_provider,
+                "default_task": default_task,
                 "providers": runtime.provider_status,
+                "tasks": runtime.task_status,
             }
             return payload
 
@@ -2702,6 +3222,7 @@ def main() -> int:
         server.point_size = repr(float(args.point_size))  # type: ignore[attr-defined]
         server.progress_log = progress_log  # type: ignore[attr-defined]
         server.default_provider = default_provider  # type: ignore[attr-defined]
+        server.default_task = default_task  # type: ignore[attr-defined]
         server.scene_qa_log = scene_qa_log  # type: ignore[attr-defined]
         server.current_runtime = current_runtime  # type: ignore[attr-defined]
         server.is_current_runtime = is_current_runtime  # type: ignore[attr-defined]
@@ -2717,10 +3238,10 @@ def main() -> int:
         print(source_label)
         print(f"Scene QA conversation log: {scene_qa_log.path}")
         print(
-            "QA providers: "
+            "QA provider/task pairs: "
             + ", ".join(
-                f"{name}={initial_runtime.provider_status[name]['model']}"
-                for name in initial_runtime.agents
+                f"{provider}/{task}"
+                for provider, task in initial_runtime.agents
             )
         )
         if args.browser == "auto" and not args.no_browser:
@@ -2733,6 +3254,7 @@ def main() -> int:
             server.server_close()
         current_runtime = initial_runtime if server is None else server.current_runtime()  # type: ignore[attr-defined]
         current_runtime.cancel()
+        current_runtime.close_resources()
         if point_sampler is not None:
             point_sampler.close()
         if live_transport is not None:

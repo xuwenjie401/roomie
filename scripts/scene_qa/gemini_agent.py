@@ -302,6 +302,9 @@ class GeminiSceneQaAgent:
                     )
                 )
                 for media in tool_result.media:
+                    media_label = str(media.summary.get("label") or "").strip()
+                    if media_label:
+                        response_parts.append(types.Part.from_text(text=media_label))
                     response_parts.append(
                         types.Part.from_bytes(
                             data=media.data,
@@ -336,7 +339,9 @@ class GeminiSceneQaAgent:
     def _build_generate_config(self, *, include_tools: bool):
         types = self._types
         kwargs: dict[str, Any] = {
-            "system_instruction": self.config.load_system_prompt(),
+            "system_instruction": self.registry.system_prompt(
+                self.config.load_system_prompt()
+            ),
             "temperature": self.config.temperature,
             "max_output_tokens": self.config.max_output_tokens,
         }
@@ -416,6 +421,13 @@ class GeminiSceneQaAgent:
             )
         if name == "inspect_snapshot":
             return f"loading snapshot for object #{args.get('object_id')}"
+        if name == "inspect_object_reference":
+            return f"loading object reference {args.get('reference_id')}"
+        if name == "compare_scene_objects_to_reference":
+            return (
+                f"loading reference {args.get('reference_id')} with scene objects "
+                f"{args.get('object_ids')}"
+            )
         if name == "get_object":
             return f"loading object metadata for #{args.get('object_id')}"
         if name == "list_rooms":

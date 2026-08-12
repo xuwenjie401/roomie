@@ -11,6 +11,7 @@
 
 #include <rclcpp/rclcpp.hpp>
 #include <sensor_msgs/msg/image.hpp>
+#include <std_msgs/msg/string.hpp>
 #include <visualization_msgs/msg/marker_array.hpp>
 
 #include "roomie/pipeline/interfaces.hpp"
@@ -110,6 +111,7 @@ class DetectionBridgeThread : public WorkerThread {
   std::optional<PendingDebugFrame> takeDebugFrame(const InferenceResponse& response);
   void publishDetectionDebugImage(const InferenceResponse& response,
                                   const std::optional<PendingDebugFrame>& pending);
+  void publish2dDetectionResult(const InferenceResponse& response);
   void publishRawDetectionMarkers(const InferenceResponse& response);
   void maybeLogStatus();
 
@@ -124,6 +126,11 @@ class DetectionBridgeThread : public WorkerThread {
       std::string,
       rclcpp::Publisher<sensor_msgs::msg::Image>::SharedPtr>
       additional_detection_debug_pubs_;
+  rclcpp::Publisher<std_msgs::msg::String>::SharedPtr detections_2d_pub_;
+  std::unordered_map<
+      std::string,
+      rclcpp::Publisher<std_msgs::msg::String>::SharedPtr>
+      additional_detections_2d_pubs_;
   rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr raw_detection_pub_;
   std::unordered_map<RequestId, PendingDebugFrame> pending_debug_frames_;
   std::deque<RequestId> pending_debug_order_;

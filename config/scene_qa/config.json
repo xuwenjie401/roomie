@@ -1,7 +1,7 @@
 {
   "graph_json": "/home/lindenbot/Datasets/output/jarvis_home/instances/latest.dam_described.json",
   "gemini_model": "gemini-flash-latest",
-  "doubao_model": "doubao-seed-2-0-lite-260428",
+  "doubao_model": "doubao-seed-2-0-lite-260215",
   "doubao_base_url": "https://ark.cn-beijing.volces.com/api/v3",
   "doubao_thinking_type": "disabled",
   "embedding_model": "/home/lindenbot/hugging_face/sentence_t5_large",
@@ -13,5 +13,18 @@
   "max_output_tokens": 4096,
   "snapshot_max_side_px": 1024,
   "snapshot_bbox_pad_px": 8,
-  "system_prompt_path": "prompts/system.txt"
+  "object_reference_max_scene_objects": 4,
+  "system_prompt_path": "prompts/system.txt",
+  "navigation_system_prompt_path": "prompts/navigation.txt",
+  "find_object_in_view_system_prompt_path": "prompts/find_object_in_view.txt",
+  "in_view_image_topic": "/roomie/input/head_color/image_rect",
+  "in_view_camera_info_topic": "/roomie/input/head_color/camera_info",
+  "in_view_detection_image_topic": "/roomie/detections_2d_image",
+  "in_view_detection_result_topic": "/roomie/detections_2d",
+  "in_view_world_frame": "map",
+  "in_view_camera_frame": "head_color",
+  "in_view_min_depth_m": 0.1,
+  "in_view_max_depth_m": 6.0,
+  "in_view_sensor_timeout_s": 1.0,
+  "in_view_tf_tolerance_s": 0.2
 }

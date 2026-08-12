@@ -206,6 +206,43 @@ TEST(PresenceEvidence, SameViewpointFallbackRejectsWeakQualitySignals) {
   EXPECT_FALSE(confirms(1.5f, 0.90f, 0.79f));
 }
 
+TEST(PresenceEvidence,
+     ConfirmationBypassWhitelistSkipsOnlyTheViewpointQualityClause) {
+  PresenceEvidenceConfig config;
+  config.confirmation_bypass_labels = {"medicine_carton"};
+  InstanceTrack track;
+  track.label = "Medicine Carton";
+  track.center_world = {0.0f, 0.0f, 2.0f};
+  track.size_m = {0.2f, 0.1f, 0.1f};
+
+  InstanceObservation observation;
+  observation.camera_id = "hand_left_color";
+  observation.has_camera_pose = true;
+  observation.camera_position_world = Eigen::Vector3f::Zero();
+  observation.camera_distance_m = 2.0f;
+  observation.confidence = 0.30f;
+  observation.bbox_quality = 0.80f;
+  observation.time_ns = 1'000'000'000LL;
+  observation.eligible_frame_index = 1;
+  addPositivePresenceEvidence(&track, observation, config);
+  EXPECT_FALSE(hasPositivePresenceConfirmation(track, 1, config));
+
+  observation.time_ns += 100'000'000LL;
+  observation.eligible_frame_index = 2;
+  addPositivePresenceEvidence(&track, observation, config);
+  ASSERT_TRUE(hasPositivePresenceConfirmation(track, 2, config));
+
+  track.existence_log_odds = config.active_threshold - 0.01f;
+  EXPECT_FALSE(hasPositivePresenceConfirmation(track, 2, config));
+  track.existence_log_odds = config.active_threshold;
+  track.positive_window_interruptions = config.max_positive_interruptions + 1;
+  EXPECT_FALSE(hasPositivePresenceConfirmation(track, 2, config));
+
+  track.positive_window_interruptions = 0;
+  track.label = "book";
+  EXPECT_FALSE(hasPositivePresenceConfirmation(track, 2, config));
+}
+
 TEST(PresenceEvidence, UnknownVisibilityDoesNotChangeBelief) {
   const PresenceEvidenceConfig config;
   InstanceTrack track = visibleTrack();

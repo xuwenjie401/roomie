@@ -1,6 +1,6 @@
 # Roomie 当前使用说明
 
-更新时间：2026-08-04
+更新时间：2026-08-12
 
 适用工作区：`/home/lindenbot/RealityLab/jarvis`
 
@@ -34,7 +34,7 @@ Gemini 依次读取 `--api-key`、`GEMINI_API_KEY`、`GOOGLE_API_KEY`；Doubao �
 `--doubao-api-key`、`DOUBAO_API_KEY`、`doubao_api_key`、`ARK_API_KEY`。如果 key
 已经在 `.bashrc` 中通过 `export` 设置，打开新终端后 launch 会直接继承，不要再把它
 写到 launch 参数或命令历史里。在线问答还需要能够访问相应 API 并具有模型配额。
-Doubao 默认模型和地址为 `doubao-seed-2-0-lite-260428`、
+Doubao 默认模型和地址为 `doubao-seed-2-0-lite-260215`、
 `https://ark.cn-beijing.volces.com/api/v3`，默认关闭 thinking；模型、地址和
 `doubao_thinking_type` 都可在
 `config/scene_qa/config.json` 中修改。ROS 2 Humble
@@ -416,6 +416,7 @@ ros2 service list | rg roomie
 ```text
 /roomie/map_surface
 /roomie/detections_2d_image
+/roomie/detections_2d
 /roomie/raw_detections
 /roomie/instances
 /roomie/objects
@@ -650,6 +651,56 @@ CLI 会复用同一个所选模型 client 和 ROS transport，但每个问题独
 创建一个新的 read session，并在该回答的所有工具调用中固定同一个 scene revision；
 下一问读取最新 revision。当前不会把上一问的自然语言对话历史自动带入下一问。
 
+#### 导航寻物与视野内寻物 task profile
+
+导航寻物使用独立 prompt 和两个有界工具，输出字段与
+`roomie_msgs/action/RoomieNavigation.action` 对齐：
+
+```bash
+ros2 run roomie roomie_scene_qa.py --once --task navigation \
+  "帮我去书桌拿维生素C"
+
+# 不允许反问时，在多个目的地中选择证据最强的一个
+ros2 run roomie roomie_scene_qa.py --once --task navigation \
+  --no-follow-up-question "帮我拿药"
+```
+
+视野内寻物只支持 live 模式，输出字段与
+`roomie_msgs/action/FindObjectInView.action` 对齐：
+
+```bash
+ros2 run roomie roomie_scene_qa.py --once --task find_object_in_view \
+  "视野内有没有奥美拉唑"
+```
+
+这里的“视野内”采用几何定义：物体 yaw-OBB 的任一顶点落入采样的
+`head_color` 视锥及配置深度范围。主工具读取最新 Image header、CameraInfo 和
+`map <- head_color` TF，不读取该帧 RGB，也不做遮挡判断。另一个有界 VLM 工具可读取
+`head_color`、`hand_left_color`、`hand_right_color` 各自最后一次发布的 2D detector
+结构化结果（label、score、bbox）和带框图。`/roomie/detections_2d[_image]` 及两路
+`/.../hand_*_color` 输出使用 transient-local QoS，因此问答进程晚启动时仍能取得上一张；
+三路结果各自独立，不保证同一时刻，工具会返回 header、同步状态和相对 head 几何采样的
+时间差。Web QA 启动时会立即启动常驻相机 worker；播放流正常时优先等待一张新图，bag
+或传感器暂停超过等待时间时则使用进程内保留的最后一个完整 Image/CameraInfo/TF 视图，
+并在工具结果中返回 `view_mode=cached_last_valid`、`cached=true` 和
+`cache_age_sec`。该缓存没有 wall-time 过期限制，适合暂停后查询暂停画面，但不是磁盘
+缓存；如果 QA worker 在 bag 已暂停后才启动且从未收到过图像，仍无法回溯此前画面。
+默认深度范围为 `0.1–6.0 m`，传感器等待 1 秒，最新 TF 回退容差为 0.2 秒；
+对应参数位于 `config/scene_qa/config.json`，也可用 `--in-view-*` CLI 参数覆盖。
+当前数据和最后有效缓存均不可用时任务失败退出，不会伪装成“未找到”。
+
+`roomie_agibot_live_with_qa.launch.py` 默认启动的 Web UI 也提供 `Scene QA`、
+`Navigation` 和 `In-view find` 三种模式。Navigation 模式可逐次选择是否允许在多个
+目的地间反问；Web 请求会按所选模式切换独立 system prompt 和有界工具集。启动时可用
+`qa_default_task:=scene_qa|navigation|find_object_in_view` 指定浏览器初始模式，例如：
+
+```bash
+ros2 launch roomie roomie_agibot_live_with_qa.launch.py \
+  qa_default_task:=find_object_in_view
+```
+
+离线 viewer 中 `In-view find` 会被禁用，因为它必须读取当前 Image、CameraInfo 和 TF。
+
 ### 11.2 单独启动实时 Web 问答界面
 
 不使用组合 launch 时，可以在 pipeline 运行期间单独启动：
@@ -699,6 +750,64 @@ ros2 run roomie roomie_scene_qa_viewer.py \
   --points /path/to/map.nvblox
 ```
 
+### 11.4 场景无关的物体参考库
+
+物体参考库保存在源码目录的 `assets/object_references/`，整个目录已被 Git 忽略；原图、
+人工编辑草稿和发布结果都只留在本机。原图按物体分目录，例如：
+
+```text
+assets/object_references/
+└── raw/
+    └── 维生素C片/
+        ├── vc1.png
+        ├── vc2.png
+        └── ...
+```
+
+第一次整理或增加图片后，启动离线编辑器：
+
+```bash
+cd /home/lindenbot/RealityLab/jarvis/src/roomie
+source /home/lindenbot/miniconda3/etc/profile.d/conda.sh
+conda activate jarvis
+
+python scripts/roomie_object_reference_editor.py
+```
+
+完成 `colcon build` 后也可以运行
+`ros2 run roomie roomie_object_reference_editor.py`。编辑器默认打开
+`http://127.0.0.1:8780/`，监听地址、端口和是否打开浏览器可通过
+`--host`、`--port`、`--browser` 调整。
+
+在编辑器中需要人工完成以下内容，然后点击“发布只读版本”：
+
+1. 为候选图片拖拽裁剪框，并逐张确认裁剪；全图合适时也必须显式确认。
+2. 为一个物体恰好选择三张有区分度的图片，设置唯一的排名 1、2、3。
+3. 为三张图填写视角标签，并按需填写显示名和别名。
+
+发布会把三张裁剪图缩放到最长边不超过 768 px，并以 JPEG 质量 85 保存到不可变的
+`processed/builds/<build-id>/`；元数据写入同目录的 SQLite，最后原子更新
+`processed/CURRENT`。运行时会校验数据库完整性、三图约束、文件长度和 SHA-256。
+这里不预存视觉 embedding，也不在本地做 OCR/分类：经过人工筛选后，每个物体只有三张
+小图，按需直接交给 Gemini 或 Doubao 判断，避免维护与实际 VLM 不一致的检索模型。
+
+Scene QA CLI 每次启动、Web viewer 每次启动和 `Reset QA` 时都会重新检查参考库：
+
+- 健康时，system prompt 会列出精确的 reference ID，并只注册
+  `inspect_object_reference` 与 `compare_scene_objects_to_reference`。
+- 不存在、未发布或校验失败时，这两个工具不会注册；普通场景问答仍可使用，prompt 会明确
+  参考比较不可用。
+
+`inspect_object_reference` 只查看一个精确 reference ID 的三张参考图；
+`compare_scene_objects_to_reference` 把一个 reference ID 与一个或多个明确的场景
+object ID 一次交给 VLM。后者不会自动搜索候选物体，也不会代替 VLM 判定匹配。这里的
+“视野内”按当前稳定场景图中的对象理解，不保证对象此刻仍位于相机画面中；需要先用已有
+场景查询工具得到具体 object ID，再做参考比较。默认每次最多比较 4 个场景对象。
+
+需要把参考库放在别处时，可设置 `ROOMIE_OBJECT_REFERENCES_ROOT`，或给 Scene QA CLI、
+viewer 传 `--object-reference-root /path/to/object_references`。最大批量数可在
+`config/scene_qa/config.json` 中通过 `object_reference_max_scene_objects` 调整。
+
 ## 12. 测试
 
 ```bash
@@ -722,5 +831,5 @@ cd /home/lindenbot/RealityLab/jarvis/src/roomie
 ctest --test-dir build/roomie --output-on-failure
 ```
 
-当前 NVBLOX 构建配置的完整测试集应为 `46/46` 通过，其中包含
-`test_scene_qa` 的持续 CLI、live read-session 和 Web viewer 模式回归。
+当前测试集包含 `test_scene_qa` 的持续 CLI、live read-session 和 Web viewer 模式回归，
+以及 `test_object_references` 的人工草稿约束、不可变发布、损坏检测和两项参考工具回归。
