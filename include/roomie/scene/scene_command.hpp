@@ -131,13 +131,15 @@ struct ApplyDescriptionArtifactCommand {
 };
 
 struct HumanAnnotationPatch {
+  std::optional<std::string> name;
   std::optional<int> semantic_id;
   std::optional<std::string> label;
   std::optional<std::string> description;
   std::map<std::string, std::string> attributes;
 
   bool empty() const {
-    return !semantic_id && !label && !description && attributes.empty();
+    return !name && !semantic_id && !label && !description &&
+           attributes.empty();
   }
 };
 
@@ -182,6 +184,16 @@ struct ApplyHumanAnnotationCommand {
   std::optional<RoomAnnotationPatch> room_patch;
 };
 
+// Explicit human deletion with scene/component compare-and-swap. Deletion is
+// represented by a durable tombstone: object ids are never reused and the
+// revision history remains auditable.
+struct DeleteObjectCommand {
+  std::optional<SceneRevision> expected_scene_revision;
+  SceneObjectId object_id = -1;
+  std::uint64_t expected_identity_revision = 0;
+  std::string reason = "offline human delete";
+};
+
 // Explicitly reclassifies every current publishable object through the
 // configured furniture whitelist and atomically rebuilds all derived
 // furniture relations. Repeating it against unchanged state is a no-op.
@@ -200,7 +212,7 @@ using SceneCommand =
                  AdvanceSurfaceCommand,
                  ApplyGeometryResultCommand, ApplySnapshotSetCommand,
                  ApplyDescriptionArtifactCommand, ApplyHumanAnnotationCommand,
-                 RebuildFurnitureGraphCommand,
+                 DeleteObjectCommand, RebuildFurnitureGraphCommand,
                  PersistedThroughCommand, ShutdownCommand>;
 
 }  // namespace roomie

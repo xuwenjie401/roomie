@@ -56,6 +56,7 @@ SceneSnapshot makeQuerySnapshot(SceneRevision revision) {
 
   auto annotation = std::make_shared<AnnotationComponent>();
   annotation->revision = 1;
+  annotation->name = "Ada's chair";
   annotation->attributes["room_id"] = "reading-room";
   object->annotation = annotation;
 
@@ -258,6 +259,7 @@ TEST(SceneQueryJsonAdapter, ResultSchemaIncludesRevisionsFreshnessAndProvenance)
 
   const Json& object = call.at("result").at("object");
   EXPECT_EQ(object.at("object_id"), 7);
+  EXPECT_EQ(object.at("name"), "Ada's chair");
   EXPECT_EQ(object.at("revisions").at("identity"), 2);
   EXPECT_EQ(object.at("revisions").at("geometry"), 4);
   EXPECT_EQ(object.at("revisions").at("semantic"), 6);

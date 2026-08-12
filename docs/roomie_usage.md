@@ -516,6 +516,7 @@ roomie/srv/MutateScene
     "annotation_revision": 6
   },
   "patch": {
+    "name": "Ada's chair",
     "semantic_id": 91,
     "label": "reading chair",
     "description": "human verified walnut chair",
@@ -554,6 +555,50 @@ ros2 run roomie roomie_dsg_viewer.py \
   --points /path/to/map.nvblox \
   --port 8765
 ```
+
+### 10.1 离线编辑 SceneStore
+
+`roomie_offline_scene_editor.py` 直接加载已经停止采集的数据目录，不启动 ROS node，
+也不执行 detector、tracker、DAM 或 embedding。启动前必须先停止仍在写同一个
+SceneStore 的 pipeline；离线编辑器和在线 pipeline 不能同时作为 scene writer。
+
+```bash
+source /opt/ros/humble/setup.bash
+source /home/lindenbot/RealityLab/jarvis/install/setup.bash
+
+ros2 run roomie roomie_offline_scene_editor.py \
+  /home/lindenbot/Datasets/output/genie_live/
+```
+
+默认打开 `http://127.0.0.1:8766/`，从数据目录中的
+`roomie_scene.sqlite3`、`assets/assets/` 和最新 durable nvblox checkpoint 读取：
+
+- 左栏按 id、name、label 搜索 object；中间显示采样点云和可点击的 3D OBB；
+  右栏显示 id、name、label、description、几何、状态和 snapshot。
+- `name` 是人工指定的实例名，OWL/Boxer 仍只产生 `label`；未人工指定时
+  `name` 为空，界面显示时回退到 `label`。
+- name、label 修改和 object 删除先在浏览器暂存；`Save` 才把整批修改写入
+  SceneStore。删除会写 tombstone、移除关联 track/furniture/relation，object id
+  不会复用。
+- 修改 label 不会隐式改变家具分类。`Rebuild All Furniture` 会保存当前暂存修改，
+  然后显式重建全部家具 role 和派生 relation。
+- 保存会原地覆盖指定 SceneStore，不自动创建备份；写入使用 scene/component CAS，
+  并在同一 SQLite transaction 中把现有地图 checkpoint 对齐到新的语义 revision，
+  因而后续 coordinated load 不会回退这些离线修改。
+
+默认最多向浏览器发送 300,000 个采样 surface voxel，点坐标和 RGB 合计约
+4.5 MB；它只是显示层，不会把点云复制进 SceneStore。显存/内存受限或只需编辑
+3D 框时可以关闭点云：
+
+```bash
+ros2 run roomie roomie_offline_scene_editor.py \
+  /home/lindenbot/Datasets/output/genie_live/ \
+  --no-points
+```
+
+也可以用 `--max-points 100000` 调低采样数，或用 `--port`、`--no-browser` 调整
+服务行为。第一次打开旧数据时，SceneStore 会从 schema v5 原地迁移到 v6；v6
+保留 map-invariant 语义编辑所需的 checkpoint alignment 历史。
 
 ## 11. 场景问答
 
@@ -677,5 +722,5 @@ cd /home/lindenbot/RealityLab/jarvis/src/roomie
 ctest --test-dir build/roomie --output-on-failure
 ```
 
-当前 NVBLOX 构建配置的完整测试集应为 `36/36` 通过，其中包含
+当前 NVBLOX 构建配置的完整测试集应为 `46/46` 通过，其中包含
 `test_scene_qa` 的持续 CLI、live read-session 和 Web viewer 模式回归。

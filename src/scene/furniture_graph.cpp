@@ -310,6 +310,32 @@ float requireRatio(const Json& object,
   return value;
 }
 
+std::size_t requirePositiveFrameCount(const Json& object,
+                                      const char* key) {
+  if (!object.is_object() || !object.contains(key) ||
+      (!object.at(key).is_number_unsigned() &&
+       !object.at(key).is_number_integer())) {
+    throw std::invalid_argument(std::string("furniture config field '") +
+                                key + "' must be a positive integer");
+  }
+  std::uint64_t value = 0U;
+  if (object.at(key).is_number_unsigned()) {
+    value = object.at(key).get<std::uint64_t>();
+  } else {
+    const std::int64_t signed_value = object.at(key).get<std::int64_t>();
+    if (signed_value <= 0) {
+      throw std::invalid_argument(std::string("furniture config field '") +
+                                  key + "' must be positive");
+    }
+    value = static_cast<std::uint64_t>(signed_value);
+  }
+  if (value == 0U || value > std::numeric_limits<std::size_t>::max()) {
+    throw std::invalid_argument(std::string("furniture config field '") +
+                                key + "' is out of range");
+  }
+  return static_cast<std::size_t>(value);
+}
+
 }  // namespace
 
 std::string normalizeFurnitureLabel(std::string label) {
@@ -401,6 +427,20 @@ FurnitureGraphConfig loadFurnitureGraphConfig(
     if (!config.classes.emplace(label, rule).second) {
       throw std::invalid_argument("duplicate normalized furniture label: " +
                                   label);
+    }
+  }
+  if (root.contains("object_creation")) {
+    const Json& object_creation = root.at("object_creation");
+    config.object_creation_detection_window_frames =
+        requirePositiveFrameCount(object_creation,
+                                  "detection_window_frames");
+    config.object_creation_min_same_class_detection_frames =
+        requirePositiveFrameCount(object_creation,
+                                  "min_same_class_detection_frames");
+    if (config.object_creation_min_same_class_detection_frames >
+        config.object_creation_detection_window_frames) {
+      throw std::invalid_argument(
+          "furniture object creation minimum exceeds detection window");
     }
   }
   const Json on = root.value("on", Json::object());

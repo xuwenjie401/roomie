@@ -117,6 +117,7 @@ Json queryObjectJson(const QueryObjectView& object) {
       {"object_id", object.object_id},
       {"resolved_alias", object.resolved_alias},
       {"semantic_id", object.semantic_id},
+      {"name", object.name},
       {"label", object.label},
       {"canonical_description", nullableString(object.canonical_description)},
       {"display_description", object.display_description},

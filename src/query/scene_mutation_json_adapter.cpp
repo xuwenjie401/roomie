@@ -236,9 +236,12 @@ void parseDependencies(const Json& value,
 void parseObjectPatch(const Json& value,
                       ApplyHumanAnnotationCommand* command) {
   requireOnlyFields(value,
-                    {"semantic_id", "label", "description", "attributes",
+                    {"name", "semantic_id", "label", "description", "attributes",
                      "room_memberships"},
                     "patch");
+  if (value.contains("name")) {
+    command->patch.name = boundedString(value.at("name"), "patch.name");
+  }
   if (value.contains("semantic_id")) {
     command->patch.semantic_id = entityId(value.at("semantic_id"),
                                            "patch.semantic_id");

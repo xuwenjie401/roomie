@@ -369,6 +369,11 @@ SemanticDocument makeSemanticDocument(const SemanticDocumentInput& input) {
 
   std::ostringstream canonical;
   canonical << "semantic-document.v1\n";
+  // Keep hashes for every pre-name object byte-identical. The optional field
+  // is emitted only after a human assigns a non-empty instance name.
+  if (!normalizeText(input.name).empty()) {
+    appendCanonicalField(&canonical, "name", normalizeText(input.name));
+  }
   appendCanonicalField(&canonical, "label", normalizeText(input.label));
   appendCanonicalField(&canonical,
                        "canonical_name",
@@ -428,6 +433,7 @@ SemanticDocument makeSemanticDocumentForObject(
 
   SemanticDocumentInput input;
   input.object_id = object_id;
+  input.name = object.annotation->name;
   input.label = effectiveSemanticLabel(object);
   input.retrieval.canonical_name = input.label;
   const std::string description = effectiveSemanticDescription(object, view);

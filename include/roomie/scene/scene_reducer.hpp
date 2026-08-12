@@ -70,6 +70,7 @@ class ReducerCore {
   SceneApplyResult applyCommand(const ApplySnapshotSetCommand& command);
   SceneApplyResult applyCommand(const ApplyDescriptionArtifactCommand& command);
   SceneApplyResult applyCommand(const ApplyHumanAnnotationCommand& command);
+  SceneApplyResult applyCommand(const DeleteObjectCommand& command);
   SceneApplyResult applyCommand(const RebuildFurnitureGraphCommand& command);
   SceneApplyResult applyCommand(const PersistedThroughCommand& command);
   SceneApplyResult applyCommand(const ShutdownCommand& command);

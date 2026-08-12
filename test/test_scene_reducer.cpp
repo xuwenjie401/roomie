@@ -75,6 +75,7 @@ TEST(SceneReducer, LoadAndHumanAnnotationUseComponentStructuralSharing) {
   annotation.object_id = 1;
   annotation.expected_identity_revision = before_one->identity->revision;
   annotation.expected_annotation_revision = before_one->annotation->revision;
+  annotation.patch.name = "Ada's chair";
   annotation.patch.label = "reading chair";
   annotation.patch.description = "human verified";
   annotation.patch.attributes["room"] = "study";
@@ -91,14 +92,87 @@ TEST(SceneReducer, LoadAndHumanAnnotationUseComponentStructuralSharing) {
   EXPECT_EQ(after_one->geometry.get(), before_one->geometry.get());
   EXPECT_EQ(after_one->semantic.get(), before_one->semantic.get());
   EXPECT_EQ(after_two.get(), before_two.get());
+  EXPECT_TRUE(before_one->annotation->name.empty());
+  EXPECT_EQ(after_one->annotation->name, "Ada's chair");
   EXPECT_FALSE(before_one->annotation->label_override.has_value());
   EXPECT_EQ(after_one->annotation->label_override, "reading chair");
 
   const ObjectGraphSnapshot materialized =
       annotated.snapshot.materializeObjectGraph();
   ASSERT_EQ(materialized.objects.size(), 2u);
+  EXPECT_EQ(materialized.objects.front().name, "Ada's chair");
   EXPECT_EQ(materialized.objects.front().label, "reading chair");
   EXPECT_EQ(materialized.objects.front().description, "human verified");
+}
+
+TEST(SceneReducer, ExplicitDeleteUsesCasAndCascadesObjectOwnedState) {
+  ReducerCore reducer;
+  LoadSceneCommand load =
+      loadCommand({makeNode(1, "table"), makeNode(2, "cup")});
+  load.graph.furniture.push_back(FurnitureRole{1, 1, "table"});
+  ObjectRelation relation;
+  setRelationEndpoints(&relation,
+                       SceneEntityRef{SceneEntityType::kObject, 1},
+                       SceneEntityRef{SceneEntityType::kObject, 2});
+  relation.relation_type = "beside";
+  relation.confidence = 0.8f;
+  load.graph.relations.push_back(relation);
+  InstanceTrack track;
+  track.track_id = 1001;
+  track.object_id = 1;
+  track.state = InstanceTrackState::kStable;
+  track.label = "table";
+  load.tracks.push_back(track);
+  const SceneApplyResult loaded = reducer.apply(SceneCommand{load});
+  ASSERT_TRUE(loaded.committedRevision()) << loaded.reason;
+  const SceneObjectPtr object = loaded.snapshot.findExactObject(1);
+  ASSERT_TRUE(object);
+  ASSERT_TRUE(object->identity);
+  ASSERT_EQ(loaded.snapshot.tracks().count(1001), 1U);
+  ASSERT_EQ(loaded.snapshot.graphMetadata().furniture.size(), 1U);
+  ASSERT_FALSE(loaded.snapshot.graphMetadata().relations.empty());
+
+  DeleteObjectCommand stale_scene;
+  stale_scene.expected_scene_revision = loaded.revision - 1;
+  stale_scene.object_id = 1;
+  stale_scene.expected_identity_revision = object->identity->revision;
+  EXPECT_EQ(reducer.apply(SceneCommand{stale_scene}).status,
+            SceneApplyStatus::kRejected);
+
+  DeleteObjectCommand stale_identity;
+  stale_identity.expected_scene_revision = loaded.revision;
+  stale_identity.object_id = 1;
+  stale_identity.expected_identity_revision = object->identity->revision + 1;
+  EXPECT_EQ(reducer.apply(SceneCommand{stale_identity}).status,
+            SceneApplyStatus::kRejected);
+
+  DeleteObjectCommand erase;
+  erase.expected_scene_revision = loaded.revision;
+  erase.object_id = 1;
+  erase.expected_identity_revision = object->identity->revision;
+  erase.reason = "offline unit test";
+  const SceneApplyResult deleted = reducer.apply(SceneCommand{erase});
+  ASSERT_TRUE(deleted.committedRevision()) << deleted.reason;
+  EXPECT_FALSE(deleted.snapshot.findExactObject(1));
+  EXPECT_TRUE(deleted.snapshot.isTombstoned(1));
+  EXPECT_EQ(deleted.snapshot.tombstones().at(1).reason, "offline unit test");
+  EXPECT_EQ(deleted.snapshot.tracks().count(1001), 0U);
+  EXPECT_TRUE(deleted.snapshot.graphMetadata().furniture.empty());
+  EXPECT_TRUE(std::none_of(
+      deleted.snapshot.graphMetadata().relations.begin(),
+      deleted.snapshot.graphMetadata().relations.end(),
+      [](const SceneRelation& value) {
+        return relationSource(value).id == 1 || relationTarget(value).id == 1;
+      }));
+  EXPECT_TRUE(std::any_of(
+      deleted.events.begin(), deleted.events.end(),
+      [](const SceneEvent& event) {
+        const auto* tombstone = std::get_if<ObjectTombstoned>(&event);
+        return tombstone && tombstone->object_id == 1;
+      }));
+  EXPECT_EQ(reducer.apply(SceneCommand{erase}).status,
+            SceneApplyStatus::kRejected)
+      << "the old scene CAS must remain stale after deletion";
 }
 
 TEST(SceneReducer, MergeAndTombstoneRetireIdsAndRejectLateResults) {

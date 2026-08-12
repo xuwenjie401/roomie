@@ -237,6 +237,7 @@ InstanceRecord ObjectGraph::recordFromNode(const ObjectNode& node) {
     record.track_id = node.source_track_ids.back();
   }
   record.semantic_id = node.semantic_id;
+  record.name = node.name;
   record.label = node.label;
   record.description = node.description;
   record.center_world = node.center_world;

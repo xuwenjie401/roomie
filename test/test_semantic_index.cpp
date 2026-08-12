@@ -182,6 +182,12 @@ TEST(SemanticDocument, IsCanonicalAndExcludesVolatileMetadata) {
 
   reordered.label = "floor lamp";
   EXPECT_NE(makeSemanticDocument(reordered).document_hash, lhs.document_hash);
+
+  SemanticDocumentInput named = first;
+  named.name = "Ada's lamp";
+  const SemanticDocument named_document = makeSemanticDocument(named);
+  EXPECT_NE(named_document.document_hash, lhs.document_hash);
+  EXPECT_NE(named_document.text.find("ada's lamp"), std::string::npos);
 }
 
 TEST(EmbeddingWorker, FirstSearchIsLexicalAndDoesNotLoadOrEncodeModel) {

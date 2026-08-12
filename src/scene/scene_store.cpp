@@ -229,6 +229,53 @@ PositivePresenceEvidenceHistory positivePresenceEvidenceHistoryFromJson(
   return result;
 }
 
+Json furnitureDetectionFramesToJson(
+    const std::map<std::string, std::vector<std::uint64_t>>& histories) {
+  Json result = Json::object();
+  for (const auto& [label, frames] : histories) {
+    result[label] = frames;
+  }
+  return result;
+}
+
+std::map<std::string, std::vector<std::uint64_t>>
+furnitureDetectionFramesFromJson(const Json& value) {
+  if (!value.is_object()) {
+    throw StoreError("stored furniture detection frames are not an object");
+  }
+  std::map<std::string, std::vector<std::uint64_t>> result;
+  for (const auto& [label, frames_json] : value.items()) {
+    if (label.empty() || !frames_json.is_array()) {
+      throw StoreError("stored furniture detection frame history is invalid");
+    }
+    std::vector<std::uint64_t> frames;
+    frames.reserve(frames_json.size());
+    for (const Json& frame_json : frames_json) {
+      if (!frame_json.is_number_unsigned() &&
+          !frame_json.is_number_integer()) {
+        throw StoreError("stored furniture detection frame is not an integer");
+      }
+      std::uint64_t frame = 0U;
+      if (frame_json.is_number_unsigned()) {
+        frame = frame_json.get<std::uint64_t>();
+      } else {
+        const std::int64_t signed_frame = frame_json.get<std::int64_t>();
+        if (signed_frame < 0) {
+          throw StoreError("stored furniture detection frame is negative");
+        }
+        frame = static_cast<std::uint64_t>(signed_frame);
+      }
+      if (!frames.empty() && frame <= frames.back()) {
+        throw StoreError(
+            "stored furniture detection frames are not strictly increasing");
+      }
+      frames.push_back(frame);
+    }
+    result.emplace(label, std::move(frames));
+  }
+  return result;
+}
+
 Json vector3iToJson(const Eigen::Vector3i& value) {
   return Json::array({value.x(), value.y(), value.z()});
 }
@@ -478,6 +525,7 @@ Json objectToJson(const SceneObject& object) {
 
   Json annotation_json{
       {"revision", annotation.revision},
+      {"name", annotation.name},
       {"attributes", annotation.attributes},
   };
   annotation_json["semantic_id_override"] =
@@ -732,6 +780,7 @@ SceneObjectPtr objectFromJson(const Json& value) {
   const Json& annotation_json = value.at("annotation");
   auto annotation = std::make_shared<AnnotationComponent>();
   annotation->revision = jsonUnsigned(annotation_json, "revision");
+  annotation->name = annotation_json.value("name", std::string());
   if (!annotation_json.at("semantic_id_override").is_null()) {
     annotation->semantic_id_override =
         jsonInt(annotation_json, "semantic_id_override");
@@ -904,6 +953,9 @@ Json trackToJson(const InstanceTrack& track) {
       {"positive_presence_evidence_history",
        positivePresenceEvidenceHistoryToJson(
            track.positive_presence_evidence_history)},
+      {"furniture_detection_frames_by_label",
+       furnitureDetectionFramesToJson(
+           track.furniture_detection_frames_by_label)},
       {"negative_evidence_timestamps_ns",
        track.negative_evidence_timestamps_ns},
       {"positive_window_interruptions",
@@ -993,6 +1045,11 @@ InstanceTrack trackFromJson(const Json& value) {
     track.positive_presence_evidence_history =
         positivePresenceEvidenceHistoryFromJson(
             value.at("positive_presence_evidence_history"));
+  }
+  if (value.contains("furniture_detection_frames_by_label")) {
+    track.furniture_detection_frames_by_label =
+        furnitureDetectionFramesFromJson(
+            value.at("furniture_detection_frames_by_label"));
   }
   track.negative_evidence_timestamps_ns = value.value(
       "negative_evidence_timestamps_ns", std::vector<TimeNanoseconds>());
@@ -2136,6 +2193,17 @@ void validateMapCheckpointTable(sqlite3* database,
     (void)mapCheckpointFromStatement(statement, 0,
                                      durable_scene_revision);
   }
+  Statement alignments(
+      database,
+      "SELECT a.aligned_scene_revision FROM map_checkpoint_alignments a "
+      "JOIN map_checkpoint_manifest m ON m.checkpoint_id=a.checkpoint_id "
+      "ORDER BY a.alignment_id;");
+  while (alignments.stepRow()) {
+    if (alignments.columnType(0) != SQLITE_INTEGER ||
+        sceneRevision(alignments.columnInt64(0)) > durable_scene_revision) {
+      throw StoreError("stored map checkpoint alignment is invalid");
+    }
+  }
 }
 
 void validateArtifactOriginTable(sqlite3* database,
@@ -2405,7 +2473,7 @@ void migrateSchema(sqlite3* database) {
     return;
   }
   if (version != 0 && version != 1 && version != 2 && version != 3 &&
-      version != 4) {
+      version != 4 && version != 5) {
     throw StoreError("scene store has no migration path from schema version " +
                      std::to_string(version));
   }
@@ -2626,6 +2694,34 @@ INSERT INTO schema_migrations(version, description)
 PRAGMA user_version = 5;
 )sql");
     version = 5;
+  }
+  if (version == 5) {
+    execSql(
+        database,
+        R"sql(
+CREATE TABLE map_checkpoint_alignments(
+  alignment_id INTEGER PRIMARY KEY AUTOINCREMENT,
+  checkpoint_id INTEGER NOT NULL,
+  aligned_scene_revision INTEGER NOT NULL
+    CHECK(aligned_scene_revision >= 0),
+  created_at_unix_ms INTEGER NOT NULL CHECK(created_at_unix_ms > 0),
+  FOREIGN KEY(checkpoint_id) REFERENCES map_checkpoint_manifest(checkpoint_id)
+);
+CREATE INDEX map_checkpoint_alignment_latest
+  ON map_checkpoint_alignments(alignment_id, aligned_scene_revision);
+INSERT INTO map_checkpoint_alignments(
+  checkpoint_id, aligned_scene_revision, created_at_unix_ms)
+SELECT checkpoint_id, aligned_scene_revision,
+       CASE WHEN published_at_unix_ms > 0 THEN published_at_unix_ms
+            ELSE created_at_unix_ms END
+FROM map_checkpoint_manifest
+ORDER BY checkpoint_id;
+
+INSERT INTO schema_migrations(version, description)
+  VALUES(6, 'map-invariant semantic revision alignments');
+PRAGMA user_version = 6;
+)sql");
+    version = 6;
   }
   if (version != SceneStore::kCurrentSchemaVersion) {
     throw StoreError("scene store migration did not reach the current schema");
@@ -2959,7 +3055,7 @@ struct SceneStore::Impl {
       : database_path(std::move(path)),
         max_pending_commits(pending_limit) {}
 
-  SceneStoreStatus flushLocked();
+  SceneStoreStatus flushLocked(bool align_latest_map = false);
   void closeWithoutFlushLocked();
 
   std::string database_path;
@@ -2973,7 +3069,7 @@ struct SceneStore::Impl {
   mutable std::mutex mutex;
 };
 
-SceneStoreStatus SceneStore::Impl::flushLocked() {
+SceneStoreStatus SceneStore::Impl::flushLocked(bool align_latest_map) {
   if (!database) {
     return SceneStoreStatus::failure("scene store is not open");
   }
@@ -3045,6 +3141,26 @@ SceneStoreStatus SceneStore::Impl::flushLocked() {
     update_watermark.stepDone();
     if (sqlite3_changes(database) != 1) {
       throw StoreError("store_state singleton row is missing");
+    }
+    if (align_latest_map) {
+      Statement latest_alignment(
+          database,
+          "SELECT checkpoint_id FROM map_checkpoint_alignments "
+          "ORDER BY alignment_id DESC LIMIT 1;");
+      if (!latest_alignment.stepRow()) {
+        throw StoreError(
+            "map-invariant edit requires an existing map checkpoint");
+      }
+      const std::int64_t checkpoint_id = latest_alignment.columnInt64(0);
+      Statement insert_alignment(
+          database,
+          "INSERT INTO map_checkpoint_alignments("
+          "checkpoint_id, aligned_scene_revision, created_at_unix_ms) "
+          "VALUES(?1, ?2, ?3);");
+      insert_alignment.bindInt64(1, checkpoint_id);
+      insert_alignment.bindInt64(2, sqliteRevision(expected_revision));
+      insert_alignment.bindInt64(3, unixTimeMilliseconds());
+      insert_alignment.stepDone();
     }
     transaction.commit();
 
@@ -3281,6 +3397,11 @@ SceneStoreStatus SceneStore::flush() {
   return impl_->flushLocked();
 }
 
+SceneStoreStatus SceneStore::flushWithMapCheckpointAlignment() {
+  std::lock_guard<std::mutex> lock(impl_->mutex);
+  return impl_->flushLocked(true);
+}
+
 SceneStoreStatus SceneStore::gracefulFlush() {
   std::lock_guard<std::mutex> lock(impl_->mutex);
   SceneStoreStatus status = impl_->flushLocked();
@@ -3428,9 +3549,13 @@ SceneStoreStatus SceneStore::rewindTo(
     };
     if (retain_aligned_map_checkpoints) {
       delete_after(
-          "DELETE FROM map_checkpoint_manifest "
+          "DELETE FROM map_checkpoint_alignments "
           "WHERE aligned_scene_revision > ?1;");
+      execSql(impl_->database,
+              "DELETE FROM map_checkpoint_manifest WHERE checkpoint_id NOT "
+              "IN (SELECT checkpoint_id FROM map_checkpoint_alignments);");
     } else {
+      execSql(impl_->database, "DELETE FROM map_checkpoint_alignments;");
       execSql(impl_->database, "DELETE FROM map_checkpoint_manifest;");
     }
     delete_after(
@@ -3527,6 +3652,18 @@ SceneStoreStatus SceneStore::publishMapCheckpoint(
     insert.bindInt64(11, manifest.created_at_unix_ms);
     insert.bindInt64(12, unixTimeMilliseconds());
     insert.stepDone();
+    const std::int64_t checkpoint_id =
+        sqlite3_last_insert_rowid(impl_->database);
+    Statement insert_alignment(
+        impl_->database,
+        "INSERT INTO map_checkpoint_alignments("
+        "checkpoint_id, aligned_scene_revision, created_at_unix_ms) "
+        "VALUES(?1, ?2, ?3);");
+    insert_alignment.bindInt64(1, checkpoint_id);
+    insert_alignment.bindInt64(
+        2, sqliteRevision(manifest.aligned_scene_revision));
+    insert_alignment.bindInt64(3, unixTimeMilliseconds());
+    insert_alignment.stepDone();
     transaction.commit();
     return SceneStoreStatus::success();
   } catch (const std::exception& error) {
@@ -3543,8 +3680,13 @@ MapCheckpointLookupResult SceneStore::latestMapCheckpoint() const {
   }
   try {
     const std::string sql =
-        std::string("SELECT ") + kMapCheckpointColumns +
-        " FROM map_checkpoint_manifest ORDER BY checkpoint_id DESC LIMIT 1;";
+        "SELECT m.backend, m.checkpoint_path, m.world_frame, "
+        "m.config_fingerprint, m.map_epoch, m.map_revision, "
+        "m.integrated_through_ns, a.aligned_scene_revision, "
+        "m.file_size_bytes, m.content_hash, m.created_at_unix_ms "
+        "FROM map_checkpoint_alignments a JOIN map_checkpoint_manifest m "
+        "ON m.checkpoint_id=a.checkpoint_id "
+        "ORDER BY a.alignment_id DESC LIMIT 1;";
     Statement statement(impl_->database, sql.c_str());
     if (statement.stepRow()) {
       result.manifest = mapCheckpointFromStatement(

@@ -235,6 +235,8 @@ void downgradeOutboxSchemaForMigrationTest(const std::string& path,
   std::string sql = R"sql(
 PRAGMA foreign_keys = OFF;
 BEGIN IMMEDIATE;
+DROP INDEX IF EXISTS map_checkpoint_alignment_latest;
+DROP TABLE IF EXISTS map_checkpoint_alignments;
 DROP INDEX IF EXISTS map_checkpoint_manifest_alignment;
 DROP TABLE IF EXISTS map_checkpoint_manifest;
 DROP INDEX IF EXISTS artifact_origins_revision;
@@ -492,6 +494,8 @@ TEST(SceneStore, PositivePresenceViewpointsSurviveRestore) {
   second.eligible_frame_index = 101;
   second.camera_position_world = {0.12f, 0.0f, 0.0f};
   create.track.positive_presence_evidence_history = {first, second};
+  create.track.furniture_detection_frames_by_label = {
+      {"sofa", {90, 100}}, {"table", {95}}};
   const SceneApplyResult applied =
       reducer.apply(SceneCommand{storeMutation(create)});
   ASSERT_TRUE(applied.committedRevision()) << applied.reason;
@@ -506,6 +510,8 @@ TEST(SceneStore, PositivePresenceViewpointsSurviveRestore) {
   ASSERT_TRUE(track->second);
   EXPECT_EQ(track->second->positive_presence_evidence_history,
             create.track.positive_presence_evidence_history);
+  EXPECT_EQ(track->second->furniture_detection_frames_by_label,
+            create.track.furniture_detection_frames_by_label);
   const SceneObjectPtr object =
       restored.snapshot.findObject(track->second->object_id);
   ASSERT_TRUE(object);
@@ -612,6 +618,76 @@ TEST(SceneStore, MapCheckpointManifestIsAlignedIdempotentAndRestorable) {
   ASSERT_TRUE(discarded.status) << discarded.status.error;
   EXPECT_FALSE(discarded.manifest.has_value());
   EXPECT_EQ(reopened.restoreLatest().snapshot.revision(), 2U);
+}
+
+TEST(SceneStore, MapInvariantFlushCarriesCheckpointAcrossOfflineEdits) {
+  TemporaryDatabase database;
+  ReducerCore reducer;
+  const SceneApplyResult loaded = reducer.apply(
+      SceneCommand{storeLoadCommand({makeStoreNode(33, "chair")})});
+  ASSERT_TRUE(loaded.committedRevision()) << loaded.reason;
+
+  SceneStore store(database.path());
+  ASSERT_TRUE(store.open());
+  ASSERT_TRUE(store.enqueueCommit(loaded.snapshot));
+  ASSERT_TRUE(store.flush());
+
+  MapCheckpointManifest manifest;
+  manifest.backend = "nvblox";
+  manifest.checkpoint_path = "/tmp/roomie-map-invariant.nvblox";
+  manifest.world_frame = "world";
+  manifest.config_fingerprint = "fnv1a64:offline-edit";
+  manifest.map_epoch = RunId{0x1111U, 0x3333U};
+  manifest.map_revision = 9;
+  manifest.integrated_through_ns = 9000;
+  manifest.aligned_scene_revision = loaded.revision;
+  manifest.file_size_bytes = 2048;
+  manifest.content_hash = "fnv1a64:offline-map";
+  manifest.created_at_unix_ms = 1000;
+  ASSERT_TRUE(store.publishMapCheckpoint(manifest));
+
+  const SceneObjectPtr object = reducer.snapshot().findExactObject(33);
+  ASSERT_TRUE(object);
+  ApplyHumanAnnotationCommand edit;
+  edit.expected_scene_revision = reducer.snapshot().revision();
+  edit.object_id = 33;
+  edit.expected_identity_revision = object->identity->revision;
+  edit.expected_annotation_revision = object->annotation->revision;
+  edit.patch.name = "reading nook chair";
+  edit.patch.label = "armchair";
+  const SceneApplyResult edited = reducer.apply(SceneCommand{edit});
+  ASSERT_TRUE(edited.committedRevision()) << edited.reason;
+  ASSERT_TRUE(store.enqueueCommit(edited.snapshot));
+  ASSERT_TRUE(store.flushWithMapCheckpointAlignment());
+
+  const MapCheckpointLookupResult aligned = store.latestMapCheckpoint();
+  ASSERT_TRUE(aligned.status) << aligned.status.error;
+  ASSERT_TRUE(aligned.manifest);
+  EXPECT_EQ(aligned.manifest->checkpoint_path, manifest.checkpoint_path);
+  EXPECT_EQ(aligned.manifest->aligned_scene_revision, edited.revision);
+  EXPECT_EQ(store.watermarks().durable_scene_revision, edited.revision);
+  EXPECT_EQ(sqliteScalar(
+                database.path(),
+                "SELECT COUNT(*) FROM map_checkpoint_alignments;"),
+            2);
+
+  ASSERT_TRUE(store.closeGracefully());
+  SceneStore reopened(database.path());
+  ASSERT_TRUE(reopened.open());
+  const SceneRestoreResult restored = reopened.restoreLatest();
+  ASSERT_TRUE(restored.status) << restored.status.error;
+  ASSERT_TRUE(restored.found);
+  const SceneObjectPtr restored_object = restored.snapshot.findExactObject(33);
+  ASSERT_TRUE(restored_object);
+  ASSERT_TRUE(restored_object->annotation);
+  EXPECT_EQ(restored_object->annotation->name, "reading nook chair");
+  EXPECT_EQ(restored_object->annotation->label_override, "armchair");
+  const MapCheckpointLookupResult reopened_alignment =
+      reopened.latestMapCheckpoint();
+  ASSERT_TRUE(reopened_alignment.status) << reopened_alignment.status.error;
+  ASSERT_TRUE(reopened_alignment.manifest);
+  EXPECT_EQ(reopened_alignment.manifest->aligned_scene_revision,
+            edited.revision);
 }
 
 TEST(SceneStore,
@@ -732,6 +808,8 @@ TEST(SceneStore, MigratesV3ByAddingCheckpointManifestWithoutSceneLoss) {
   sqliteExecute(
       database.path(),
       "PRAGMA foreign_keys = OFF; BEGIN IMMEDIATE; "
+      "DROP INDEX map_checkpoint_alignment_latest; "
+      "DROP TABLE map_checkpoint_alignments; "
       "DROP INDEX map_checkpoint_manifest_alignment; "
       "DROP TABLE map_checkpoint_manifest; "
       "DROP INDEX artifact_origins_revision; "
@@ -751,6 +829,61 @@ TEST(SceneStore, MigratesV3ByAddingCheckpointManifestWithoutSceneLoss) {
       migrated.latestMapCheckpoint();
   ASSERT_TRUE(no_checkpoint.status) << no_checkpoint.status.error;
   EXPECT_FALSE(no_checkpoint.manifest.has_value());
+}
+
+TEST(SceneStore, MigratesV5WithMultipleCheckpointsAtOneRevision) {
+  TemporaryDatabase database;
+  ReducerCore reducer;
+  const SceneApplyResult loaded = reducer.apply(
+      SceneCommand{storeLoadCommand({makeStoreNode(34, "cabinet")})});
+  ASSERT_TRUE(loaded.committedRevision()) << loaded.reason;
+  {
+    SceneStore seed(database.path());
+    ASSERT_TRUE(seed.open());
+    ASSERT_TRUE(seed.enqueueCommit(loaded.snapshot));
+    ASSERT_TRUE(seed.flush());
+    MapCheckpointManifest first;
+    first.backend = "nvblox";
+    first.checkpoint_path = "/tmp/roomie-v5-first.nvblox";
+    first.world_frame = "world";
+    first.config_fingerprint = "fnv1a64:v5-migration";
+    first.map_epoch = RunId{0x55U, 0x66U};
+    first.map_revision = 1;
+    first.integrated_through_ns = 100;
+    first.aligned_scene_revision = loaded.revision;
+    first.file_size_bytes = 100;
+    first.content_hash = "fnv1a64:first";
+    first.created_at_unix_ms = 1000;
+    ASSERT_TRUE(seed.publishMapCheckpoint(first));
+    MapCheckpointManifest second = first;
+    second.checkpoint_path = "/tmp/roomie-v5-second.nvblox";
+    second.map_revision = 2;
+    second.content_hash = "fnv1a64:second";
+    second.created_at_unix_ms = 2000;
+    ASSERT_TRUE(seed.publishMapCheckpoint(second));
+    ASSERT_TRUE(seed.closeGracefully());
+  }
+
+  sqliteExecute(
+      database.path(),
+      "PRAGMA foreign_keys = OFF; BEGIN IMMEDIATE; "
+      "DROP INDEX map_checkpoint_alignment_latest; "
+      "DROP TABLE map_checkpoint_alignments; "
+      "DELETE FROM schema_migrations WHERE version >= 6; "
+      "PRAGMA user_version = 5; COMMIT;");
+  SceneStore migrated(database.path());
+  ASSERT_TRUE(migrated.open());
+  EXPECT_EQ(migrated.schemaVersion(), SceneStore::kCurrentSchemaVersion);
+  EXPECT_EQ(sqliteScalar(
+                database.path(),
+                "SELECT COUNT(*) FROM map_checkpoint_alignments;"),
+            2);
+  const MapCheckpointLookupResult latest = migrated.latestMapCheckpoint();
+  ASSERT_TRUE(latest.status) << latest.status.error;
+  ASSERT_TRUE(latest.manifest);
+  EXPECT_EQ(latest.manifest->checkpoint_path,
+            "/tmp/roomie-v5-second.nvblox");
+  EXPECT_EQ(latest.manifest->aligned_scene_revision, loaded.revision);
 }
 
 TEST(SceneStore, RestoreIgnoresUnflushedSuffixAfterCrashStyleClose) {

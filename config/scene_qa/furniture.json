@@ -11,6 +11,10 @@
     {"label": "nightstand", "support_mode": "top", "can_contain": true},
     {"label": "drawer", "support_mode": "top", "can_contain": true}
   ],
+  "object_creation": {
+    "detection_window_frames": 30,
+    "min_same_class_detection_frames": 11
+  },
   "on": {
     "min_horizontal_overlap_ratio": 0.5,
     "max_gap_m": 0.12,

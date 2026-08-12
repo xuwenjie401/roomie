@@ -33,7 +33,9 @@ std::string instanceText(const InstanceRecord& instance,
                          bool show_object_id,
                          bool show_track_id) {
   std::ostringstream stream;
-  if (!instance.label.empty()) {
+  if (!instance.name.empty()) {
+    stream << instance.name;
+  } else if (!instance.label.empty()) {
     stream << instance.label;
   } else if (show_track_id && instance.track_id >= 0) {
     stream << "instance";

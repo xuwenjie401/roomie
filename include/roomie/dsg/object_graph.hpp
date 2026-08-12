@@ -151,6 +151,11 @@ struct InstanceTrack {
   float existence_log_odds = 0.0f;
   std::vector<TimeNanoseconds> positive_evidence_timestamps_ns;
   PositivePresenceEvidenceHistory positive_presence_evidence_history;
+  // Exact per-class detector frames retained for tentative furniture
+  // promotion. Keys are normalized furniture labels and each frame appears
+  // at most once per label.
+  std::map<std::string, std::vector<std::uint64_t>>
+      furniture_detection_frames_by_label;
   std::vector<TimeNanoseconds> negative_evidence_timestamps_ns;
   int positive_window_interruptions = 0;
   TimeNanoseconds last_presence_evidence_ns = 0;
@@ -292,6 +297,7 @@ struct ObjectNode {
 
   int object_id = -1;
   int semantic_id = -1;
+  std::string name;
   std::string label;
   std::string description;
   Eigen::Vector3f center_world = Eigen::Vector3f::Zero();
@@ -338,7 +344,7 @@ struct ObjectNode {
 };
 
 struct ObjectGraphSnapshot {
-  int schema_version = 5;
+  int schema_version = 6;
   int next_object_id = 0;
   std::vector<ObjectNode, Eigen::aligned_allocator<ObjectNode>> objects;
   std::vector<RoomNode, Eigen::aligned_allocator<RoomNode>> rooms;

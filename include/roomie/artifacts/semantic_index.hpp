@@ -50,6 +50,7 @@ struct SemanticMetadata {
 
 struct SemanticDocumentInput {
   SceneObjectId object_id = -1;
+  std::string name;
   std::string label;
   SemanticRetrievalFields retrieval;
   std::vector<std::string> human_tags;

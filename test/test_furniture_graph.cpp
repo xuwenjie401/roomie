@@ -1,15 +1,65 @@
 #include <gtest/gtest.h>
 
 #include <algorithm>
+#include <cstdio>
+#include <filesystem>
+#include <fstream>
 #include <memory>
 #include <optional>
+#include <stdexcept>
 #include <string>
 #include <vector>
+
+#include <unistd.h>
 
 #include "roomie/scene/furniture_graph.hpp"
 
 namespace roomie {
 namespace {
+
+class TemporaryFurnitureConfig {
+ public:
+  explicit TemporaryFurnitureConfig(const std::string& contents) {
+    char pattern[] = "/tmp/roomie_furniture_config_XXXXXX";
+    const int descriptor = mkstemp(pattern);
+    if (descriptor < 0) {
+      throw std::runtime_error("mkstemp failed");
+    }
+    close(descriptor);
+    path_ = pattern;
+    std::ofstream stream(path_);
+    stream << contents;
+    if (!stream) {
+      throw std::runtime_error("failed to write temporary furniture config");
+    }
+  }
+
+  ~TemporaryFurnitureConfig() { std::remove(path_.c_str()); }
+
+  const std::filesystem::path& path() const { return path_; }
+
+ private:
+  std::filesystem::path path_;
+};
+
+std::string minimalFurnitureConfig(const std::string& object_creation = {}) {
+  return std::string(R"({
+    "schema_version": "roomie.furniture.v1",
+    "classes": [
+      {"label": "desk", "support_mode": "top", "can_contain": false}
+    ],
+  )") + object_creation + R"(
+    "on": {
+      "min_horizontal_overlap_ratio": 0.5,
+      "max_gap_m": 0.12,
+      "max_penetration_m": 0.15
+    },
+    "in": {
+      "min_child_containment_ratio": 0.8,
+      "max_child_parent_volume_ratio": 0.8
+    }
+  })";
+}
 
 SceneObjectPtr makeFurnitureTestObject(
     int object_id, std::string label, const Eigen::Vector3f& center,
@@ -63,6 +113,31 @@ TEST(FurnitureGraph, NormalizesAndClassifiesExactConfiguredLabels) {
   EXPECT_EQ(roles.front().object_id, 1);
   EXPECT_EQ(roles.front().classification_label, "chair");
   EXPECT_EQ(roles.front().revision, 7U);
+}
+
+TEST(FurnitureGraph, LoadsObjectCreationThresholdsFromConfig) {
+  const FurnitureGraphConfig config = loadFurnitureGraphConfig(
+      std::filesystem::path(ROOMIE_SOURCE_DIR) / "config" / "scene_qa" /
+      "furniture.json");
+  EXPECT_EQ(config.object_creation_detection_window_frames, 30U);
+  EXPECT_EQ(config.object_creation_min_same_class_detection_frames, 11U);
+}
+
+TEST(FurnitureGraph, DefaultsObjectCreationThresholdsForLegacyConfig) {
+  const TemporaryFurnitureConfig file(minimalFurnitureConfig());
+  const FurnitureGraphConfig config = loadFurnitureGraphConfig(file.path());
+  EXPECT_EQ(config.object_creation_detection_window_frames, 30U);
+  EXPECT_EQ(config.object_creation_min_same_class_detection_frames, 11U);
+}
+
+TEST(FurnitureGraph, RejectsObjectCreationMinimumAboveWindow) {
+  const TemporaryFurnitureConfig file(minimalFurnitureConfig(R"(
+    "object_creation": {
+      "detection_window_frames": 30,
+      "min_same_class_detection_frames": 31
+    },
+  )"));
+  EXPECT_THROW(loadFurnitureGraphConfig(file.path()), std::invalid_argument);
 }
 
 TEST(FurnitureGraph, DerivesRoomAndSingleBestOnOrInParent) {

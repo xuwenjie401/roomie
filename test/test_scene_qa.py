@@ -7,6 +7,7 @@ import json
 import io
 import os
 from pathlib import Path
+import struct
 import sys
 import tempfile
 from types import SimpleNamespace
@@ -26,6 +27,7 @@ from scene_qa.embeddings import ObjectSearchIndex  # noqa: E402
 from scene_qa.gemini_agent import GeminiSceneQaAgent, sanitize_proxy_environment  # noqa: E402
 from scene_qa.graph_store import GraphStore  # noqa: E402
 from scene_qa.live_query import LiveSceneQueryClient, LiveSceneQueryError  # noqa: E402
+from scene_qa._ros_pointcloud_worker import sample_cloud  # noqa: E402
 from scene_qa.session_log import SceneQaSessionLog  # noqa: E402
 from scene_qa.tools import create_default_tool_registry, create_live_tool_registry  # noqa: E402
 import roomie_scene_qa  # noqa: E402
@@ -35,6 +37,8 @@ from roomie_scene_qa_viewer import (  # noqa: E402
     QaRuntime,
     highlight_groups_from_history,
     live_graph_payload,
+    read_live_graph,
+    read_live_object_details,
 )
 
 
@@ -972,6 +976,30 @@ class LiveSceneQaTests(unittest.TestCase):
         registry.end_answer()
         self.assertIsNone(self.client.session_id)
 
+    def test_viewer_reads_live_scene_before_any_qa_turn(self) -> None:
+        payload = read_live_graph(self.client, "/roomie/query_scene")
+
+        self.assertEqual(payload["scene_revision"], 77)
+        self.assertEqual(len(payload["objects"]), 1)
+        self.assertEqual(payload["objects"][0]["object_id"], 1)
+        self.assertEqual(payload["objects"][0]["center_world"], [1.0, 0.0, 0.5])
+        self.assertEqual(payload["objects"][0]["rooms"][0]["room_id"], "kitchen")
+        self.assertEqual(payload["objects"][0]["description"], "yellow bottle")
+        self.assertIsNone(self.client.session_id)
+        self.assertEqual(self.transport.requests[1]["calls"][0]["method"], "rooms")
+        self.assertEqual(self.transport.requests[2]["calls"][0]["method"], "get_object")
+
+    def test_viewer_reads_live_object_details_without_model_tools(self) -> None:
+        detail = read_live_object_details(self.client, 1)
+
+        self.assertEqual(detail["object"]["object_id"], 1)
+        self.assertEqual(detail["object"]["rooms"][0]["label"], "Kitchen")
+        self.assertEqual(detail["scene_revision"], 77)
+        self.assertEqual(detail["snapshots"], [])
+        methods = [call["method"] for call in self.transport.requests[1]["calls"]]
+        self.assertEqual(methods, ["get_object", "inspect_snapshot", "rooms"])
+        self.assertIsNone(self.client.session_id)
+
     def test_live_get_objects_related_combines_in_and_on_memberships(self) -> None:
         registry = create_live_tool_registry(self.client, self.config)
         registry.begin_answer()
@@ -1288,6 +1316,12 @@ class LiveSceneQaTests(unittest.TestCase):
         self.assertIn('data-provider="gemini"', roomie_scene_qa_viewer.HTML)
         self.assertIn('data-provider="doubao"', roomie_scene_qa_viewer.HTML)
         self.assertIn('id="resetBtn"', roomie_scene_qa_viewer.HTML)
+        self.assertIn('id="objectDetails"', roomie_scene_qa_viewer.HTML)
+        self.assertIn('id="refreshSceneBtn"', roomie_scene_qa_viewer.HTML)
+        self.assertIn("/object-details.json?id=", roomie_scene_qa_viewer.HTML)
+        self.assertNotIn("state.objects.slice(0, 25)", roomie_scene_qa_viewer.HTML)
+        self.assertIn("reference.bbox_xyxy", roomie_scene_qa_viewer.HTML)
+        self.assertIn("red box = object 2D bbox", roomie_scene_qa_viewer.HTML)
         self.assertIn("fetch('/reset'", roomie_scene_qa_viewer.HTML)
         self.assertIn("JSON.stringify({query, provider})", roomie_scene_qa_viewer.HTML)
         payload = live_graph_payload(args.service)
@@ -1301,6 +1335,41 @@ class LiveSceneQaTests(unittest.TestCase):
         ):
             offline_args = roomie_scene_qa_viewer.parse_args()
         self.assertEqual(offline_args.offline_json, Path("/tmp/scene.json"))
+
+    def test_live_point_cloud_worker_samples_xyz_and_rgb(self) -> None:
+        fields = [
+            SimpleNamespace(name="x", offset=0, datatype=7),
+            SimpleNamespace(name="y", offset=4, datatype=7),
+            SimpleNamespace(name="z", offset=8, datatype=7),
+            SimpleNamespace(name="rgb", offset=12, datatype=7),
+        ]
+        data = b"".join(
+            struct.pack("<fffI", x, y, z, rgb)
+            for x, y, z, rgb in [
+                (1.0, 2.0, 3.0, 0x00112233),
+                (4.0, 5.0, 6.0, 0x00A0B0C0),
+            ]
+        )
+        message = SimpleNamespace(
+            fields=fields,
+            width=2,
+            height=1,
+            is_bigendian=False,
+            point_step=16,
+            data=data,
+            header=SimpleNamespace(frame_id="map"),
+        )
+
+        sampled = sample_cloud(message, max_points=1)
+
+        self.assertTrue(sampled["ok"])
+        self.assertEqual(sampled["count"], 1)
+        self.assertEqual(sampled["source_count"], 2)
+        self.assertEqual(sampled["bounds"], {"min": [1.0, 2.0, 3.0], "max": [1.0, 2.0, 3.0]})
+        self.assertEqual(
+            __import__("base64").b64decode(sampled["colors_b64"]),
+            bytes((0x11, 0x22, 0x33)),
+        )
 
 
 if __name__ == "__main__":

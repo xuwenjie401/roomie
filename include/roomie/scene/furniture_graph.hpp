@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
 #include <filesystem>
 #include <map>
@@ -22,6 +23,8 @@ struct FurnitureClassRule {
 
 struct FurnitureGraphConfig {
   std::map<std::string, FurnitureClassRule> classes;
+  std::size_t object_creation_detection_window_frames = 30;
+  std::size_t object_creation_min_same_class_detection_frames = 11;
   float on_min_horizontal_overlap_ratio = 0.50f;
   float on_max_gap_m = 0.12f;
   float on_max_penetration_m = 0.15f;

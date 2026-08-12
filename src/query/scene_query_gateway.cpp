@@ -511,6 +511,7 @@ QueryObjectView SceneQueryGateway::objectView(
   view.object_id = canonical_object_id;
   view.resolved_alias = requested_object_id != canonical_object_id;
   view.semantic_id = effectiveSemanticId(object);
+  view.name = object.annotation ? object.annotation->name : std::string{};
   view.label = effectiveLabel(object);
   view.canonical_description = effectiveDescription(object);
   if (view.canonical_description && !view.canonical_description->empty()) {

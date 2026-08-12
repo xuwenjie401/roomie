@@ -70,6 +70,8 @@ def generate_launch_description() -> LaunchDescription:
     qa_port = LaunchConfiguration("qa_port")
     qa_browser = LaunchConfiguration("qa_browser")
     qa_default_provider = LaunchConfiguration("qa_default_provider")
+    qa_point_topic = LaunchConfiguration("qa_point_topic")
+    qa_live_max_points = LaunchConfiguration("qa_live_max_points")
 
     mapping = IncludeLaunchDescription(
         PythonLaunchDescriptionSource(str(mapping_launch)),
@@ -111,6 +113,10 @@ def generate_launch_description() -> LaunchDescription:
             qa_browser,
             "--default-provider",
             qa_default_provider,
+            "--point-topic",
+            qa_point_topic,
+            "--live-max-points",
+            qa_live_max_points,
         ],
         output="screen",
         emulate_tty=True,
@@ -193,6 +199,16 @@ def generate_launch_description() -> LaunchDescription:
                 "qa_default_provider",
                 default_value="gemini",
                 description="Initial browser provider: gemini or doubao.",
+            ),
+            DeclareLaunchArgument(
+                "qa_point_topic",
+                default_value="/roomie/map_surface",
+                description="PointCloud2 topic sampled on page load and refresh.",
+            ),
+            DeclareLaunchArgument(
+                "qa_live_max_points",
+                default_value="120000",
+                description="Maximum live map points transferred to the browser.",
             ),
             DeclareLaunchArgument(
                 "qa_browser",

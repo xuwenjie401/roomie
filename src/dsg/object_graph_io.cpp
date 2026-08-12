@@ -20,7 +20,7 @@
 namespace roomie {
 namespace {
 
-constexpr int kRoomieObjectGraphFormatVersion = 5;
+constexpr int kRoomieObjectGraphFormatVersion = 6;
 constexpr const char* kRoomieObjectGraphFormat = "roomie_object_graph";
 constexpr const char* kRoomieManualSceneGraphFormat = "roomie_manual_scene_graph";
 
@@ -403,6 +403,7 @@ json objectNodeToJson(const ObjectNode& object) {
   json value;
   value["object_id"] = object.object_id;
   value["semantic_id"] = object.semantic_id;
+  value["name"] = object.name;
   value["label"] = object.label;
   value["description"] = object.description;
   value["center_world"] = vector3fToJson(object.center_world);
@@ -460,6 +461,7 @@ ObjectNode objectNodeFromJson(const json& value) {
   ObjectNode object;
   object.object_id = value.value("object_id", -1);
   object.semantic_id = value.value("semantic_id", -1);
+  object.name = value.value("name", std::string());
   object.label = value.value("label", std::string());
   object.description = value.value("description", std::string());
   object.center_world = vector3fFromJson(value.value("center_world", json::array()));

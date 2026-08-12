@@ -432,6 +432,7 @@ struct InstanceRecord {
   int object_id = -1;
   int track_id = -1;
   int semantic_id = -1;
+  std::string name;
   std::string label;
   std::string description;
   Eigen::Vector3f center_world = Eigen::Vector3f::Zero();

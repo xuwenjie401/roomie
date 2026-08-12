@@ -160,6 +160,9 @@ struct SemanticComponent {
 
 struct AnnotationComponent {
   std::uint64_t revision = 0;
+  // Human-assigned instance name. Detector backends never populate this
+  // field; an empty string means that no name has been assigned.
+  std::string name;
   std::optional<int> semantic_id_override;
   std::optional<std::string> label_override;
   std::optional<std::string> description_override;

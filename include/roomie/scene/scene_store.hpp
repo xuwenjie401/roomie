@@ -135,7 +135,7 @@ struct ArtifactOriginListResult {
 // only the in-memory suffix, which makes crash semantics deterministic.
 class SceneStore {
  public:
-  static constexpr int kCurrentSchemaVersion = 5;
+  static constexpr int kCurrentSchemaVersion = 6;
   static constexpr std::size_t kDefaultMaxPendingCommits = 64;
   // A durable revision log contains one complete recovery checkpoint at this
   // cadence. Revisions between checkpoints are compact, hash-checked deltas,
@@ -161,6 +161,10 @@ class SceneStore {
       std::vector<DurableTaskSpec> outbox_tasks = {},
       std::vector<DurableArtifactOrigin> artifact_origins = {});
   SceneStoreStatus flush();
+  // Atomically persists the queued semantic revisions and records that the
+  // latest immutable map checkpoint is still valid for the resulting scene
+  // revision. Intended for offline, map-invariant human edits.
+  SceneStoreStatus flushWithMapCheckpointAlignment();
   SceneStoreStatus gracefulFlush();
   SceneStoreStatus closeGracefully();
 

@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import base64
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 import mimetypes
@@ -15,11 +16,14 @@ from typing import Any
 import urllib.parse
 import webbrowser
 
+import numpy as np
+
 SCRIPT_DIR = Path(__file__).resolve().parent
 if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 
 from roomie_dsg_viewer import (  # noqa: E402
+    PointCloud,
     as_path,
     empty_point_cloud,
     find_auto_point_cloud,
@@ -37,7 +41,11 @@ from scene_qa.gemini_agent import (  # noqa: E402
     SceneQaCancelledError,
 )
 from scene_qa.graph_store import GraphStore  # noqa: E402
-from scene_qa.live_query import LiveSceneQueryClient, RosQuerySceneTransport  # noqa: E402
+from scene_qa.live_query import (  # noqa: E402
+    LiveSceneQueryClient,
+    RosPointCloudSampler,
+    RosQuerySceneTransport,
+)
 from scene_qa.session_log import (  # noqa: E402
     SceneQaSessionLog,
     default_scene_qa_log_dir,
@@ -159,6 +167,23 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--points", type=Path, default=None, help="RGB point cloud: .nvblox, .ply, .pcd, .npy, .npz, or JSON")
     parser.add_argument("--no-points", action="store_true", help="disable point cloud loading")
     parser.add_argument("--max-points", type=int, default=700000, help="point cloud downsample limit")
+    parser.add_argument(
+        "--live-max-points",
+        type=int,
+        default=120000,
+        help="maximum sampled live map points sent to the browser",
+    )
+    parser.add_argument(
+        "--point-topic",
+        default="/roomie/map_surface",
+        help="live PointCloud2 topic sampled for browser context",
+    )
+    parser.add_argument(
+        "--point-timeout-sec",
+        type=float,
+        default=2.5,
+        help="maximum wait for one live point cloud sample",
+    )
     parser.add_argument("--surface-threshold-m", type=float, default=0.0, help="nvblox surface distance threshold; 0 uses 1.5 voxels")
     parser.add_argument("--min-tsdf-weight", type=float, default=1.0e-4, help="nvblox TSDF weight gate")
     parser.add_argument("--point-size", type=float, default=2.5, help="initial WebGL point size")
@@ -241,7 +266,7 @@ def graph_payload(graph: GraphStore) -> dict[str, Any]:
 
 
 def live_graph_payload(service_name: str) -> dict[str, Any]:
-    """Return an empty graph shell that the browser enriches from live tool results."""
+    """Return the live graph shell used when a read is temporarily unavailable."""
 
     return {
         "format": "roomie_live_query",
@@ -253,6 +278,167 @@ def live_graph_payload(service_name: str) -> dict[str, Any]:
         "live": True,
         "service": service_name,
     }
+
+
+def _normalize_live_object(value: Any) -> dict[str, Any]:
+    data = dict(value) if isinstance(value, dict) else {}
+    data["name"] = str(data.get("name") or "")
+    geometry = data.get("geometry")
+    if isinstance(geometry, dict):
+        for key in ("center_world", "size_m", "yaw_rad"):
+            if key in geometry:
+                data.setdefault(key, geometry[key])
+    data["description"] = (
+        data.get("canonical_description")
+        or data.get("description")
+        or data.get("display_description")
+        or data.get("label")
+        or ""
+    )
+    return data
+
+
+def read_live_graph(
+    client: LiveSceneQueryClient,
+    service_name: str,
+) -> dict[str, Any]:
+    """Read all query-visible objects before any model question is asked."""
+
+    try:
+        session = client.begin_answer()
+        room_values = client.call("rooms", {}) or []
+        rooms: list[dict[str, Any]] = []
+        object_ids: set[int] = set()
+        for value in room_values:
+            if not isinstance(value, dict):
+                continue
+            room = dict(value)
+            room["label"] = room.get("name") or room.get("label") or room.get("room_id")
+            rooms.append(room)
+            for candidate in list(room.get("object_ids") or []) + list(
+                room.get("furniture_ids") or []
+            ):
+                try:
+                    object_ids.add(int(candidate))
+                except (TypeError, ValueError):
+                    continue
+
+        values: list[Any] = []
+        sorted_ids = sorted(object_ids)
+        for offset in range(0, len(sorted_ids), 128):
+            values.extend(
+                client.call_many(
+                    [
+                        {"method": "get_object", "params": {"object_id": object_id}}
+                        for object_id in sorted_ids[offset : offset + 128]
+                    ]
+                )
+            )
+        objects_by_id: dict[int, dict[str, Any]] = {}
+        for value in values:
+            obj = _normalize_live_object(value)
+            try:
+                object_id = int(obj["object_id"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            if obj.get("publishable") is False:
+                continue
+            obj["object_id"] = object_id
+            objects_by_id[object_id] = obj
+        for room in rooms:
+            membership = {
+                "room_id": room.get("room_id"),
+                "label": room.get("label"),
+            }
+            for candidate in room.get("object_ids") or []:
+                try:
+                    obj = objects_by_id.get(int(candidate))
+                except (TypeError, ValueError):
+                    obj = None
+                if obj is not None:
+                    obj.setdefault("rooms", []).append(membership)
+
+        payload = live_graph_payload(service_name)
+        payload.update(
+            {
+                "objects": [objects_by_id[key] for key in sorted(objects_by_id)],
+                "rooms": rooms,
+                "scene_revision": session.get("scene_revision"),
+                "durable_scene_revision": session.get("durable_scene_revision"),
+            }
+        )
+        return payload
+    finally:
+        client.end_answer()
+
+
+def read_live_object_details(
+    client: LiveSceneQueryClient,
+    object_id: int,
+) -> dict[str, Any]:
+    """Read one object's metadata, room membership, and snapshot references."""
+
+    try:
+        session = client.begin_answer()
+        object_value, inspection, rooms = client.call_many(
+            [
+                {"method": "get_object", "params": {"object_id": int(object_id)}},
+                {"method": "inspect_snapshot", "params": {"object_id": int(object_id)}},
+                {"method": "rooms", "params": {}},
+            ]
+        )
+        obj = _normalize_live_object(object_value)
+        memberships = []
+        for room in rooms or []:
+            if not isinstance(room, dict):
+                continue
+            member_ids = set()
+            for candidate in room.get("object_ids") or []:
+                try:
+                    member_ids.add(int(candidate))
+                except (TypeError, ValueError):
+                    continue
+            if object_id not in member_ids:
+                continue
+            memberships.append(
+                {
+                    "room_id": room.get("room_id"),
+                    "label": room.get("name") or room.get("room_id"),
+                }
+            )
+        obj["rooms"] = memberships
+        detail = dict(inspection) if isinstance(inspection, dict) else {}
+        detail["object"] = obj
+        detail["scene_revision"] = session.get("scene_revision")
+        return detail
+    finally:
+        client.end_answer()
+
+
+def live_snapshot_path(detail: dict[str, Any]) -> Path | None:
+    for snapshot in detail.get("snapshots") or []:
+        if not isinstance(snapshot, dict) or not snapshot.get("available"):
+            continue
+        asset = snapshot.get("physical_asset") or snapshot.get("asset")
+        if not isinstance(asset, dict):
+            continue
+        source_path = asset.get("source_path")
+        if isinstance(source_path, str) and source_path:
+            path = Path(source_path).expanduser()
+        else:
+            uri = asset.get("uri")
+            if not isinstance(uri, str) or not uri:
+                continue
+            parsed = urllib.parse.urlparse(uri)
+            if parsed.scheme == "file":
+                path = Path(urllib.parse.unquote(parsed.path))
+            elif not parsed.scheme:
+                path = Path(uri).expanduser()
+            else:
+                continue
+        if path.exists() and path.is_file():
+            return path.resolve()
+    return None
 
 
 class ProgressLog:
@@ -572,8 +758,58 @@ HTML = r"""<!doctype html>
     }
     .trace-panel {
       display: grid;
-      grid-template-rows: auto auto minmax(0, 1fr);
+      grid-template-rows: auto minmax(210px, .9fr) auto auto minmax(0, 1.1fr);
       height: 100%;
+    }
+    .object-details {
+      min-height: 0;
+      overflow: auto;
+      padding: 12px;
+      border-bottom: 1px solid var(--line);
+      background: #fbfcfa;
+    }
+    .detail-title {
+      display: flex;
+      align-items: baseline;
+      justify-content: space-between;
+      gap: 10px;
+      margin-bottom: 10px;
+    }
+    .detail-title strong { font-size: 17px; }
+    .detail-id { color: var(--accent); font-size: 12px; font-weight: 700; }
+    .detail-description {
+      margin-bottom: 11px;
+      color: #35443f;
+      font-size: 13px;
+      line-height: 1.45;
+      white-space: pre-wrap;
+    }
+    .detail-grid {
+      display: grid;
+      grid-template-columns: 92px minmax(0, 1fr);
+      gap: 6px 10px;
+      margin-bottom: 12px;
+      font-size: 12px;
+      line-height: 1.35;
+    }
+    .detail-key { color: var(--muted); }
+    .detail-value { overflow-wrap: anywhere; }
+    .detail-snapshot {
+      overflow: hidden;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: #e9ede7;
+    }
+    .detail-snapshot svg {
+      display: block;
+      width: 100%;
+      max-height: 320px;
+      background: #e9ede7;
+    }
+    .detail-error { color: var(--warn); font-size: 12px; line-height: 1.4; }
+    .trace-heading {
+      padding: 10px 12px 8px;
+      border-bottom: 1px solid var(--line);
     }
     .trace-list {
       overflow: auto;
@@ -757,6 +993,12 @@ HTML = r"""<!doctype html>
     .scene-controls input[type="range"] {
       width: 72px;
     }
+    .scene-controls button {
+      height: 26px;
+      padding: 0 8px;
+      color: var(--accent);
+      font-size: 12px;
+    }
     .object-pill {
       padding: 6px 9px;
       border-radius: 7px;
@@ -838,7 +1080,7 @@ HTML = r"""<!doctype html>
           <div class="text" id="answerText">No question asked yet.</div>
           <div class="reasoning" id="reasoningText"></div>
         </div>
-        <h3>Highlighted Objects</h3>
+        <h3>Scene Objects</h3>
         <div id="highlightSummary" class="meta">Tool results will appear here.</div>
         <div class="object-list" id="objectList"></div>
       </div>
@@ -847,17 +1089,23 @@ HTML = r"""<!doctype html>
       <canvas id="view"></canvas>
       <div class="object-bar"><div class="object-pill" id="selectedInfo">No object selected</div></div>
       <div class="scene-controls">
-        <label><input type="checkbox" id="showPoints" checked> Points</label>
+        <label id="pointsControl"><input type="checkbox" id="showPoints" checked> Map sample</label>
         <label><input type="checkbox" id="showRooms" checked> Rooms</label>
-        <label>Size <input type="range" id="pointSize" min="1" max="7" step="0.5"></label>
+        <label id="pointSizeControl">Size <input type="range" id="pointSize" min="1" max="7" step="0.5"></label>
+        <button id="refreshSceneBtn" type="button">Refresh</button>
       </div>
       <div class="hud" id="hud"></div>
     </main>
     <aside class="trace-panel">
       <header>
-        <h2>Tool Trace</h2>
-        <div class="meta">Visible model text, local tool calls, and object results. Hidden model chain-of-thought is not exposed.</div>
+        <h2>Object Details</h2>
+        <div class="meta">Select any 3D box or object row. Details remain available before QA and after Reset QA.</div>
       </header>
+      <div class="object-details" id="objectDetails"><div class="empty">Select an object to inspect it.</div></div>
+      <div class="trace-heading">
+        <h2>Tool Trace</h2>
+        <div class="meta">Visible model text, tool calls, and object results.</div>
+      </div>
       <div class="progress-list" id="progressList"></div>
       <div class="trace-list" id="traceList"></div>
     </aside>
@@ -877,6 +1125,8 @@ HTML = r"""<!doctype html>
       pollTimer: null,
       asking: false,
       askController: null,
+      selectionRequest: 0,
+      sceneRetryTimer: null,
       provider: 'gemini',
       yaw: 2.45,
       pitch: 0.72,
@@ -914,16 +1164,23 @@ HTML = r"""<!doctype html>
     const traceList = document.getElementById('traceList');
     const progressList = document.getElementById('progressList');
     const providerStatus = document.getElementById('providerStatus');
+    const objectDetails = document.getElementById('objectDetails');
     const providerButtons = Array.from(document.querySelectorAll('[data-provider]'));
     const showPoints = document.getElementById('showPoints');
     const showRooms = document.getElementById('showRooms');
     const pointSize = document.getElementById('pointSize');
+    const pointsControl = document.getElementById('pointsControl');
+    const pointSizeControl = document.getElementById('pointSizeControl');
+    const refreshSceneBtn = document.getElementById('refreshSceneBtn');
     pointSize.value = String(DEFAULT_POINT_SIZE);
 
     function escapeHtml(text) {
       return String(text ?? '').replace(/[&<>"']/g, ch => ({
         '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
       }[ch]));
+    }
+    function objectTitle(object) {
+      return object?.name || object?.label || 'object';
     }
     function providerInfo(name) {
       return state.graph?.qa?.providers?.[name] || null;
@@ -1247,22 +1504,39 @@ HTML = r"""<!doctype html>
       updateSelectedInfo();
     }
     async function loadPointCloud() {
-      const metaResponse = await fetch('/points-meta.json');
+      const metaResponse = await fetch(`/points-meta.json?t=${Date.now()}`);
       const meta = await metaResponse.json();
       state.pointCount = meta.count || 0;
       state.pointSource = meta.source || '';
       state.pointBounds = meta.bounds || null;
-      if (!state.pointCount) return;
+      state.pointBuffersReady = false;
+      if (!state.pointCount) {
+        showPoints.checked = false;
+        showPoints.disabled = true;
+        pointSize.disabled = true;
+        pointsControl.title = meta.error || meta.message || 'No point cloud is available.';
+        pointSizeControl.style.display = 'none';
+        return meta;
+      }
+      showPoints.disabled = false;
+      showPoints.checked = true;
+      pointSize.disabled = false;
+      pointSizeControl.style.display = '';
+      pointsControl.title = meta.source || '';
       const [pointData, colorData] = await Promise.all([
-        fetch('/points.bin').then(r => r.arrayBuffer()),
-        fetch('/colors.bin').then(r => r.arrayBuffer())
+        fetch(`/points.bin?t=${Date.now()}`).then(r => r.arrayBuffer()),
+        fetch(`/colors.bin?t=${Date.now()}`).then(r => r.arrayBuffer())
       ]);
+      if (pointData.byteLength !== state.pointCount * 12 || colorData.byteLength !== state.pointCount * 3) {
+        throw new Error('Point cloud buffers do not match metadata.');
+      }
       const gl = state.gl;
       gl.bindBuffer(gl.ARRAY_BUFFER, state.pointPositionBuffer);
       gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(pointData), gl.STATIC_DRAW);
       gl.bindBuffer(gl.ARRAY_BUFFER, state.pointColorBuffer);
       gl.bufferData(gl.ARRAY_BUFFER, new Uint8Array(colorData), gl.STATIC_DRAW);
       state.pointBuffersReady = true;
+      return meta;
     }
     function computeBounds() {
       let min = [Infinity, Infinity, Infinity], max = [-Infinity, -Infinity, -Infinity];
@@ -1304,14 +1578,103 @@ HTML = r"""<!doctype html>
       renderTraceGroups();
       render();
     }
-    function selectObject(id) {
-      state.selectedId = Number(id);
+    function detailRow(key, value) {
+      if (value === null || value === undefined || value === '') return '';
+      return `<div class="detail-key">${escapeHtml(key)}</div><div class="detail-value">${escapeHtml(value)}</div>`;
+    }
+    function renderObjectDetails(detail, error = '') {
+      const object = detail?.object;
+      if (!object) {
+        objectDetails.innerHTML = `<div class="empty">Select an object to inspect it.</div>`;
+        return;
+      }
+      const geometry = object.geometry && typeof object.geometry === 'object' ? object.geometry : {};
+      const center = object.center_world || geometry.center_world;
+      const size = object.size_m || geometry.size_m;
+      const yaw = object.yaw_rad ?? geometry.yaw_rad;
+      const description = object.canonical_description || object.description || object.display_description || 'No description available.';
+      const probability = Number.isFinite(Number(object.existence_probability))
+        ? `${fmt(Number(object.existence_probability) * 100, 1)}%` : '';
+      const freshness = object.freshness && typeof object.freshness === 'object'
+        ? Object.entries(object.freshness).filter(([, value]) => typeof value !== 'object').map(([key, value]) => `${key}: ${value}`).join(' · ')
+        : '';
+      const role = object.furniture_role?.classification_label || '';
+      const snapshot = (detail.snapshots || []).find(item => item?.available) || (detail.snapshots || [])[0];
+      const reference = snapshot?.reference || object.snapshot || {};
+      const asset = snapshot?.physical_asset || snapshot?.asset || {};
+      const snapshotMeta = reference.image_index !== undefined
+        ? `image ${reference.image_index}${reference.camera_id ? ` · ${reference.camera_id}` : ''}${Number.isFinite(Number(reference.quality)) ? ` · quality ${fmt(reference.quality, 2)}` : ''}`
+        : '';
+      const snapshotWidth = Math.max(1, Number(asset.width) || 1);
+      const snapshotHeight = Math.max(1, Number(asset.height) || 1);
+      let snapshotBox = '';
+      if (Array.isArray(reference.bbox_xyxy) && reference.bbox_xyxy.length >= 4) {
+        const x0 = Math.max(0, Math.min(snapshotWidth, Math.min(Number(reference.bbox_xyxy[0]) || 0, Number(reference.bbox_xyxy[2]) || 0)));
+        const x1 = Math.max(0, Math.min(snapshotWidth, Math.max(Number(reference.bbox_xyxy[0]) || 0, Number(reference.bbox_xyxy[2]) || 0)));
+        const y0 = Math.max(0, Math.min(snapshotHeight, Math.min(Number(reference.bbox_xyxy[1]) || 0, Number(reference.bbox_xyxy[3]) || 0)));
+        const y1 = Math.max(0, Math.min(snapshotHeight, Math.max(Number(reference.bbox_xyxy[1]) || 0, Number(reference.bbox_xyxy[3]) || 0)));
+        if (x1 > x0 && y1 > y0) {
+          snapshotBox = `<rect x="${x0}" y="${y0}" width="${x1 - x0}" height="${y1 - y0}" fill="none" stroke="#e45756" stroke-width="3" vector-effect="non-scaling-stroke"></rect>`;
+        }
+      }
+      const snapshotHtml = detail.snapshot_url
+        ? `<div class="evidence-title">Full snapshot${snapshotBox ? ' · red box = object 2D bbox' : ''}${snapshotMeta ? ` · ${escapeHtml(snapshotMeta)}` : ''}</div>
+           <div class="detail-snapshot">
+             <svg viewBox="0 0 ${snapshotWidth} ${snapshotHeight}" role="img" aria-label="Snapshot of ${escapeHtml(objectTitle(object))}">
+               <image href="${escapeHtml(detail.snapshot_url)}?t=${Date.now()}" x="0" y="0" width="${snapshotWidth}" height="${snapshotHeight}"></image>
+               ${snapshotBox}
+             </svg>
+           </div>`
+        : `<div class="meta">No snapshot is available for this object.</div>`;
+      objectDetails.innerHTML = `
+        <div class="detail-title"><strong>${escapeHtml(objectTitle(object))}</strong><span class="detail-id">#${escapeHtml(object.object_id)}</span></div>
+        <div class="detail-description">${escapeHtml(description)}</div>
+        <div class="detail-grid">
+          ${detailRow('Name', object.name || '')}
+          ${detailRow('Label', object.label || '')}
+          ${detailRow('Room', roomText(object) || 'Unassigned')}
+          ${detailRow('Center (m)', Array.isArray(center) ? vec3(center).map(value => fmt(value)).join(', ') : '')}
+          ${detailRow('Size (m)', Array.isArray(size) ? vec3(size).map(value => fmt(value)).join(' × ') : '')}
+          ${detailRow('Yaw (rad)', fmt(yaw))}
+          ${detailRow('Presence', object.presence_state || (object.active === true ? 'active' : object.active === false ? 'inactive' : ''))}
+          ${detailRow('Existence', probability)}
+          ${detailRow('Furniture role', role)}
+          ${detailRow('Freshness', freshness)}
+          ${detailRow('Scene revision', detail.scene_revision)}
+        </div>
+        ${snapshotHtml}
+        ${error ? `<div class="detail-error">${escapeHtml(error)}</div>` : ''}`;
+    }
+    async function selectObject(id) {
+      const numericId = Number(id);
+      const object = state.objects.find(candidate => Number(candidate.object_id) === numericId);
+      if (!object) return;
+      state.selectedId = numericId;
       renderObjectList();
+      renderObjectDetails({object});
       render();
+      const request = ++state.selectionRequest;
+      try {
+        const response = await fetch(`/object-details.json?id=${encodeURIComponent(String(numericId))}`);
+        const detail = await response.json();
+        if (!response.ok) throw new Error(detail.error || response.statusText);
+        if (request !== state.selectionRequest || state.selectedId !== numericId) return;
+        const merged = {...object, ...(detail.object || {})};
+        const index = state.objects.findIndex(candidate => Number(candidate.object_id) === numericId);
+        if (index >= 0) state.objects[index] = merged;
+        detail.object = merged;
+        renderObjectDetails(detail);
+        renderObjectList();
+        render();
+      } catch (error) {
+        if (request === state.selectionRequest && state.selectedId === numericId) {
+          renderObjectDetails({object}, `Could not refresh live details: ${error}`);
+        }
+      }
     }
     function objectLabel(id) {
       const object = state.objects.find(o => o.object_id === Number(id));
-      return object ? `${object.label || 'object'} #${object.object_id}` : `#${id}`;
+      return object ? `${objectTitle(object)} #${object.object_id}` : `#${id}`;
     }
     function roomText(object) {
       return (object.rooms || []).map(r => r.label).join(', ');
@@ -1319,12 +1682,12 @@ HTML = r"""<!doctype html>
     function updateSelectedInfo() {
       const object = state.objects.find(o => o.object_id === state.selectedId);
       document.getElementById('selectedInfo').textContent = object
-        ? `#${object.object_id} ${object.label || 'object'} | ${roomText(object)} | ${vec3(object.center_world).map(v => fmt(v)).join(', ')}`
+        ? `#${object.object_id} ${objectTitle(object)} | ${roomText(object)} | ${vec3(object.center_world).map(v => fmt(v)).join(', ')}`
         : 'No object selected';
     }
     function renderObjectList() {
       const highlighted = state.objects.filter(o => state.highlightedIds.has(o.object_id));
-      const rows = (highlighted.length ? highlighted : state.objects.slice(0, 25)).map(object => {
+      const rows = state.objects.map(object => {
         const cls = [
           'object-row',
           state.highlightedIds.has(object.object_id) ? 'highlighted' : '',
@@ -1332,7 +1695,7 @@ HTML = r"""<!doctype html>
         ].filter(Boolean).join(' ');
         return `<button class="${cls}" data-id="${object.object_id}">
           <span class="id">#${object.object_id}</span>
-          <span class="name">${escapeHtml(object.label || 'object')}</span>
+          <span class="name">${escapeHtml(objectTitle(object))}</span>
           <span class="room">${escapeHtml(roomText(object))}</span>
         </button>`;
       }).join('');
@@ -1340,7 +1703,7 @@ HTML = r"""<!doctype html>
       objectList.querySelectorAll('button[data-id]').forEach(btn => btn.addEventListener('click', () => selectObject(btn.dataset.id)));
       document.getElementById('highlightSummary').textContent = highlighted.length
         ? `${highlighted.length} objects are highlighted from tool results.`
-        : 'No highlighted tool objects yet.';
+        : `${state.objects.length} scene objects. Click a box or row for details.`;
     }
     function responseObjectsFromCall(call) {
       const objects = [];
@@ -1451,7 +1814,7 @@ HTML = r"""<!doctype html>
           <img src="${uri}" alt="">
           ${box}
         </div>
-        <div class="snapshot-caption">#${Number(object.object_id)} ${escapeHtml(object.label || 'object')} | image ${Number(ref.image_index)}</div>
+        <div class="snapshot-caption">#${Number(object.object_id)} ${escapeHtml(objectTitle(object))} | image ${Number(ref.image_index)}</div>
       </div>`;
     }
     function descriptionEvidenceFromCall(call) {
@@ -1527,10 +1890,10 @@ HTML = r"""<!doctype html>
           const chips = (group?.object_ids || []).map(id => `<button class="chip" data-id="${id}">${escapeHtml(objectLabel(id))}</button>`).join('');
           const objectSummary = objects.slice(0, 8).map(obj => {
             const score = Number.isFinite(Number(obj.semantic_score)) ? ` score ${fmt(obj.semantic_score, 3)}` : '';
-            return `#${obj.object_id} ${obj.label || ''}${score}`;
+            return `#${obj.object_id} ${objectTitle(obj)}${score}`;
           }).join('\n');
           const descriptions = descriptionEvidenceFromCall(call);
-          const descriptionHtml = descriptions.map(obj => `<div class="description-item"><strong>#${Number(obj.object_id)} ${escapeHtml(obj.label || 'object')}</strong><br>${escapeHtml(obj.description)}</div>`).join('');
+          const descriptionHtml = descriptions.map(obj => `<div class="description-item"><strong>#${Number(obj.object_id)} ${escapeHtml(objectTitle(obj))}</strong><br>${escapeHtml(obj.description)}</div>`).join('');
           const snapshots = snapshotEvidenceFromCall(call);
           const snapshotHtml = snapshots.map(snapshotThumbHtml).join('');
           html += `<div class="tool-card" data-tool="${escapeHtml(call.name)}">
@@ -1670,24 +2033,62 @@ HTML = r"""<!doctype html>
     showPoints.addEventListener('change', render);
     showRooms.addEventListener('change', render);
     pointSize.addEventListener('input', render);
+    refreshSceneBtn.addEventListener('click', () => refreshScene(false));
     window.addEventListener('resize', render);
-    async function loadGraph() {
-      initGl();
-      const [response] = await Promise.all([fetch('/graph.json'), loadPointCloud()]);
-      state.graph = await response.json();
+    async function refreshScene(initial = false) {
+      refreshSceneBtn.disabled = true;
+      refreshSceneBtn.textContent = 'Refreshing…';
+      let pointError = '';
+      try {
+        const [response] = await Promise.all([
+          fetch(`/graph.json?t=${Date.now()}`),
+          loadPointCloud().catch(error => {
+            pointError = String(error);
+            state.pointCount = 0;
+            state.pointBuffersReady = false;
+            showPoints.checked = false;
+            showPoints.disabled = true;
+            pointSizeControl.style.display = 'none';
+          })
+        ]);
+        const graph = await response.json();
+        if (!response.ok) throw new Error(graph.error || response.statusText);
+        state.graph = graph;
+      } finally {
+        refreshSceneBtn.disabled = false;
+        refreshSceneBtn.textContent = 'Refresh';
+      }
       state.provider = state.graph?.qa?.default_provider || state.provider;
       state.objects = (state.graph.objects || []).slice().sort((a, b) => Number(a.object_id) - Number(b.object_id));
       state.rooms = (state.graph.rooms || []).slice().sort((a, b) => Number(a.room_id) - Number(b.room_id));
-      state.selectedId = state.objects.length ? state.objects[0].object_id : null;
+      if (!state.objects.some(object => Number(object.object_id) === Number(state.selectedId))) {
+        state.selectedId = state.objects.length ? Number(state.objects[0].object_id) : null;
+      }
       computeBounds();
       uploadRoomBoxes();
       document.getElementById('graphMeta').textContent = state.graph.live
-        ? `LIVE ${state.graph.service} | waiting for the first question`
+        ? state.graph.load_error
+          ? `LIVE ${state.graph.service} | scene unavailable: ${state.graph.load_error}`
+          : `LIVE ${state.graph.service} | revision ${state.graph.scene_revision ?? '?'} | ${state.objects.length} objects`
         : `${state.objects.length} objects | ${(state.graph.rooms || []).length} rooms | ${state.graph.world_frame || 'world'}`;
+      if (pointError) pointsControl.title = pointError;
       updateProviderControls();
       renderObjectList();
       renderTraceGroups();
       render();
+      if (state.selectedId !== null) selectObject(state.selectedId);
+      else renderObjectDetails(null);
+      if (state.sceneRetryTimer !== null) {
+        window.clearTimeout(state.sceneRetryTimer);
+        state.sceneRetryTimer = null;
+      }
+      if (state.graph.load_error) {
+        state.sceneRetryTimer = window.setTimeout(() => refreshScene(false), 2500);
+      }
+    }
+    async function loadGraph() {
+      initGl();
+      await refreshScene(true);
     }
     loadGraph().catch(error => {
       document.getElementById('graphMeta').textContent = String(error);
@@ -1707,10 +2108,10 @@ class Handler(BaseHTTPRequestHandler):
             self._send_bytes(body.encode("utf-8"), "text/html; charset=utf-8")
             return
         if parsed.path == "/graph.json":
-            self._send_bytes(server.graph_json, "application/json; charset=utf-8")
+            self._send_json(server.read_graph())  # type: ignore[attr-defined]
             return
         if parsed.path == "/points-meta.json":
-            self._send_bytes(server.points_meta_json, "application/json; charset=utf-8")  # type: ignore[attr-defined]
+            self._send_json(server.refresh_points())  # type: ignore[attr-defined]
             return
         if parsed.path == "/points.bin":
             self._send_bytes(server.points_bytes, "application/octet-stream")  # type: ignore[attr-defined]
@@ -1727,6 +2128,34 @@ class Handler(BaseHTTPRequestHandler):
             except ValueError:
                 after = 0
             self._send_json(server.progress_log.snapshot(after))  # type: ignore[attr-defined]
+            return
+        if parsed.path == "/object-details.json":
+            query_params = urllib.parse.parse_qs(parsed.query)
+            try:
+                object_id = int((query_params.get("id") or [""])[0])
+                self._send_json(server.read_object_details(object_id))  # type: ignore[attr-defined]
+            except ValueError:
+                self._send_json({"error": "id must be an integer"}, status=400)
+            except KeyError:
+                self._send_json({"error": "object not found"}, status=404)
+            except Exception as exc:
+                self._send_json(
+                    {"error": f"{type(exc).__name__}: {exc}"}, status=500
+                )
+            return
+        if parsed.path.startswith("/object-snapshot/"):
+            token = urllib.parse.unquote(parsed.path[len("/object-snapshot/"):])
+            try:
+                object_id = int(token)
+            except ValueError:
+                self.send_error(404, "not found")
+                return
+            image_path = server.live_snapshot_path(object_id)  # type: ignore[attr-defined]
+            if image_path is None or not image_path.exists() or not image_path.is_file():
+                self.send_error(404, "not found")
+                return
+            content_type = mimetypes.guess_type(image_path.name)[0] or "application/octet-stream"
+            self._send_bytes(image_path.read_bytes(), content_type)
             return
         if parsed.path.startswith("/snapshot-image/"):
             token = urllib.parse.unquote(parsed.path[len("/snapshot-image/"):])
@@ -1992,6 +2421,7 @@ def main() -> int:
         return 2
 
     live_transport: RosQuerySceneTransport | None = None
+    point_sampler: RosPointCloudSampler | None = None
     live_transport_lock = threading.Lock()
     if not offline:
         try:
@@ -2007,6 +2437,18 @@ def main() -> int:
                 file=sys.stderr,
             )
             return 2
+        if not args.no_points:
+            try:
+                point_sampler = RosPointCloudSampler(
+                    topic=args.point_topic,
+                    timeout_sec=args.point_timeout_sec,
+                )
+            except Exception as exc:
+                print(
+                    "Live point cloud sampling unavailable: "
+                    f"{type(exc).__name__}: {exc}",
+                    file=sys.stderr,
+                )
 
     def call_live_scene(payload: dict[str, Any]) -> dict[str, Any]:
         if live_transport is None:
@@ -2072,6 +2514,8 @@ def main() -> int:
 
     initial_runtime = build_runtime(1)
     if not initial_runtime.agents:
+        if point_sampler is not None:
+            point_sampler.close()
         if live_transport is not None:
             live_transport.close()
         scene_qa_log.close()
@@ -2131,7 +2575,126 @@ def main() -> int:
                 )
                 return new_runtime
 
-        server.graph_json = json.dumps(graph_data, ensure_ascii=False, separators=(",", ":")).encode("utf-8")  # type: ignore[attr-defined]
+        live_snapshot_paths: dict[int, Path] = {}
+        live_snapshot_lock = threading.Lock()
+        point_cloud_lock = threading.Lock()
+
+        def read_graph() -> dict[str, Any]:
+            if offline:
+                return graph_data
+            try:
+                client = LiveSceneQueryClient(
+                    call_live_scene,
+                    session_ttl_ms=LIVE_READ_SESSION_TTL_MS,
+                )
+                payload = read_live_graph(client, args.service)
+            except Exception as exc:
+                payload = live_graph_payload(args.service)
+                payload["load_error"] = f"{type(exc).__name__}: {exc}"
+            runtime = current_runtime()
+            payload["qa"] = {
+                "default_provider": default_provider,
+                "providers": runtime.provider_status,
+            }
+            return payload
+
+        def read_object_details(object_id: int) -> dict[str, Any]:
+            if offline:
+                obj = next(
+                    (
+                        value
+                        for value in graph_data.get("objects", [])
+                        if int(value.get("object_id", -1)) == object_id
+                    ),
+                    None,
+                )
+                if obj is None:
+                    raise KeyError(object_id)
+                detail: dict[str, Any] = {"object": obj, "snapshots": []}
+                reference = obj.get("snapshot")
+                if isinstance(reference, dict):
+                    image_index = reference.get("image_index")
+                    asset = next(
+                        (
+                            image
+                            for image in graph_data.get("snapshot_images", [])
+                            if image.get("image_index") == image_index
+                        ),
+                        None,
+                    )
+                    detail["snapshots"] = [
+                        {
+                            "reference": reference,
+                            "available": image_index in snapshot_paths,
+                            "asset": asset,
+                        }
+                    ]
+                    if image_index in snapshot_paths:
+                        detail["snapshot_url"] = (
+                            f"/snapshot-image/{urllib.parse.quote(str(image_index))}"
+                        )
+                return detail
+
+            client = LiveSceneQueryClient(
+                call_live_scene,
+                session_ttl_ms=LIVE_READ_SESSION_TTL_MS,
+            )
+            detail = read_live_object_details(client, object_id)
+            path = live_snapshot_path(detail)
+            if path is not None:
+                with live_snapshot_lock:
+                    live_snapshot_paths[object_id] = path
+                detail["snapshot_url"] = (
+                    f"/object-snapshot/{urllib.parse.quote(str(object_id))}"
+                )
+            return detail
+
+        def get_live_snapshot_path(object_id: int) -> Path | None:
+            with live_snapshot_lock:
+                return live_snapshot_paths.get(object_id)
+
+        def refresh_points() -> dict[str, Any]:
+            nonlocal point_cloud
+            with point_cloud_lock:
+                if offline or point_sampler is None:
+                    meta = points_meta(point_cloud)
+                    if not offline and args.no_points:
+                        meta["disabled"] = True
+                        meta["message"] = "Live point cloud display is disabled."
+                    elif not offline:
+                        meta["message"] = "Live point cloud sampler is unavailable."
+                    return meta
+                try:
+                    sample = point_sampler.sample(max_points=args.live_max_points)
+                    positions = base64.b64decode(sample.get("positions_b64") or "")
+                    colors = base64.b64decode(sample.get("colors_b64") or "")
+                    count = int(sample.get("count") or 0)
+                    if len(positions) != count * 12 or len(colors) != count * 3:
+                        raise ValueError("point cloud worker returned inconsistent buffers")
+                    point_cloud = PointCloud(
+                        np.frombuffer(positions, dtype="<f4").reshape((-1, 3)).copy(),
+                        np.frombuffer(colors, dtype="u1").reshape((-1, 3)).copy(),
+                        (
+                            f"{args.point_topic} sampled {count}/"
+                            f"{int(sample.get('source_count') or count)}"
+                        ),
+                    )
+                    server.points_bytes = positions  # type: ignore[attr-defined]
+                    server.colors_bytes = colors  # type: ignore[attr-defined]
+                    meta = points_meta(point_cloud)
+                    meta["source_count"] = int(sample.get("source_count") or count)
+                    meta["frame_id"] = sample.get("frame_id")
+                    return meta
+                except Exception as exc:
+                    point_cloud = empty_point_cloud()
+                    server.points_bytes = b""  # type: ignore[attr-defined]
+                    server.colors_bytes = b""  # type: ignore[attr-defined]
+                    return {
+                        **points_meta(point_cloud),
+                        "source": args.point_topic,
+                        "error": f"{type(exc).__name__}: {exc}",
+                    }
+
         server.snapshot_paths = snapshot_paths  # type: ignore[attr-defined]
         server.points_meta_json = json.dumps(points_meta(point_cloud), separators=(",", ":")).encode("utf-8")  # type: ignore[attr-defined]
         server.points_bytes = point_cloud.points.astype("<f4", copy=False).tobytes()  # type: ignore[attr-defined]
@@ -2143,6 +2706,10 @@ def main() -> int:
         server.current_runtime = current_runtime  # type: ignore[attr-defined]
         server.is_current_runtime = is_current_runtime  # type: ignore[attr-defined]
         server.reset_runtime = reset_runtime  # type: ignore[attr-defined]
+        server.read_graph = read_graph  # type: ignore[attr-defined]
+        server.read_object_details = read_object_details  # type: ignore[attr-defined]
+        server.live_snapshot_path = get_live_snapshot_path  # type: ignore[attr-defined]
+        server.refresh_points = refresh_points  # type: ignore[attr-defined]
 
         browser_host = "127.0.0.1" if args.host in {"0.0.0.0", "::"} else args.host
         url = f"http://{browser_host}:{server.server_port}/"
@@ -2166,6 +2733,8 @@ def main() -> int:
             server.server_close()
         current_runtime = initial_runtime if server is None else server.current_runtime()  # type: ignore[attr-defined]
         current_runtime.cancel()
+        if point_sampler is not None:
+            point_sampler.close()
         if live_transport is not None:
             live_transport.close()
         scene_qa_log.close()

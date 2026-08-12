@@ -6,6 +6,7 @@ import json
 import os
 from pathlib import Path
 import subprocess
+import threading
 from typing import Any, Callable
 
 
@@ -378,6 +379,139 @@ class RosQuerySceneTransport:
                     worker.wait(timeout=1.0)
 
     def __enter__(self) -> "RosQuerySceneTransport":
+        return self
+
+    def __exit__(self, *_: object) -> None:
+        self.close()
+
+
+class RosPointCloudSampler:
+    """Bounded ROS PointCloud2 sampler for non-ROS Python environments.
+
+    The browser only needs an occasional spatial context snapshot, not a full
+    ROS-to-WebGL stream. A system-Python worker waits for one cloud, samples it
+    deterministically, and returns compact position/color byte arrays.
+    """
+
+    def __init__(
+        self,
+        *,
+        topic: str = "/roomie/map_surface",
+        timeout_sec: float = 2.5,
+    ):
+        if not topic:
+            raise ValueError("point cloud topic must not be empty")
+        if timeout_sec <= 0:
+            raise ValueError("point cloud timeout_sec must be positive")
+        self.topic = topic
+        self.timeout_sec = float(timeout_sec)
+        self._lock = threading.Lock()
+        worker_path = Path(__file__).with_name("_ros_pointcloud_worker.py")
+        ros_python = os.environ.get("ROOMIE_ROS_PYTHON", "/usr/bin/python3")
+        try:
+            self._worker = subprocess.Popen(
+                [ros_python, str(worker_path), topic, str(self.timeout_sec)],
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                bufsize=1,
+            )
+        except Exception as exc:
+            raise RuntimeError(f"could not start ROS point cloud worker: {exc}") from exc
+
+    def sample(self, *, max_points: int = 120_000) -> dict[str, Any]:
+        if max_points <= 0:
+            raise ValueError("max_points must be positive")
+        with self._lock:
+            worker = self._worker
+            if worker is None:
+                raise LiveSceneQueryError(
+                    "point_cloud_unavailable", "ROS point cloud worker is closed"
+                )
+            if worker.stdin is None or worker.stdout is None:
+                raise LiveSceneQueryError(
+                    "point_cloud_unavailable", "ROS point cloud worker is unavailable"
+                )
+            if worker.poll() is not None:
+                raise LiveSceneQueryError(
+                    "point_cloud_unavailable", self._worker_exit_message()
+                )
+            try:
+                worker.stdin.write(
+                    json.dumps(
+                        {
+                            "max_points": int(max_points),
+                            "wait_timeout_sec": self.timeout_sec,
+                        }
+                    )
+                    + "\n"
+                )
+                worker.stdin.flush()
+                line = worker.stdout.readline()
+            except (BrokenPipeError, OSError) as exc:
+                raise LiveSceneQueryError("point_cloud_unavailable", str(exc)) from exc
+            if not line:
+                raise LiveSceneQueryError(
+                    "point_cloud_unavailable", self._worker_exit_message()
+                )
+            try:
+                response = json.loads(line)
+            except json.JSONDecodeError as exc:
+                raise LiveSceneQueryError(
+                    "invalid_response", "ROS point cloud worker returned invalid JSON"
+                ) from exc
+            if not isinstance(response, dict) or not response.get("ok"):
+                message = (
+                    response.get("error")
+                    if isinstance(response, dict)
+                    else "invalid point cloud worker response"
+                )
+                raise LiveSceneQueryError(
+                    str(response.get("status") or "point_cloud_unavailable")
+                    if isinstance(response, dict)
+                    else "point_cloud_unavailable",
+                    str(message),
+                    response if isinstance(response, dict) else None,
+                )
+            return response
+
+    def _worker_exit_message(self) -> str:
+        worker = self._worker
+        if worker is None:
+            return "ROS point cloud worker is closed"
+        detail = ""
+        if worker.poll() is not None and worker.stderr is not None:
+            try:
+                detail = worker.stderr.read().strip()
+            except OSError:
+                detail = ""
+        message = f"ROS point cloud worker exited with code {worker.poll()}"
+        return f"{message}: {detail}" if detail else message
+
+    def close(self) -> None:
+        with self._lock:
+            worker = self._worker
+            self._worker = None
+            if worker is None:
+                return
+        if worker is not None:
+            if worker.stdin is not None:
+                try:
+                    worker.stdin.close()
+                except OSError:
+                    pass
+            try:
+                worker.wait(timeout=1.0)
+            except subprocess.TimeoutExpired:
+                worker.terminate()
+                try:
+                    worker.wait(timeout=1.0)
+                except subprocess.TimeoutExpired:
+                    worker.kill()
+                    worker.wait(timeout=1.0)
+
+    def __enter__(self) -> "RosPointCloudSampler":
         return self
 
     def __exit__(self, *_: object) -> None:

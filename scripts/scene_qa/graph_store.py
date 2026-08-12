@@ -74,6 +74,7 @@ class RoomRecord:
 @dataclass(frozen=True)
 class ObjectRecord:
     object_id: int
+    name: str
     label: str
     description: str
     center_world: tuple[float, float, float] | None
@@ -184,7 +185,7 @@ class GraphStore:
             for rid in record.room_ids
             if rid in self.rooms_by_id and self.rooms_by_id[rid].label
         ]
-        parts = [record.label, record.description, " ".join(room_labels)]
+        parts = [record.name, record.label, record.description, " ".join(room_labels)]
         return " ".join(p for p in parts if p).strip()
 
     def object_to_dict(
@@ -196,6 +197,7 @@ class GraphStore:
     ) -> dict[str, Any]:
         data: dict[str, Any] = {
             "object_id": record.object_id,
+            "name": record.name,
             "label": record.label,
             "description": record.description,
             "center_world": _round(record.center_world),
@@ -451,6 +453,7 @@ class GraphStore:
             snapshot = item.get("snapshot") if isinstance(item.get("snapshot"), dict) else None
             records[object_id] = ObjectRecord(
                 object_id=object_id,
+                name=str(item.get("name") or ""),
                 label=str(item.get("label") or f"object {object_id}"),
                 description=str(item.get("description") or ""),
                 center_world=_as_vec3(item.get("center_world")),

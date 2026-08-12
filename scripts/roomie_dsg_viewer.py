@@ -1216,8 +1216,12 @@ HTML = r"""<!doctype html>
       }
       const q = filterInput.value.trim().toLowerCase();
       if (!q) return true;
-      const text = `${object.object_id} ${object.label || ''} ${object.semantic_id ?? ''}`.toLowerCase();
+      const text = `${object.object_id} ${object.name || ''} ${object.label || ''} ${object.semantic_id ?? ''}`.toLowerCase();
       return text.includes(q);
+    }
+
+    function objectTitle(object) {
+      return object.name || object.label || 'object';
     }
 
     function updateFilter() {
@@ -1244,7 +1248,7 @@ HTML = r"""<!doctype html>
         const snap = object.snapshot && Number.isFinite(object.snapshot.image_index) ? '<span class="pill">snap</span>' : '';
         row.innerHTML = `
           <div class="id">#${object.object_id}</div>
-          <div class="name">${escapeHtml(object.label || 'object')}</div>
+          <div class="name">${escapeHtml(objectTitle(object))}</div>
           <div class="score">${snap || fmt(objectScore(object), 2)}</div>`;
         row.addEventListener('click', () => selectObject(object.object_id));
         fragment.appendChild(row);
@@ -1290,7 +1294,7 @@ HTML = r"""<!doctype html>
         return;
       }
       title.textContent = `Object #${object.object_id}`;
-      sub.textContent = object.label || 'unlabeled';
+      sub.textContent = objectTitle(object);
       const status = [
         object.active === false ? 'inactive' : 'active',
         object.publishable === false ? 'suppressed' : 'publishable',
@@ -1300,6 +1304,7 @@ HTML = r"""<!doctype html>
         ${snapshotHtml(object)}
         <div class="kv">
           ${valueRow('id', object.object_id)}
+          ${valueRow('name', object.name || '')}
           ${valueRow('label', object.label || '')}
           ${valueRow('description', object.description || '')}
           ${valueRow('semantic id', object.semantic_id ?? '')}

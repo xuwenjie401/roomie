@@ -142,6 +142,7 @@ struct QueryObjectView {
   SceneObjectId object_id = -1;
   bool resolved_alias = false;
   int semantic_id = -1;
+  std::string name;
   std::string label;
   // Canonical description is empty when neither a human annotation nor a
   // description artifact exists. display_description is a query/UI fallback.

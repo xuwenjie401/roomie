@@ -19,6 +19,7 @@
 
 #include "roomie/dsg/observation_history.hpp"
 #include "roomie/pipeline/association_engine.hpp"
+#include "roomie/pipeline/furniture_evidence.hpp"
 #include "roomie/pipeline/presence_evidence.hpp"
 #include "roomie/utils/run_logger.hpp"
 
@@ -1211,6 +1212,10 @@ std::size_t countPromotionQualityBlocked(
   }
   std::size_t count = 0;
   for (const InstanceTrack& track : tracks) {
+    if (isConfiguredFurnitureLabel(track.label,
+                                   config.furniture_graph_config)) {
+      continue;
+    }
     if (track.object_id < 0 && hasBasePromotionEvidence(track, config) &&
         !hasPromotionQuality(track, config)) {
       ++count;
@@ -1255,6 +1260,8 @@ InstanceRecord recordFromTrack(const InstanceTrack& track) {
   record.object_id = track.object_id;
   record.track_id = track.track_id;
   record.semantic_id = track.semantic_id;
+  // Detector/tracker output never assigns a human instance name.
+  record.name.clear();
   record.label = track.label;
   record.description =
       track.object_id >= 0 ? geometryStatusName(track.geometry_status) : "tentative";
@@ -2242,6 +2249,7 @@ void InstanceMapThread::applyDetections(const InferenceResponse& response) {
   std::map<std::string, std::size_t> updated_by_label;
   std::map<std::string, std::size_t> promoted_by_label;
   std::map<std::string, std::size_t> promotion_quality_blocked_by_label;
+  std::map<std::string, std::size_t> furniture_promotion_blocked_by_label;
   std::map<std::string, std::size_t> geometry_update_suppressed_by_label;
   std::map<std::string, std::size_t> geometry_update_suppressed_by_reason;
   std::map<std::string, std::size_t> merged_small_duplicates_by_label;
@@ -2300,6 +2308,8 @@ void InstanceMapThread::applyDetections(const InferenceResponse& response) {
   std::size_t merged_duplicates = 0;
   std::size_t duplicate_rejected = 0;
   std::size_t promotion_quality_blocked = 0;
+  std::size_t furniture_promotion_blocked = 0;
+  std::string furniture_promotion_evidence;
   std::size_t geometry_update_suppressed = 0;
   std::size_t published_objects_after = 0;
   {
@@ -2525,6 +2535,42 @@ void InstanceMapThread::applyDetections(const InferenceResponse& response) {
     objects_after = object_graph_.objectCount();
     promotion_quality_blocked =
         countPromotionQualityBlocked(tracks_, config_, &promotion_quality_blocked_by_label);
+    std::ostringstream furniture_evidence_stream;
+    bool first_furniture_evidence = true;
+    for (const InstanceTrack& track : tracks_) {
+      if (track.object_id >= 0 ||
+          !isConfiguredFurnitureLabel(
+              track.label, config_.furniture_graph_config)) {
+        continue;
+      }
+      const std::size_t evidence_count = furnitureDetectionEvidenceCount(
+          track, track.label, frame_index_,
+          config_.furniture_graph_config
+              .object_creation_detection_window_frames);
+      if (evidence_count >=
+          config_.furniture_graph_config
+              .object_creation_min_same_class_detection_frames) {
+        continue;
+      }
+      ++furniture_promotion_blocked;
+      ++furniture_promotion_blocked_by_label[
+          diagnosticsLabel(track.label)];
+      if (!first_furniture_evidence) {
+        furniture_evidence_stream << ',';
+      }
+      first_furniture_evidence = false;
+      furniture_evidence_stream
+          << "track:" << track.track_id
+          << ":label:" << diagnosticsLabel(track.label)
+          << ":count:" << evidence_count
+          << ":min:"
+          << config_.furniture_graph_config
+                 .object_creation_min_same_class_detection_frames
+          << ":window:"
+          << config_.furniture_graph_config
+                 .object_creation_detection_window_frames;
+    }
+    furniture_promotion_evidence = furniture_evidence_stream.str();
     published_objects_after =
         object_graph_.snapshotInstanceRecords(/*publishable_only=*/false).size();
   }
@@ -2544,6 +2590,8 @@ void InstanceMapThread::applyDetections(const InferenceResponse& response) {
            << " duplicate_rejected=" << duplicate_rejected
            << " geometry_update_suppressed=" << geometry_update_suppressed
            << " promotion_quality_blocked=" << promotion_quality_blocked
+           << " furniture_promotion_blocked="
+           << furniture_promotion_blocked
            << " created_tracks=" << created
            << " updated_tracks=" << updated
            << " removed_tentative=" << removed_tentative
@@ -2567,6 +2615,10 @@ void InstanceMapThread::applyDetections(const InferenceResponse& response) {
            << " promoted=" << formatLabelCounts(promoted_by_label)
            << " promotion_quality_blocked="
            << formatLabelCounts(promotion_quality_blocked_by_label)
+           << " furniture_promotion_blocked="
+           << formatLabelCounts(furniture_promotion_blocked_by_label)
+           << " furniture_promotion_evidence={"
+           << furniture_promotion_evidence << '}'
            << " geometry_update_suppressed="
            << formatLabelCounts(geometry_update_suppressed_by_label)
            << " geometry_update_suppressed_reason="
@@ -3026,6 +3078,8 @@ bool InstanceMapThread::createTrack(const InstanceObservation& observation) {
     track.semantic_weights[track.semantic_id] =
         observation.confidence * promotion_weight;
   }
+  recordFurnitureDetectionEvidence(
+      &track, observation, config_.furniture_graph_config);
   if (config_.instance_association_mode == "evidence") {
     addPositivePresenceEvidence(&track, observation,
                                 presenceEvidenceConfig(config_));
@@ -3102,6 +3156,11 @@ bool InstanceMapThread::updateTrack(InstanceTrack* track,
   }
   fuseAppearanceShadow(track, observation.detection);
   recordObservationQuality(track, observation, config_);
+
+  if (track->object_id < 0) {
+    recordFurnitureDetectionEvidence(
+        track, observation, config_.furniture_graph_config);
+  }
 
   capSemanticPrior(&track->label_weights, 20.0f);
   capSemanticPrior(&track->semantic_weights, 20.0f);
@@ -3422,6 +3481,11 @@ bool InstanceMapThread::maybePromoteOrUpdateObject(InstanceTrack* track) {
 }
 
 bool InstanceMapThread::isPromotable(const InstanceTrack& track) const {
+  if (isConfiguredFurnitureLabel(track.label,
+                                 config_.furniture_graph_config)) {
+    return hasFurnitureCreationEvidence(
+        track, frame_index_, config_.furniture_graph_config);
+  }
   if (config_.instance_association_mode == "evidence") {
     return hasPositivePresenceConfirmation(
         track, frame_index_, presenceEvidenceConfig(config_));

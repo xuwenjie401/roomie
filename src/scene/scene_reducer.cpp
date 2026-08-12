@@ -211,6 +211,7 @@ SceneObjectPtr objectFromNode(const ObjectNode& node) {
   object->semantic = semanticFromNode(node);
   auto annotation = std::make_shared<AnnotationComponent>();
   annotation->revision = 1;
+  annotation->name = node.name;
   object->annotation = std::move(annotation);
   auto artifact = std::make_shared<ArtifactComponent>();
   artifact->revision = 1;
@@ -953,7 +954,7 @@ std::optional<ObjectRelation> deriveRoomContainmentRelation(
 
 ObjectGraphSnapshot SceneSnapshot::materializeObjectGraph() const {
   ObjectGraphSnapshot graph;
-  graph.schema_version = 5;
+  graph.schema_version = 6;
   graph.next_object_id = nextObjectId();
   graph.rooms = graphMetadata().rooms;
   graph.furniture = graphMetadata().furniture;
@@ -974,6 +975,7 @@ ObjectGraphSnapshot SceneSnapshot::materializeObjectGraph() const {
     node.object_id = object_id;
     node.semantic_id = object->annotation->semantic_id_override.value_or(
         object->semantic->semantic_id);
+    node.name = object->annotation->name;
     node.label = object->annotation->label_override.value_or(
         object->semantic->label);
     node.description = object->annotation->description_override.value_or(
@@ -2261,6 +2263,10 @@ SceneApplyResult ReducerCore::applyCommand(
   auto annotation =
       std::make_shared<AnnotationComponent>(*object->annotation);
   bool changed = false;
+  if (command.patch.name && annotation->name != *command.patch.name) {
+    annotation->name = *command.patch.name;
+    changed = true;
+  }
   if (command.patch.semantic_id &&
       annotation->semantic_id_override != command.patch.semantic_id) {
     annotation->semantic_id_override = command.patch.semantic_id;
@@ -2316,6 +2322,97 @@ SceneApplyResult ReducerCore::applyCommand(
       semantic_document_changed});
   events.push_back(ObjectUpdated{
       revision, *canonical, next.objects->at(*canonical)->revisions()});
+  return commit(std::move(next), revision, std::move(events));
+}
+
+SceneApplyResult ReducerCore::applyCommand(
+    const DeleteObjectCommand& command) {
+  if (command.object_id < 0) {
+    return reject("object delete rejected: object id is invalid");
+  }
+  if (command.expected_scene_revision &&
+      *command.expected_scene_revision != state_->latest_scene_revision) {
+    return reject("object delete rejected: scene dependency is stale; expected=" +
+                  std::to_string(*command.expected_scene_revision) +
+                  " current=" +
+                  std::to_string(state_->latest_scene_revision));
+  }
+  const auto canonical = resolveCanonical(*state_->aliases, command.object_id);
+  if (!canonical) {
+    return reject("object delete rejected: object alias cycle");
+  }
+  if (state_->tombstones->count(*canonical) != 0) {
+    return noOp("object is already tombstoned");
+  }
+  const auto object_it = state_->objects->find(*canonical);
+  if (object_it == state_->objects->end() || !object_it->second ||
+      !object_it->second->identity) {
+    return reject("object delete rejected: object does not exist");
+  }
+  if (command.expected_identity_revision != 0 &&
+      object_it->second->identity->revision !=
+          command.expected_identity_revision) {
+    return reject("object delete rejected: identity dependency is stale");
+  }
+
+  const SceneRevision revision =
+      nextSceneRevision(state_->latest_scene_revision);
+  SceneState next = *state_;
+  SceneObjectTable objects = *state_->objects;
+  SceneTombstoneTable tombstones = *state_->tombstones;
+  SceneTrackTable tracks = *state_->tracks;
+  SceneGraphMetadata graph = *state_->graph;
+
+  objects.erase(*canonical);
+  tombstones[*canonical] = ObjectTombstone{
+      *canonical, revision,
+      command.reason.empty() ? std::string("offline human delete")
+                             : command.reason};
+  for (auto track_it = tracks.begin(); track_it != tracks.end();) {
+    if (track_it->second && track_it->second->object_id == *canonical) {
+      track_it = tracks.erase(track_it);
+    } else {
+      ++track_it;
+    }
+  }
+  graph.furniture.erase(
+      std::remove_if(graph.furniture.begin(), graph.furniture.end(),
+                     [&](const FurnitureRole& role) {
+                       return role.object_id == *canonical;
+                     }),
+      graph.furniture.end());
+  const std::size_t relation_count_before = graph.relations.size();
+  graph.relations.erase(
+      std::remove_if(
+          graph.relations.begin(), graph.relations.end(),
+          [&](const SceneRelation& relation) {
+            const SceneEntityRef source = relationSource(relation);
+            const SceneEntityRef target = relationTarget(relation);
+            return (entityBackedByObject(source) &&
+                    source.id == *canonical) ||
+                   (entityBackedByObject(target) &&
+                    target.id == *canonical);
+          }),
+      graph.relations.end());
+
+  next.objects =
+      std::make_shared<const SceneObjectTable>(std::move(objects));
+  next.tombstones =
+      std::make_shared<const SceneTombstoneTable>(std::move(tombstones));
+  next.tracks =
+      std::make_shared<const SceneTrackTable>(std::move(tracks));
+  next.graph =
+      std::make_shared<const SceneGraphMetadata>(std::move(graph));
+  std::vector<SceneEvent> events;
+  if (relation_count_before != next.graph->relations.size()) {
+    events.push_back(RelationInvalidated{
+        revision, *canonical,
+        SceneEntityRef{SceneEntityType::kObject, *canonical}});
+  }
+  events.push_back(ObjectTombstoned{
+      revision, *canonical,
+      command.reason.empty() ? std::string("offline human delete")
+                             : command.reason});
   return commit(std::move(next), revision, std::move(events));
 }
 

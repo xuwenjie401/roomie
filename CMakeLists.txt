@@ -86,6 +86,7 @@ add_library(
   src/cpu_point_map_backend.cpp
   src/detection_bridge_thread.cpp
   src/ephemeral_run_workspace.cpp
+  src/furniture_evidence.cpp
   src/dsg/object_graph.cpp
   src/dsg/object_graph_io.cpp
   src/dsg/object_snapshot_remaker.cpp
@@ -181,6 +182,9 @@ ament_target_dependencies(roomie_pipeline_node rclcpp std_srvs)
 rosidl_get_typesupport_target(roomie_cpp_typesupport_target
                               ${PROJECT_NAME} "rosidl_typesupport_cpp")
 target_link_libraries(roomie_pipeline_node "${roomie_cpp_typesupport_target}")
+
+add_executable(roomie_offline_scene_worker src/offline_scene_worker.cpp)
+target_link_libraries(roomie_offline_scene_worker roomie_pipeline)
 if(ROOMIE_ENABLE_NVBLOX AND EXISTS "${ROOMIE_NVBLOX_LIBRARY_DIR}/libnvblox_lib.so")
   set_target_properties(
     roomie_pipeline_node
@@ -195,7 +199,8 @@ install(TARGETS roomie_pipeline
         LIBRARY DESTINATION lib
         RUNTIME DESTINATION bin
 )
-install(TARGETS roomie_pipeline_node RUNTIME DESTINATION lib/${PROJECT_NAME})
+install(TARGETS roomie_pipeline_node roomie_offline_scene_worker
+        RUNTIME DESTINATION lib/${PROJECT_NAME})
 install(DIRECTORY include/ DESTINATION include/${PROJECT_NAME})
 install(DIRECTORY config launch rviz DESTINATION share/${PROJECT_NAME}
         PATTERN "__pycache__" EXCLUDE
@@ -208,6 +213,7 @@ install(PROGRAMS
   scripts/roomie_python_inference_worker.py
   scripts/roomie_sentence_transformer_worker.py
   scripts/roomie_dsg_viewer.py
+  scripts/roomie_offline_scene_editor.py
   scripts/roomie_offline_room_partition_ui.py
   scripts/roomie_scene_qa.py
   scripts/roomie_scene_qa_viewer.py
@@ -233,6 +239,8 @@ if(BUILD_TESTING)
   target_link_libraries(test_association_engine roomie_pipeline)
   ament_add_gtest(test_presence_evidence test/test_presence_evidence.cpp)
   target_link_libraries(test_presence_evidence roomie_pipeline)
+  ament_add_gtest(test_furniture_evidence test/test_furniture_evidence.cpp)
+  target_link_libraries(test_furniture_evidence roomie_pipeline)
   ament_add_gtest(test_robot_mask_generator
                   test/test_robot_mask_generator.cpp)
   target_link_libraries(test_robot_mask_generator roomie_pipeline)
@@ -267,6 +275,9 @@ if(BUILD_TESTING)
   target_link_libraries(test_scene_reducer roomie_pipeline)
   ament_add_gtest(test_furniture_graph test/test_furniture_graph.cpp)
   target_link_libraries(test_furniture_graph roomie_pipeline)
+  target_compile_definitions(
+    test_furniture_graph
+    PRIVATE "ROOMIE_SOURCE_DIR=\"${CMAKE_CURRENT_SOURCE_DIR}\"")
   ament_add_gtest(test_geometry_scheduler test/test_geometry_scheduler.cpp)
   target_link_libraries(test_geometry_scheduler roomie_pipeline)
   ament_add_gtest(test_geometry_worker test/test_geometry_worker.cpp)

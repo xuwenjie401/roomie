@@ -82,7 +82,8 @@ TEST(SceneMutationJsonAdapter,
       {"dependencies",
        {{"identity_revision", 3}, {"annotation_revision", 6}}},
       {"patch",
-       {{"semantic_id", 91},
+       {{"name", "Ada's chair"},
+        {"semantic_id", 91},
         {"label", "reading chair"},
         {"description", "human verified walnut chair"},
         {"attributes", {{"owner", "library"}, {"tag", "favorite"}}},
@@ -99,6 +100,8 @@ TEST(SceneMutationJsonAdapter,
   EXPECT_EQ(captured->object_id, 7);
   EXPECT_EQ(captured->expected_identity_revision, 3U);
   EXPECT_EQ(captured->expected_annotation_revision, 6U);
+  ASSERT_TRUE(captured->patch.name.has_value());
+  EXPECT_EQ(*captured->patch.name, "Ada's chair");
   ASSERT_TRUE(captured->patch.semantic_id.has_value());
   EXPECT_EQ(*captured->patch.semantic_id, 91);
   EXPECT_EQ(*captured->patch.label, "reading chair");

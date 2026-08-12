@@ -255,7 +255,7 @@ TEST(ObjectGraphIo, ManualSceneGraphPreservesEnvelopeWhenSavingSnapshots) {
   ASSERT_TRUE(saved_stream);
   const nlohmann::json saved = nlohmann::json::parse(saved_stream);
   EXPECT_EQ(saved.value("format", std::string()), "roomie_manual_scene_graph");
-  EXPECT_EQ(saved.value("format_version", 0), 5);
+  EXPECT_EQ(saved.value("format_version", 0), 6);
   EXPECT_FALSE(saved.contains("object_graph"));
   ASSERT_TRUE(saved.contains("rooms"));
   EXPECT_EQ(saved.at("rooms").at(0).value("room_id", -1), 3);
@@ -326,7 +326,9 @@ TEST(ObjectGraphIo, LegacyV1AndSchemaV3TypedRoomsRelationsAreCompatible) {
   ASSERT_TRUE(loadObjectGraphSnapshotJson(
       legacy_path, &loaded_v1, &world_frame, &error)) << error;
   ASSERT_EQ(loaded_v1.objects.size(), 1U);
+  EXPECT_TRUE(loaded_v1.objects.front().name.empty());
   EXPECT_TRUE(loaded_v1.objects.front().description.empty());
+  loaded_v1.objects.front().name = "blue cup by the sink";
 
   RoomNode room;
   room.room_id = 9;
@@ -363,8 +365,10 @@ TEST(ObjectGraphIo, LegacyV1AndSchemaV3TypedRoomsRelationsAreCompatible) {
       loaded_v1, "map", 456, v3_path, &error)) << error;
   std::ifstream stream(v3_path);
   const nlohmann::json v3 = nlohmann::json::parse(stream);
-  EXPECT_EQ(v3.value("format_version", 0), 5);
+  EXPECT_EQ(v3.value("format_version", 0), 6);
   ASSERT_EQ(v3.at("objects").size(), 1U);
+  EXPECT_EQ(v3.at("objects").at(0).at("name"),
+            "blue cup by the sink");
   ASSERT_EQ(v3.at("rooms").size(), 1U);
   ASSERT_EQ(v3.at("furniture").size(), 1U);
   ASSERT_EQ(v3.at("relations").size(), 2U);
@@ -376,6 +380,8 @@ TEST(ObjectGraphIo, LegacyV1AndSchemaV3TypedRoomsRelationsAreCompatible) {
   ObjectGraphSnapshot loaded_v3;
   ASSERT_TRUE(loadObjectGraphSnapshotJson(
       v3_path, &loaded_v3, &world_frame, &error)) << error;
+  ASSERT_EQ(loaded_v3.objects.size(), 1U);
+  EXPECT_EQ(loaded_v3.objects.front().name, "blue cup by the sink");
   ASSERT_EQ(loaded_v3.rooms.size(), 1U);
   ASSERT_EQ(loaded_v3.furniture.size(), 1U);
   EXPECT_EQ(loaded_v3.furniture.front().object_id, 1);
