@@ -16,6 +16,7 @@
 #include "roomie/artifacts/online_snapshot_worker.hpp"
 #include "roomie/dsg/object_graph.hpp"
 #include "roomie/dsg/object_snapshot_remaker.hpp"
+#include "roomie/pipeline/association_engine.hpp"
 #include "roomie/pipeline/pipeline_config.hpp"
 #include "roomie/pipeline/snapshot_control_queue.hpp"
 #include "roomie/pipeline/thread_safe_queue.hpp"
@@ -122,6 +123,7 @@ class InstanceMapThread : public WorkerThread, public InstanceStore {
   ThreadSafeQueue<QueuedSceneCommand> scene_command_queue_;
   const MapProjector& map_projector_;
   PipelineConfig config_;
+  SmallObjectIdentityConfig small_object_identity_config_;
   mutable std::mutex mutex_;
   int next_track_id_ = 0;
   std::uint64_t frame_index_ = 0;

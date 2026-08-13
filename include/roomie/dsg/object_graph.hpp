@@ -76,6 +76,9 @@ struct InstanceObservation {
   std::size_t member_count = 1;
   std::map<std::string, float> label_votes;
   std::map<int, float> semantic_votes;
+  // Set only when same-frame clustering used the strict small-object identity
+  // path. Empty for ordinary physical-observation clustering.
+  std::string strong_identity_family;
 };
 
 struct ObservationQualitySample {

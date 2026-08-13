@@ -411,6 +411,11 @@ class GeminiSceneQaAgent:
             raise SceneQaCancelledError("question was reset")
 
     def _tool_start_message(self, name: str, args: dict[str, Any]) -> str:
+        if name == "gather_in_view_evidence":
+            return (
+                "gathering combined camera and scene evidence for: "
+                f"{str(args.get('target_description') or '').strip()}"
+            )
         if name == "search_objects":
             description = str(args.get("description") or "").strip()
             return f"sentence querying: {description}" if description else "sentence querying objects..."

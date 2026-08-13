@@ -168,9 +168,12 @@ struct PipelineConfig {
   float instance_duplicate_small_object_volume_ratio = 0.15f;
   float instance_small_duplicate_max_volume_m3 = 0.025f;
   float instance_small_duplicate_max_extent_m = 0.65f;
-  float instance_small_duplicate_iou_threshold = 0.25f;
+  float instance_small_duplicate_iou_threshold = 0.01f;
   float instance_small_duplicate_center_ratio = 0.35f;
-  float instance_small_duplicate_size_ratio_min = 0.55f;
+  float instance_small_duplicate_volume_ratio_min = 0.50f;
+  // Pipe-separated label families. Exact normalized labels remain compatible
+  // even when not listed, so this only declares cross-label identities.
+  std::vector<std::string> instance_small_object_identity_groups;
   float instance_quality_observation_min_quality = 0.45f;
   float instance_close_observation_distance_m = 3.5f;
   float instance_far_observation_distance_m = 3.5f;

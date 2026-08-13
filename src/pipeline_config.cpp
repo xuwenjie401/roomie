@@ -8,6 +8,8 @@
 
 #include <ament_index_cpp/get_package_share_directory.hpp>
 
+#include "roomie/pipeline/association_engine.hpp"
+
 namespace roomie {
 
 namespace {
@@ -650,11 +652,24 @@ PipelineConfig PipelineConfig::declareAndLoad(rclcpp::Node& node) {
                node.declare_parameter<double>(
                    "instance.small_duplicate_center_ratio",
                    config.instance_small_duplicate_center_ratio)));
-  config.instance_small_duplicate_size_ratio_min = static_cast<float>(std::clamp(
-      node.declare_parameter<double>("instance.small_duplicate_size_ratio_min",
-                                     config.instance_small_duplicate_size_ratio_min),
+  config.instance_small_duplicate_volume_ratio_min = static_cast<float>(std::clamp(
+      node.declare_parameter<double>("instance.small_duplicate_volume_ratio_min",
+                                     config.instance_small_duplicate_volume_ratio_min),
       0.0,
       1.0));
+  config.instance_small_object_identity_groups =
+      node.declare_parameter<std::vector<std::string>>(
+          "instance.small_object_identity_groups",
+          config.instance_small_object_identity_groups);
+  // Validate the compact group syntax and reject overlapping families during
+  // startup instead of silently changing association behavior.
+  (void)makeSmallObjectIdentityConfig(
+      config.instance_small_object_identity_groups,
+      config.instance_small_duplicate_max_volume_m3,
+      config.instance_small_duplicate_max_extent_m,
+      config.instance_small_duplicate_iou_threshold,
+      config.instance_small_duplicate_center_ratio,
+      config.instance_small_duplicate_volume_ratio_min);
   config.instance_quality_observation_min_quality = static_cast<float>(std::clamp(
       node.declare_parameter<double>("instance.quality_observation_min_quality",
                                      config.instance_quality_observation_min_quality),

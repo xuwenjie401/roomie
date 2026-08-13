@@ -1,7 +1,9 @@
 #pragma once
 
 #include <cstddef>
+#include <map>
 #include <optional>
+#include <string>
 #include <vector>
 
 #include <Eigen/StdVector>
@@ -10,12 +12,34 @@
 
 namespace roomie {
 
+struct SmallObjectIdentityConfig {
+  float max_volume_m3 = 0.025f;
+  float max_extent_m = 0.65f;
+  float min_iou_3d = 0.01f;
+  float max_normalized_center_distance = 0.35f;
+  float min_volume_ratio = 0.50f;
+  // Normalized label -> normalized family name. Exact normalized labels are
+  // always compatible even when they are not present in this map.
+  std::map<std::string, std::string> family_by_label;
+};
+
+struct SmallObjectIdentityFeatures {
+  bool label_compatible = false;
+  bool identity_conflict = false;
+  bool eligible = false;
+  std::string family;
+  float iou_3d = 0.0f;
+  float normalized_center_distance = 0.0f;
+  float volume_ratio = 0.0f;
+};
+
 struct PhysicalObservationConfig {
   float min_2d_iou = 0.65f;
   float min_volume_ratio = 0.50f;
   float max_normalized_center_distance = 0.35f;
   float min_3d_iou = 0.20f;
   float min_containment = 0.60f;
+  SmallObjectIdentityConfig small_object_identity;
 };
 
 struct AssociationScoringConfig {
@@ -30,6 +54,7 @@ struct AssociationScoringConfig {
   float archived_match_threshold = 0.75f;
   float merge_support_threshold = 0.75f;
   float max_center_gate_m = 0.75f;
+  SmallObjectIdentityConfig small_object_identity;
 };
 
 struct AssociationPairFeatures {
@@ -43,6 +68,8 @@ struct AssociationPairFeatures {
   float identity_score = 0.0f;
   float score = 0.0f;
   bool candidate = false;
+  bool strong_identity = false;
+  bool identity_conflict = false;
 };
 
 struct AssociationResult {
@@ -65,6 +92,25 @@ float orientedBoxContainment(const Eigen::Vector3f& lhs_center,
                              const Eigen::Vector3f& rhs_center,
                              const Eigen::Vector3f& rhs_size,
                              float rhs_yaw);
+
+SmallObjectIdentityConfig makeSmallObjectIdentityConfig(
+    const std::vector<std::string>& group_specs,
+    float max_volume_m3 = 0.025f,
+    float max_extent_m = 0.65f,
+    float min_iou_3d = 0.01f,
+    float max_normalized_center_distance = 0.35f,
+    float min_volume_ratio = 0.50f);
+
+SmallObjectIdentityFeatures evaluateSmallObjectIdentity(
+    const std::string& lhs_label,
+    const Eigen::Vector3f& lhs_center,
+    const Eigen::Vector3f& lhs_size,
+    float lhs_yaw,
+    const std::string& rhs_label,
+    const Eigen::Vector3f& rhs_center,
+    const Eigen::Vector3f& rhs_size,
+    float rhs_yaw,
+    const SmallObjectIdentityConfig& config);
 
 std::vector<InstanceObservation, Eigen::aligned_allocator<InstanceObservation>>
 clusterPhysicalObservations(

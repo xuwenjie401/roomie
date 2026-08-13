@@ -369,6 +369,7 @@ class DoubaoSceneQaAgent:
             "temperature": self.config.temperature,
             "max_output_tokens": self.config.max_output_tokens,
             "thinking": {"type": self.config.doubao_thinking_type},
+            "service_tier": self.config.doubao_service_tier,
             # Ark's documented function-call continuation uses
             # previous_response_id, which requires stored responses.
             "store": True,
@@ -515,6 +516,11 @@ class DoubaoSceneQaAgent:
 
     @staticmethod
     def _tool_start_message(name: str, args: dict[str, Any]) -> str:
+        if name == "gather_in_view_evidence":
+            return (
+                "gathering combined camera and scene evidence for: "
+                f"{str(args.get('target_description') or '').strip()}"
+            )
         if name == "search_objects":
             description = str(args.get("description") or "").strip()
             return (

@@ -4,6 +4,7 @@
   "doubao_model": "doubao-seed-2-0-lite-260215",
   "doubao_base_url": "https://ark.cn-beijing.volces.com/api/v3",
   "doubao_thinking_type": "disabled",
+  "doubao_service_tier": "fast",
   "embedding_model": "/home/lindenbot/hugging_face/sentence_t5_large",
   "embedding_backend": "embedding",
   "device": "auto",

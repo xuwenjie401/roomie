@@ -741,6 +741,146 @@ TEST(InstanceMapThread, EvidenceModeDurablyMergesLegacyBackpackHandbagPair) {
 }
 
 TEST(InstanceMapThread,
+     EvidenceModeMergesMeasuredBottleTripleButKeepsBottleCapSeparate) {
+  PipelineConfig config;
+  config.instance_association_mode = "evidence";
+  config.instance_min_confidence = 0.0f;
+  config.instance_min_bbox_size_m = 0.001f;
+  config.instance_small_object_identity_groups = {"bottle|bottled_water"};
+
+  ThreadSafeQueue<InferenceResponse> queue(8);
+  FakeMapProjector projector;
+  InstanceMapThread instance_map(queue, projector, config);
+  const auto bottle = [](int object_id,
+                         std::string label,
+                         Eigen::Vector3f center,
+                         Eigen::Vector3f size,
+                         float quality) {
+    ObjectNode object = makeObject(object_id);
+    object.label = std::move(label);
+    object.center_world = center;
+    object.size_m = size;
+    object.confidence = quality;
+    object.confidence_mass = quality;
+    object.object_quality_score = quality;
+    object.support_count = 1;
+    object.label_weights[object.label] = 1.0f;
+    return object;
+  };
+
+  ObjectGraphSnapshot loaded;
+  loaded.objects = {
+      bottle(87, "bottle", {0.866043f, -2.538530f, 0.781970f},
+             {0.057092f, 0.057383f, 0.130203f}, 0.90f),
+      bottle(90, "bottle", {0.884047f, -2.594693f, 0.802578f},
+             {0.064928f, 0.063798f, 0.174672f}, 0.80f),
+      bottle(95, "bottled_water", {0.861847f, -2.563005f, 0.757086f},
+             {0.061129f, 0.051063f, 0.092013f}, 0.70f),
+      bottle(101, "bottle_cap", {0.866043f, -2.538530f, 0.781970f},
+             {0.057092f, 0.057383f, 0.130203f}, 0.60f)};
+  loaded.next_object_id = 102;
+  std::string error;
+  ASSERT_TRUE(instance_map.loadObjectGraphSnapshot(loaded, &error)) << error;
+  instance_map.start();
+
+  InferenceResponse response;
+  response.ok = true;
+  response.time_ns = 1'000'000'000;
+  response.camera_id = "head";
+  response.provenance.run_id = RunId{450, 550};
+  response.provenance.frame_id = 1;
+  response.provenance.request_id = 1;
+  ASSERT_TRUE(instance_map.enqueueDetections(std::move(response)));
+  ASSERT_TRUE(instance_map.waitUntilIdle(std::chrono::seconds(1)));
+
+  const SceneSnapshot snapshot = instance_map.sceneSnapshot();
+  ASSERT_EQ(snapshot.objects().size(), 2U);
+  EXPECT_EQ(snapshot.resolveCanonicalId(90),
+            std::optional<SceneObjectId>(87));
+  EXPECT_EQ(snapshot.resolveCanonicalId(95),
+            std::optional<SceneObjectId>(87));
+  EXPECT_TRUE(snapshot.findExactObject(87));
+  EXPECT_TRUE(snapshot.findExactObject(101));
+  const SceneObjectPtr canonical = snapshot.findExactObject(87);
+  ASSERT_TRUE(canonical && canonical->semantic);
+  EXPECT_GT(canonical->semantic->label_weights.at("bottle"), 0.0f);
+  EXPECT_GT(canonical->semantic->label_weights.at("bottled_water"), 0.0f);
+  instance_map.stop();
+}
+
+TEST(InstanceMapThread,
+     EvidenceModeMergesTransitivePackageFamilyAndPreservesLabelEvidence) {
+  PipelineConfig config;
+  config.instance_association_mode = "evidence";
+  config.instance_min_confidence = 0.0f;
+  config.instance_min_bbox_size_m = 0.001f;
+  config.instance_small_object_identity_groups = {
+      "box|labeled_package|printed_carton|medicine_carton"};
+
+  ThreadSafeQueue<InferenceResponse> queue(8);
+  FakeMapProjector projector;
+  InstanceMapThread instance_map(queue, projector, config);
+  const auto package = [](int object_id,
+                          std::string label,
+                          Eigen::Vector3f center,
+                          Eigen::Vector3f size,
+                          float yaw,
+                          float quality) {
+    ObjectNode object = makeObject(object_id);
+    object.label = std::move(label);
+    object.center_world = center;
+    object.size_m = size;
+    object.yaw_rad = yaw;
+    object.confidence = quality;
+    object.confidence_mass = quality;
+    object.object_quality_score = quality;
+    object.support_count = 1;
+    object.label_weights[object.label] = 1.0f;
+    return object;
+  };
+
+  ObjectGraphSnapshot loaded;
+  loaded.objects = {
+      package(42, "box", {2.162210f, 3.844470f, 0.828921f},
+              {0.211200f, 0.185070f, 0.264856f}, -0.011774f, 0.50f),
+      package(50, "labeled_package", {2.208026f, 3.920180f, 0.841667f},
+              {0.219637f, 0.095061f, 0.265831f}, -0.606546f, 0.70f),
+      package(55, "medicine_carton", {2.178208f, 3.908470f, 0.766520f},
+              {0.253268f, 0.158681f, 0.084193f}, 0.008728f, 0.90f)};
+  loaded.next_object_id = 56;
+  std::string error;
+  ASSERT_TRUE(instance_map.loadObjectGraphSnapshot(loaded, &error)) << error;
+  instance_map.start();
+
+  InferenceResponse response;
+  response.ok = true;
+  response.time_ns = 1'000'000'000;
+  response.camera_id = "head";
+  response.provenance.run_id = RunId{500, 600};
+  response.provenance.frame_id = 1;
+  response.provenance.request_id = 1;
+  ASSERT_TRUE(instance_map.enqueueDetections(std::move(response)));
+  ASSERT_TRUE(instance_map.waitUntilIdle(std::chrono::seconds(1)));
+
+  const SceneSnapshot snapshot = instance_map.sceneSnapshot();
+  ASSERT_EQ(snapshot.objects().size(), 1U);
+  EXPECT_EQ(snapshot.resolveCanonicalId(50),
+            std::optional<SceneObjectId>(42));
+  EXPECT_EQ(snapshot.resolveCanonicalId(55),
+            std::optional<SceneObjectId>(42));
+  const SceneObjectPtr canonical = snapshot.findExactObject(42);
+  ASSERT_TRUE(canonical);
+  ASSERT_TRUE(canonical->semantic);
+  EXPECT_GT(canonical->semantic->label_weights.at("box"), 0.0f);
+  EXPECT_GT(canonical->semantic->label_weights.at("labeled_package"), 0.0f);
+  EXPECT_GT(canonical->semantic->label_weights.at("medicine_carton"), 0.0f);
+  ASSERT_TRUE(canonical->geometry);
+  EXPECT_TRUE(canonical->geometry->center_world.isApprox(
+      Eigen::Vector3f(2.178208f, 3.908470f, 0.766520f), 1.0e-5f));
+  instance_map.stop();
+}
+
+TEST(InstanceMapThread,
      PersistenceAdmissionAndTerminalSinkFuseRejectBeforeReducer) {
   PipelineConfig config;
   ThreadSafeQueue<InferenceResponse> queue(4);

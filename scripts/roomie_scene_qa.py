@@ -188,6 +188,7 @@ def apply_cli_overrides(config: SceneQaConfig, args: argparse.Namespace) -> Scen
         doubao_model=args.doubao_model or config.doubao_model,
         doubao_base_url=(args.doubao_base_url or config.doubao_base_url).rstrip("/"),
         doubao_thinking_type=config.doubao_thinking_type,
+        doubao_service_tier=config.doubao_service_tier,
         embedding_model=args.embedding_model or config.embedding_model,
         embedding_backend=args.embedding_backend or config.embedding_backend,
         device=args.device or config.device,
@@ -196,7 +197,7 @@ def apply_cli_overrides(config: SceneQaConfig, args: argparse.Namespace) -> Scen
             args.max_iterations
             if args.max_iterations is not None
             else (
-                4
+                2
                 if args.task == TASK_FIND_OBJECT_IN_VIEW
                 else (3 if args.task == TASK_NAVIGATION else config.max_iterations)
             )

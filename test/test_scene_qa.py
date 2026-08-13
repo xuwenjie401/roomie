@@ -203,6 +203,7 @@ class SceneQaToolTests(unittest.TestCase):
             "doubao-seed-2-0-lite-260215",
         )
         self.assertEqual(SceneQaConfig().doubao_thinking_type, "disabled")
+        self.assertEqual(SceneQaConfig().doubao_service_tier, "default")
         prompt_dir = Path(self.tmp.name) / "prompts"
         prompt_dir.mkdir()
         prompt_path = prompt_dir / "system.txt"
@@ -216,6 +217,7 @@ class SceneQaToolTests(unittest.TestCase):
                     "doubao_model": "doubao-test-model",
                     "doubao_base_url": "https://ark.example.test/api/v3/",
                     "doubao_thinking_type": "auto",
+                    "doubao_service_tier": "fast",
                     "embedding_model": "/tmp/fake_embedding",
                     "embedding_backend": "lexical",
                     "device": "cpu",
@@ -236,6 +238,7 @@ class SceneQaToolTests(unittest.TestCase):
         self.assertEqual(config.doubao_model, "doubao-test-model")
         self.assertEqual(config.doubao_base_url, "https://ark.example.test/api/v3")
         self.assertEqual(config.doubao_thinking_type, "auto")
+        self.assertEqual(config.doubao_service_tier, "fast")
         self.assertEqual(config.embedding_backend, "lexical")
         self.assertEqual(config.top_k, 3)
         self.assertEqual(config.snapshot_bbox_pad_px, 5)
@@ -797,6 +800,7 @@ class SceneQaToolTests(unittest.TestCase):
             embedding_backend="lexical",
             doubao_model="doubao-test-model",
             doubao_base_url="https://ark.example.test/api/v3",
+            doubao_service_tier="fast",
             top_k=5,
         )
         agent = DoubaoSceneQaAgent(
@@ -832,6 +836,7 @@ class SceneQaToolTests(unittest.TestCase):
             fake_client.calls[0]["json"]["thinking"],
             {"type": "disabled"},
         )
+        self.assertEqual(fake_client.calls[0]["json"]["service_tier"], "fast")
         continuation = fake_client.calls[1]["json"]
         self.assertEqual(continuation["previous_response_id"], "resp-tool")
         self.assertEqual(continuation["input"][0]["type"], "function_call_output")
@@ -1482,7 +1487,7 @@ class LiveSceneQaTests(unittest.TestCase):
             "find_object_in_view",
             explicit_max_iterations=None,
         )
-        self.assertEqual(in_view_config.max_iterations, 4)
+        self.assertEqual(in_view_config.max_iterations, 2)
         self.assertEqual(
             in_view_config.system_prompt_path.name, "find_object_in_view.txt"
         )

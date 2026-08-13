@@ -132,6 +132,13 @@ roomie_pipeline_node:
       association_active_threshold: 0.55
       association_archived_threshold: 0.75
       association_merge_threshold: 0.75
+      small_duplicate_max_volume_m3: 0.025
+      small_duplicate_max_extent_m: 0.65
+      small_duplicate_iou_threshold: 0.01
+      small_duplicate_center_ratio: 0.35
+      small_duplicate_volume_ratio_min: 0.50
+      small_object_identity_groups:
+        ["bottle|bottled_water", "box|labeled_package|printed_carton|medicine_carton"]
       presence_window_sec: 2.0
       presence_positive_window_eligible_frames: 20
       presence_min_positive_frames: 2

@@ -297,11 +297,16 @@ def test_in_view_primary_strong_match_and_structured_bbox() -> None:
         )
 
         primary = registry.call_tool(
-            "find_objects_in_view", {"target_description": "yellow bottle"}
+            "gather_in_view_evidence", {"target_description": "yellow bottle"}
         )
 
         assert primary.response["strong_match_object_id"] == 1
-        assert not primary.response["current_rgb_inspected"]
+        assert primary.response["evidence_limits"]["occlusion_checked"] is False
+        encoded = json.dumps(primary.response, ensure_ascii=False)
+        assert "indexed_document_hash" not in encoded
+        assert "semantic_document_hash" not in encoded
+        assert "snapshot_set_hash" not in encoded
+        assert '"revisions"' not in encoded
         result = build_find_object_in_view_result(
             qa_response(
                 {
@@ -336,31 +341,27 @@ def test_in_view_vlm_tool_returns_latest_three_camera_2d_results() -> None:
             detection_sampler=detection_sampler,
         )
 
-        before_primary = registry.call_tool("inspect_latest_2d_detections", {})
-        assert "call find_objects_in_view" in before_primary.response["error"]
-        registry.call_tool(
-            "find_objects_in_view", {"target_description": "yellow bottle"}
+        result = registry.call_tool(
+            "gather_in_view_evidence", {"target_description": "yellow bottle"}
         )
-        result = registry.call_tool("inspect_latest_2d_detections", {})
 
-        assert registry.list_tools() == [
-            "find_objects_in_view",
-            "inspect_latest_2d_detections",
-            "inspect_in_view_candidates",
-        ]
-        assert result.response["available_camera_count"] == 3
-        assert [camera["camera_id"] for camera in result.response["cameras"]] == list(
+        assert registry.list_tools() == ["gather_in_view_evidence"]
+        detections = result.response["latest_2d_detections"]
+        assert detections["available_camera_count"] == 3
+        assert [camera["camera_id"] for camera in detections["cameras"]] == list(
             DETECTION_CAMERA_IDS
         )
-        assert result.response["cameras"][0]["detections"][0]["label"] == (
+        assert detections["cameras"][0]["detections"][0]["label"] == (
             "yellow_bottle"
         )
-        assert result.response["cameras"][0]["head_geometry_sample_delta_ms"] == 0.0
+        assert detections["cameras"][0]["head_geometry_sample_delta_ms"] == 0.0
         assert len(result.media) == 3
         assert [media.summary["camera_id"] for media in result.media] == list(
             DETECTION_CAMERA_IDS
         )
-        repeated = registry.call_tool("inspect_latest_2d_detections", {})
+        repeated = registry.call_tool(
+            "gather_in_view_evidence", {"target_description": "yellow bottle"}
+        )
         assert "only once" in repeated.response["error"]
 
 
@@ -386,7 +387,7 @@ def test_invalid_in_view_model_id_downgrades_to_aligned_suspected_arrays() -> No
             base, config, evidence, SimpleNamespace(sample=camera_sample)
         )
         registry.call_tool(
-            "find_objects_in_view", {"target_description": "medicine package"}
+            "gather_in_view_evidence", {"target_description": "medicine package"}
         )
 
         result = build_find_object_in_view_result(
@@ -425,7 +426,7 @@ def test_in_view_sensor_failure_is_fatal_not_not_found() -> None:
         )
         with pytest.raises(CameraViewError) as context:
             registry.call_tool(
-                "find_objects_in_view", {"target_description": "yellow bottle"}
+                "gather_in_view_evidence", {"target_description": "yellow bottle"}
             )
         assert context.value.status == "camera_image_timeout"
 
@@ -466,7 +467,7 @@ def test_task_cli_selects_prompt_and_three_iteration_default() -> None:
     in_view_config = roomie_scene_qa.apply_cli_overrides(
         SceneQaConfig(), in_view_args
     )
-    assert in_view_config.max_iterations == 4
+    assert in_view_config.max_iterations == 2
     assert in_view_config.system_prompt_path.name == "find_object_in_view.txt"
 
     with patch.object(sys, "argv", ["roomie_scene_qa.py"]):

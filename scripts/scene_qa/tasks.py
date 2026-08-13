@@ -144,12 +144,19 @@ def _reference_prompt(
         lines.append(
             f"- reference_id={reference.reference_id!r}; name={reference.name!r}{suffix}"
         )
-    lines.append(
-        f"Pass an exact reference_id to {evidence_tool} only after the primary "
-        "tool has returned concrete scene object ids. The tool supplies labeled "
-        "historical scene snapshots and reference views; make the visual judgment "
-        "yourself and report inconclusive evidence honestly."
-    )
+    if evidence_tool == "gather_in_view_evidence":
+        lines.append(
+            "When the requested item exactly matches a listed name or alias, pass its "
+            "reference_id directly to gather_in_view_evidence. The combined tool selects "
+            "scene candidates and supplies labeled reference and historical images."
+        )
+    else:
+        lines.append(
+            f"Pass an exact reference_id to {evidence_tool} only after the primary "
+            "tool has returned concrete scene object ids. The tool supplies labeled "
+            "historical scene snapshots and reference views; make the visual judgment "
+            "yourself and report inconclusive evidence honestly."
+        )
     return "\n".join(lines)
 
 
@@ -282,6 +289,238 @@ def _inspect_task_candidates(
         },
         media,
     )
+
+
+def _compact_text(value: Any, *, maximum: int = 600) -> str:
+    text = " ".join(str(value or "").split())
+    if len(text) <= maximum:
+        return text
+    return f"{text[: maximum - 1].rstrip()}…"
+
+
+def _compact_in_view_candidate(
+    item: dict[str, Any],
+    projection: dict[str, Any],
+    *,
+    match_strength: int,
+    match_type: str,
+) -> dict[str, Any]:
+    """Return only identity, ranking, presence, and head-ROI model evidence."""
+
+    camera_value = projection.get("object_in_head_cam")
+    camera_value = camera_value if isinstance(camera_value, dict) else {}
+    bbox = camera_value.get("bbox")
+    result: dict[str, Any] = {
+        "object_id": _object_id(item),
+        "label": str(item.get("label") or ""),
+        "name": str(item.get("name") or ""),
+        "description": _compact_text(
+            item.get("description")
+            or item.get("canonical_description")
+            or item.get("display_description")
+            or item.get("label")
+        ),
+        "active": bool(item.get("active")),
+        "presence_state": str(item.get("presence_state") or ""),
+        "semantic_score": round(_number(item.get("semantic_score")), 4),
+        "match_strength": int(match_strength),
+        "match_type": str(match_type),
+        "head_camera_bbox": dict(bbox) if isinstance(bbox, dict) else None,
+        "depth_range_m": [
+            round(_number(projection.get("min_corner_depth_m")), 4),
+            round(_number(projection.get("max_corner_depth_m")), 4),
+        ],
+    }
+    probability = item.get("existence_probability")
+    if probability is not None:
+        result["existence_probability"] = round(_number(probability), 4)
+    reason = str(item.get("last_presence_evidence_reason") or "").strip()
+    if reason:
+        result["last_presence_evidence_reason"] = reason
+    return result
+
+
+def _compact_detection_camera(
+    frame: Latest2dDetectionFrame,
+    *,
+    head_sample_ns: int | None,
+) -> dict[str, Any]:
+    metadata = frame.metadata()
+    result_ns = _stamp_ns(metadata.get("header"))
+    return {
+        "camera_id": frame.camera_id,
+        "available": bool(metadata.get("available")),
+        "header": metadata.get("header"),
+        "head_geometry_sample_delta_ms": (
+            round((result_ns - head_sample_ns) / 1.0e6, 3)
+            if result_ns is not None and head_sample_ns is not None
+            else None
+        ),
+        "image_attached": bool(frame.image_available and frame.image_data),
+        "detector_ok": bool(metadata.get("detector_ok")),
+        "detections": list(metadata.get("detections") or []),
+        **(
+            {"detector_error": str(metadata.get("detector_error"))}
+            if metadata.get("detector_error")
+            else {}
+        ),
+    }
+
+
+def _latest_detection_evidence(
+    detection_sampler: Any,
+    evidence: TaskEvidence,
+) -> ToolResult:
+    sampled = detection_sampler.sample()
+    if not isinstance(sampled, list):
+        raise ValueError("latest 2D detection sampler must return an array")
+    frames = [
+        value
+        if isinstance(value, Latest2dDetectionFrame)
+        else Latest2dDetectionFrame.from_mapping(value)
+        for value in sampled
+    ]
+    by_camera = {frame.camera_id: frame for frame in frames}
+    if (
+        len(frames) != len(DETECTION_CAMERA_IDS)
+        or set(by_camera) != set(DETECTION_CAMERA_IDS)
+    ):
+        raise ValueError("latest 2D detection sampler returned an unexpected camera set")
+
+    evidence.detection_inspection_called = True
+    head_sample_ns = (
+        _stamp_ns(evidence.camera_sample.header)
+        if evidence.camera_sample is not None
+        else None
+    )
+    cameras: list[dict[str, Any]] = []
+    media: list[MediaAttachment] = []
+    for camera_id in DETECTION_CAMERA_IDS:
+        frame = by_camera[camera_id]
+        camera = _compact_detection_camera(frame, head_sample_ns=head_sample_ns)
+        cameras.append(camera)
+        # Keep every available head/hand image. Hand images support identity and
+        # appearance even though they do not prove head-camera visibility.
+        if frame.image_available and frame.image_data:
+            header = camera.get("header")
+            stamp = header.get("stamp") if isinstance(header, dict) else None
+            media.append(
+                MediaAttachment(
+                    data=frame.image_data,
+                    mime_type=frame.image_mime_type,
+                    summary={
+                        "role": "latest_2d_detection_result",
+                        "camera_id": camera_id,
+                        "header": header,
+                        "label": (
+                            "LATEST 2D DETECTION RESULT "
+                            f"camera_id={camera_id}; stamp={stamp}; "
+                            "boxes, labels, and scores are detector output."
+                        ),
+                    },
+                )
+            )
+    return ToolResult(
+        {
+            "available": True,
+            "evidence_scope": "latest_retained_2d_detection_results",
+            "available_camera_count": sum(
+                bool(camera["available"]) for camera in cameras
+            ),
+            "cameras": cameras,
+            "timing_note": (
+                "Camera results are independent retained observations, not a "
+                "synchronized capture."
+            ),
+        },
+        media,
+    )
+
+
+def _candidate_inspection_ids(
+    target_description: str,
+    candidates: list[dict[str, Any]],
+    *,
+    reference_id: str | None,
+) -> list[int]:
+    """Choose up to four candidates worth the cost of historical RGB evidence."""
+
+    query_tokens = {
+        token
+        for token in _tokens(target_description)
+        if len(token) >= 3 and token not in {"the", "with", "object", "item"}
+    }
+    selected: list[int] = []
+    for candidate in candidates:
+        object_id = _object_id(candidate)
+        if object_id is None:
+            continue
+        identity_tokens = _tokens(
+            " ".join(
+                str(candidate.get(key) or "")
+                for key in ("label", "name", "description")
+            )
+        )
+        materially_matched = int(candidate.get("match_strength") or 0) >= 2
+        if reference_id or materially_matched or bool(query_tokens & identity_tokens):
+            selected.append(object_id)
+        if len(selected) >= 4:
+            break
+    if reference_id and not selected:
+        selected = [
+            object_id
+            for object_id in (_object_id(candidate) for candidate in candidates[:4])
+            if object_id is not None
+        ]
+    return selected
+
+
+def _compact_candidate_inspection(result: ToolResult) -> dict[str, Any]:
+    response = result.response
+    objects = response.get("objects")
+    if not isinstance(objects, list):
+        objects = response.get("scene_objects")
+    compact_objects = []
+    for value in objects if isinstance(objects, list) else []:
+        if not isinstance(value, dict):
+            continue
+        snapshot = value.get("historical_snapshot")
+        snapshot = snapshot if isinstance(snapshot, dict) else {}
+        compact_objects.append(
+            {
+                "object_id": _object_id(value),
+                "label": str(value.get("label") or ""),
+                "name": str(value.get("name") or ""),
+                "description": _compact_text(
+                    value.get("description")
+                    or value.get("canonical_description")
+                    or value.get("display_description")
+                    or value.get("label")
+                ),
+                "snapshot_attached": bool(
+                    value.get("snapshot_attached")
+                    or value.get("comparison_snapshot_attached")
+                    or snapshot.get("image_attached")
+                ),
+            }
+        )
+    compact: dict[str, Any] = {
+        "evidence_scope": str(response.get("evidence_scope") or ""),
+        "inspected_object_ids": list(response.get("inspected_object_ids") or []),
+        "objects": compact_objects,
+        "note": "Attached scene snapshots are historical identity evidence.",
+    }
+    reference = response.get("reference")
+    if isinstance(reference, dict):
+        compact["reference"] = {
+            "reference_id": reference.get("reference_id"),
+            "name": reference.get("name"),
+            "aliases": list(reference.get("aliases") or []),
+        }
+        compact["note"] = (
+            "Compare labeled reference and scene media; the tool does not decide identity."
+        )
+    return compact
 
 
 def create_navigation_task_registry(
@@ -561,7 +800,7 @@ def create_find_object_in_view_task_registry(
     *,
     detection_sampler: Any | None = None,
 ) -> ToolRegistry:
-    """Expose bounded frustum, latest-2D, and historical evidence tools."""
+    """Expose one compact tool that gathers all bounded in-view evidence."""
 
     if (
         config.in_view_min_depth_m <= 0.0
@@ -576,16 +815,16 @@ def create_find_object_in_view_task_registry(
         base,
         evidence,
         prompt_suffix=_reference_prompt(
-            reference_catalog_load, "inspect_in_view_candidates"
+            reference_catalog_load, "gather_in_view_evidence"
         ),
     )
 
-    def find_objects_in_view(
+    def gather_in_view_evidence(
         target_description: str,
         reference_id: str | None = None,
     ) -> ToolResult:
         if evidence.primary_called and not evidence.turn_closed:
-            raise ValueError("find_objects_in_view may be called only once per task")
+            raise ValueError("gather_in_view_evidence may be called only once per task")
         if not str(target_description).strip():
             raise ValueError("target_description must be non-empty")
         evidence.begin_primary()
@@ -608,7 +847,7 @@ def create_find_object_in_view_task_registry(
         search_objects = search.response.get("objects")
         if not isinstance(search_objects, list):
             search_objects = []
-        candidates = []
+        candidates: list[dict[str, Any]] = []
         for value in search_objects:
             if not isinstance(value, dict):
                 continue
@@ -635,15 +874,16 @@ def create_find_object_in_view_task_registry(
             item = dict(value)
             strength, match_type = _match_strength(str(target_description), item)
             projection_value = projection.to_dict(sample.header)
-            candidate = {
-                **item,
-                "match_type": match_type,
-                "match_strength": strength,
-                **projection_value,
-            }
             evidence.objects[object_id] = item
             evidence.projections[object_id] = projection_value
-            candidates.append(candidate)
+            candidates.append(
+                _compact_in_view_candidate(
+                    item,
+                    projection_value,
+                    match_strength=strength,
+                    match_type=match_type,
+                )
+            )
             if len(candidates) >= 12:
                 break
 
@@ -657,29 +897,94 @@ def create_find_object_in_view_task_registry(
             if int(candidate["match_strength"]) == strongest and strongest >= 2
         ]
         strong_match_id = strongest_ids[0] if len(strongest_ids) == 1 else None
+
+        detection_result = (
+            _latest_detection_evidence(detection_sampler, evidence)
+            if detection_sampler is not None
+            else ToolResult(
+                {
+                    "available": False,
+                    "evidence_scope": "latest_retained_2d_detection_results",
+                    "available_camera_count": 0,
+                    "cameras": [],
+                    "timing_note": "Latest 2D detection sampling is unavailable.",
+                }
+            )
+        )
+        inspection_ids = _candidate_inspection_ids(
+            str(target_description),
+            candidates,
+            reference_id=reference_id,
+        )
+        if inspection_ids:
+            inspection_result = _inspect_task_candidates(
+                base,
+                evidence,
+                inspection_ids,
+                reference_id,
+            )
+            historical_evidence = _compact_candidate_inspection(inspection_result)
+            historical_media = inspection_result.media
+        else:
+            historical_evidence = {
+                "evidence_scope": "historical_scene_snapshots",
+                "inspected_object_ids": [],
+                "objects": [],
+                "note": (
+                    "No candidate had enough structured or lexical identity overlap "
+                    "to justify historical snapshot inspection."
+                ),
+            }
+            historical_media = []
+
+        camera_metadata = sample.metadata()
+        compact_camera = {
+            key: camera_metadata.get(key)
+            for key in (
+                "header",
+                "world_frame",
+                "camera_frame",
+                "width",
+                "height",
+                "view_mode",
+                "cached",
+                "cache_reason",
+                "cache_age_sec",
+            )
+            if key in camera_metadata
+        }
         response = {
             "target_description": str(target_description),
             "reference_id": reference_id,
-            "camera": sample.metadata(),
-            "visibility_definition": "any_3d_bbox_corner_in_sampled_head_camera_frustum",
-            "occlusion_checked": False,
-            "current_rgb_inspected": False,
+            "head_camera": compact_camera,
             "candidate_count": len(candidates),
             "candidates": candidates,
             "strong_match_object_id": strong_match_id,
             "strong_match_is_unique": strong_match_id is not None,
+            "latest_2d_detections": detection_result.response,
+            "historical_identity_evidence": historical_evidence,
+            "evidence_limits": {
+                "head_frustum_is_geometric_eligibility_only": True,
+                "occlusion_checked": False,
+                "hand_images_prove_head_camera_presence": False,
+                "historical_images_are_current_observations": False,
+            },
         }
         evidence.primary_response = response
-        return ToolResult(response)
+        return ToolResult(
+            response,
+            [*detection_result.media, *historical_media],
+        )
 
     registry.register(
         ToolSpec(
-            name="find_objects_in_view",
+            name="gather_in_view_evidence",
             description=(
-                "Required first step for in-view object finding. Search stable scene "
-                "objects and return the bounded head-view candidates, their projected "
-                "ROIs, structured identity strength, and camera freshness metadata. "
-                "This tool does not inspect RGB or establish occlusion-free visibility."
+                "Required and only evidence step for in-view object finding. In one call, "
+                "return compact head-frustum candidates, latest detector metadata and all "
+                "available annotated head/hand images, plus historical snapshots for up "
+                "to four identity-relevant candidates. It does not establish occlusion-free "
+                "head-camera visibility."
             ),
             parameters_json_schema={
                 "type": "object",
@@ -701,155 +1006,7 @@ def create_find_object_in_view_task_registry(
                 },
                 "required": ["target_description"],
             },
-            handler=find_objects_in_view,
-        )
-    )
-
-    def inspect_latest_2d_detections() -> ToolResult:
-        if not evidence.primary_called:
-            raise ValueError("call find_objects_in_view before inspecting 2D detections")
-        if evidence.detection_inspection_called:
-            raise ValueError("latest 2D detections may be inspected only once per task")
-        if detection_sampler is None:
-            raise ValueError("latest 2D detection sampling is unavailable")
-        evidence.detection_inspection_called = True
-        sampled = detection_sampler.sample()
-        if not isinstance(sampled, list):
-            raise ValueError("latest 2D detection sampler must return an array")
-        frames = [
-            value
-            if isinstance(value, Latest2dDetectionFrame)
-            else Latest2dDetectionFrame.from_mapping(value)
-            for value in sampled
-        ]
-        by_camera = {frame.camera_id: frame for frame in frames}
-        if (
-            len(frames) != len(DETECTION_CAMERA_IDS)
-            or set(by_camera) != set(DETECTION_CAMERA_IDS)
-        ):
-            raise ValueError("latest 2D detection sampler returned an unexpected camera set")
-
-        head_sample_ns = (
-            _stamp_ns(evidence.camera_sample.header)
-            if evidence.camera_sample is not None
-            else None
-        )
-        cameras: list[dict[str, Any]] = []
-        media: list[MediaAttachment] = []
-        for camera_id in DETECTION_CAMERA_IDS:
-            frame = by_camera[camera_id]
-            metadata = frame.metadata()
-            result_ns = _stamp_ns(metadata.get("header"))
-            metadata["head_geometry_sample_delta_ms"] = (
-                round((result_ns - head_sample_ns) / 1.0e6, 3)
-                if result_ns is not None and head_sample_ns is not None
-                else None
-            )
-            metadata["image_attached"] = bool(
-                frame.image_available and frame.image_data
-            )
-            cameras.append(metadata)
-            if frame.image_available and frame.image_data:
-                header = metadata.get("image_header")
-                stamp = header.get("stamp") if isinstance(header, dict) else None
-                media.append(
-                    MediaAttachment(
-                        data=frame.image_data,
-                        mime_type=frame.image_mime_type,
-                        summary={
-                            "role": "latest_2d_detection_result",
-                            "camera_id": camera_id,
-                            "header": header,
-                            "label": (
-                                "LATEST 2D DETECTION RESULT "
-                                f"camera_id={camera_id}; stamp={stamp}; "
-                                "boxes, labels, and scores are detector output."
-                            ),
-                        },
-                    )
-                )
-        available_count = sum(bool(camera["available"]) for camera in cameras)
-        return ToolResult(
-            {
-                "evidence_scope": "latest_retained_2d_detection_results",
-                "requested_camera_ids": list(DETECTION_CAMERA_IDS),
-                "available_camera_count": available_count,
-                "cameras": cameras,
-                "message": (
-                    "Each entry is the last retained detector result for that camera, "
-                    "not a newly synchronized three-camera capture. Use headers and "
-                    "head_geometry_sample_delta_ms when judging temporal alignment."
-                ),
-            },
-            media,
-        )
-
-    registry.register(
-        ToolSpec(
-            name="inspect_latest_2d_detections",
-            description=(
-                "Use after find_objects_in_view when its structured identity evidence is "
-                "not sufficient. Return exact detector labels, scores, boxes, timestamps, "
-                "and the last retained annotated RGB frame for each available head or "
-                "hand camera. Camera frames are independently timestamped and are not a "
-                "synchronized capture."
-            ),
-            parameters_json_schema={
-                "type": "object",
-                "properties": {},
-                "additionalProperties": False,
-            },
-            handler=inspect_latest_2d_detections,
-        )
-    )
-
-    def inspect_in_view_candidates(
-        object_ids: list[int], reference_id: str | None = None
-    ) -> ToolResult:
-        ids = _candidate_ids(object_ids, evidence)
-        if any(object_id not in evidence.projections for object_id in ids):
-            raise ValueError("every inspected object must be in the sampled camera frustum")
-        result = _inspect_task_candidates(base, evidence, ids, reference_id)
-        response = dict(result.response)
-        response["current_camera_projections"] = {
-            str(object_id): evidence.projections[object_id] for object_id in ids
-        }
-        response["current_rgb_inspected"] = False
-        return ToolResult(response, result.media)
-
-    registry.register(
-        ToolSpec(
-            name="inspect_in_view_candidates",
-            description=(
-                "Use only when identity remains ambiguous among candidates returned by "
-                "find_objects_in_view. Inspect historical scene snapshots for up to four "
-                "candidate ids and, when reference_id is provided, attach curated "
-                "reference views for comparison. This tool never inspects current RGB."
-            ),
-            parameters_json_schema={
-                "type": "object",
-                "properties": {
-                    "object_ids": {
-                        "type": "array",
-                        "items": {"type": "integer"},
-                        "minItems": 1,
-                        "maxItems": 4,
-                        "description": (
-                            "One to four plausible object ids returned by "
-                            "find_objects_in_view."
-                        ),
-                    },
-                    "reference_id": {
-                        "type": "string",
-                        "description": (
-                            "Optional exact curated reference_id listed in the runtime "
-                            "prompt for this requested item."
-                        ),
-                    },
-                },
-                "required": ["object_ids"],
-            },
-            handler=inspect_in_view_candidates,
+            handler=gather_in_view_evidence,
         )
     )
     return registry
@@ -1035,7 +1192,7 @@ def build_find_object_in_view_result(
     decision = _decision(response.answer)
     invalid_reason = ""
     if not evidence.primary_called:
-        invalid_reason = "model did not call find_objects_in_view"
+        invalid_reason = "model did not call gather_in_view_evidence"
     if decision is None:
         invalid_reason = invalid_reason or "model returned invalid task JSON"
         decision = {}

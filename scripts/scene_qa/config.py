@@ -19,6 +19,8 @@ DEFAULT_DOUBAO_MODEL = "doubao-seed-2-0-lite-260215"
 DEFAULT_DOUBAO_BASE_URL = "https://ark.cn-beijing.volces.com/api/v3"
 DEFAULT_DOUBAO_THINKING_TYPE = "disabled"
 DOUBAO_THINKING_TYPES = frozenset({"enabled", "disabled", "auto"})
+DEFAULT_DOUBAO_SERVICE_TIER = "default"
+DOUBAO_SERVICE_TIERS = frozenset({"default", "fast"})
 DEFAULT_QA_CONFIG_NAME = "config.json"
 DEFAULT_SYSTEM_PROMPT_PATH = Path("prompts/system.txt")
 DEFAULT_NAVIGATION_SYSTEM_PROMPT_PATH = Path("prompts/navigation.txt")
@@ -93,6 +95,14 @@ def _doubao_thinking_type_or_default(value: Any, default: str) -> str:
     return thinking_type
 
 
+def _doubao_service_tier_or_default(value: Any, default: str) -> str:
+    service_tier = str(value or default).strip().lower()
+    if service_tier not in DOUBAO_SERVICE_TIERS:
+        choices = ", ".join(sorted(DOUBAO_SERVICE_TIERS))
+        raise ValueError(f"doubao_service_tier must be one of: {choices}")
+    return service_tier
+
+
 @dataclass
 class SceneQaConfig:
     """Runtime settings for the scene QA agent."""
@@ -102,6 +112,7 @@ class SceneQaConfig:
     doubao_model: str = DEFAULT_DOUBAO_MODEL
     doubao_base_url: str = DEFAULT_DOUBAO_BASE_URL
     doubao_thinking_type: str = DEFAULT_DOUBAO_THINKING_TYPE
+    doubao_service_tier: str = DEFAULT_DOUBAO_SERVICE_TIER
     embedding_model: Path = DEFAULT_EMBEDDING_MODEL
     embedding_backend: str = "embedding"
     device: str = "auto"
@@ -189,6 +200,9 @@ class SceneQaConfig:
             ).rstrip("/"),
             doubao_thinking_type=_doubao_thinking_type_or_default(
                 data.get("doubao_thinking_type"), defaults.doubao_thinking_type
+            ),
+            doubao_service_tier=_doubao_service_tier_or_default(
+                data.get("doubao_service_tier"), defaults.doubao_service_tier
             ),
             embedding_model=_path_or_default(
                 data.get("embedding_model"), defaults.embedding_model

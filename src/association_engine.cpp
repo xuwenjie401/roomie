@@ -1,10 +1,13 @@
 #include "roomie/pipeline/association_engine.hpp"
 
 #include <algorithm>
+#include <cctype>
 #include <cmath>
 #include <limits>
 #include <map>
 #include <numeric>
+#include <set>
+#include <stdexcept>
 #include <tuple>
 
 namespace roomie {
@@ -16,6 +19,29 @@ using Polygon =
 
 float clamp01(float value) {
   return std::clamp(value, 0.0f, 1.0f);
+}
+
+std::string normalizeIdentityLabel(const std::string& label) {
+  std::string normalized;
+  normalized.reserve(label.size());
+  bool previous_separator = true;
+  for (unsigned char character : label) {
+    const bool separator = std::isspace(character) || character == '-' ||
+                           character == '_';
+    if (separator) {
+      if (!previous_separator && !normalized.empty()) {
+        normalized.push_back('_');
+      }
+      previous_separator = true;
+      continue;
+    }
+    normalized.push_back(static_cast<char>(std::tolower(character)));
+    previous_separator = false;
+  }
+  if (!normalized.empty() && normalized.back() == '_') {
+    normalized.pop_back();
+  }
+  return normalized;
 }
 
 float volume(const Eigen::Vector3f& size) {
@@ -30,6 +56,14 @@ float volumeRatio(const Eigen::Vector3f& lhs, const Eigen::Vector3f& rhs) {
   const float b = volume(rhs);
   return std::max(a, b) > kEpsilon ? std::min(a, b) / std::max(a, b)
                                    : 0.0f;
+}
+
+bool isSmallObjectSize(const Eigen::Vector3f& size,
+                       const SmallObjectIdentityConfig& config) {
+  return config.max_volume_m3 > 0.0f && config.max_extent_m > 0.0f &&
+         (size.array() > 0.0f).all() &&
+         volume(size) <= config.max_volume_m3 &&
+         size.maxCoeff() <= config.max_extent_m;
 }
 
 float cross(const Eigen::Vector2f& lhs, const Eigen::Vector2f& rhs) {
@@ -193,20 +227,32 @@ bool samePhysicalItem(const InstanceObservation& lhs,
                       const PhysicalObservationConfig& config) {
   const RawDetection& a = lhs.detection;
   const RawDetection& b = rhs.detection;
+  const SmallObjectIdentityFeatures identity = evaluateSmallObjectIdentity(
+      a.label, a.center_world, a.size_m, a.yaw_rad,
+      b.label, b.center_world, b.size_m, b.yaw_rad,
+      config.small_object_identity);
+  if (identity.identity_conflict) {
+    return false;
+  }
   const float diagonal = std::max(a.size_m.norm(), b.size_m.norm());
   const float normalized_distance =
       diagonal > kEpsilon
           ? (a.center_world - b.center_world).norm() / diagonal
           : std::numeric_limits<float>::infinity();
-  return box2dIou(a.box_xyxy, b.box_xyxy) >= config.min_2d_iou &&
-         volumeRatio(a.size_m, b.size_m) >= config.min_volume_ratio &&
-         normalized_distance <= config.max_normalized_center_distance &&
-         (orientedBoxIou(a.center_world, a.size_m, a.yaw_rad,
-                         b.center_world, b.size_m, b.yaw_rad) >=
-              config.min_3d_iou ||
-          orientedBoxContainment(a.center_world, a.size_m, a.yaw_rad,
-                                 b.center_world, b.size_m, b.yaw_rad) >=
-              config.min_containment);
+  const bool ordinary_physical_match =
+      box2dIou(a.box_xyxy, b.box_xyxy) >= config.min_2d_iou &&
+      volumeRatio(a.size_m, b.size_m) >= config.min_volume_ratio &&
+      normalized_distance <= config.max_normalized_center_distance &&
+      (orientedBoxIou(a.center_world, a.size_m, a.yaw_rad,
+                      b.center_world, b.size_m, b.yaw_rad) >=
+           config.min_3d_iou ||
+       orientedBoxContainment(a.center_world, a.size_m, a.yaw_rad,
+                              b.center_world, b.size_m, b.yaw_rad) >=
+           config.min_containment);
+  if (ordinary_physical_match) {
+    return true;
+  }
+  return identity.eligible;
 }
 
 std::vector<int> hungarianMaximum(const std::vector<std::vector<float>>& score) {
@@ -342,6 +388,131 @@ float orientedBoxContainment(const Eigen::Vector3f& lhs_center,
   return smaller > kEpsilon ? overlap / smaller : 0.0f;
 }
 
+SmallObjectIdentityConfig makeSmallObjectIdentityConfig(
+    const std::vector<std::string>& group_specs,
+    float max_volume_m3,
+    float max_extent_m,
+    float min_iou_3d,
+    float max_normalized_center_distance,
+    float min_volume_ratio) {
+  SmallObjectIdentityConfig config;
+  config.max_volume_m3 = std::max(0.0f, max_volume_m3);
+  config.max_extent_m = std::max(0.0f, max_extent_m);
+  config.min_iou_3d = clamp01(min_iou_3d);
+  config.max_normalized_center_distance =
+      std::max(0.0f, max_normalized_center_distance);
+  config.min_volume_ratio = clamp01(min_volume_ratio);
+
+  std::set<std::string> assigned_labels;
+  for (const std::string& spec : group_specs) {
+    std::vector<std::string> labels;
+    std::set<std::string> unique_labels;
+    std::size_t begin = 0;
+    while (begin <= spec.size()) {
+      const std::size_t separator = spec.find('|', begin);
+      const std::string label = normalizeIdentityLabel(
+          spec.substr(begin, separator == std::string::npos
+                                 ? std::string::npos
+                                 : separator - begin));
+      if (label.empty()) {
+        throw std::invalid_argument(
+            "small-object identity group contains an empty label: '" + spec +
+            "'");
+      }
+      if (!unique_labels.insert(label).second) {
+        throw std::invalid_argument(
+            "small-object identity group contains a duplicate normalized label '" +
+            label + "': '" + spec + "'");
+      }
+      labels.push_back(label);
+      if (separator == std::string::npos) {
+        break;
+      }
+      begin = separator + 1;
+    }
+    if (labels.size() < 2U) {
+      throw std::invalid_argument(
+          "small-object identity group must contain at least two labels: '" +
+          spec + "'");
+    }
+    const std::string& family = labels.front();
+    for (const std::string& label : labels) {
+      if (!assigned_labels.insert(label).second) {
+        throw std::invalid_argument(
+            "small-object identity label belongs to multiple groups: '" + label +
+            "'");
+      }
+      config.family_by_label.emplace(label, family);
+    }
+  }
+  return config;
+}
+
+SmallObjectIdentityFeatures evaluateSmallObjectIdentity(
+    const std::string& lhs_label,
+    const Eigen::Vector3f& lhs_center,
+    const Eigen::Vector3f& lhs_size,
+    float lhs_yaw,
+    const std::string& rhs_label,
+    const Eigen::Vector3f& rhs_center,
+    const Eigen::Vector3f& rhs_size,
+    float rhs_yaw,
+    const SmallObjectIdentityConfig& config) {
+  SmallObjectIdentityFeatures features;
+  features.normalized_center_distance =
+      std::numeric_limits<float>::infinity();
+  if (!isSmallObjectSize(lhs_size, config) ||
+      !isSmallObjectSize(rhs_size, config)) {
+    return features;
+  }
+  const float lhs_volume = volume(lhs_size);
+  const float rhs_volume = volume(rhs_size);
+
+  const std::string lhs = normalizeIdentityLabel(lhs_label);
+  const std::string rhs = normalizeIdentityLabel(rhs_label);
+  if (lhs.empty() || rhs.empty()) {
+    return features;
+  }
+
+  const auto lhs_family = config.family_by_label.find(lhs);
+  const auto rhs_family = config.family_by_label.find(rhs);
+  if (lhs == rhs) {
+    features.label_compatible = true;
+    features.family = lhs_family == config.family_by_label.end()
+                          ? lhs
+                          : lhs_family->second;
+  } else if (lhs_family != config.family_by_label.end() &&
+             rhs_family != config.family_by_label.end() &&
+             lhs_family->second == rhs_family->second) {
+    features.label_compatible = true;
+    features.family = lhs_family->second;
+  }
+  features.identity_conflict =
+      !features.label_compatible &&
+      (lhs_family != config.family_by_label.end() ||
+       rhs_family != config.family_by_label.end());
+  if (!features.label_compatible) {
+    return features;
+  }
+  features.volume_ratio =
+      std::max(lhs_volume, rhs_volume) > kEpsilon
+          ? std::min(lhs_volume, rhs_volume) /
+                std::max(lhs_volume, rhs_volume)
+          : 0.0f;
+  const float diagonal = std::max(lhs_size.norm(), rhs_size.norm());
+  features.normalized_center_distance =
+      diagonal > kEpsilon ? (lhs_center - rhs_center).norm() / diagonal
+                          : std::numeric_limits<float>::infinity();
+  features.iou_3d = orientedBoxIou(lhs_center, lhs_size, lhs_yaw,
+                                   rhs_center, rhs_size, rhs_yaw);
+  features.eligible =
+      features.iou_3d >= config.min_iou_3d &&
+      features.normalized_center_distance <=
+          config.max_normalized_center_distance &&
+      features.volume_ratio >= config.min_volume_ratio;
+  return features;
+}
+
 std::vector<InstanceObservation, Eigen::aligned_allocator<InstanceObservation>>
 clusterPhysicalObservations(
     const std::vector<InstanceObservation,
@@ -396,6 +567,7 @@ clusterPhysicalObservations(
     physical.member_count = cluster.size();
     physical.label_votes.clear();
     physical.semantic_votes.clear();
+    physical.strong_identity_family.clear();
     for (std::size_t member : cluster) {
       const InstanceObservation& observation = input[member];
       const float vote = std::max(kEpsilon,
@@ -405,6 +577,22 @@ clusterPhysicalObservations(
       }
       if (observation.detection.semantic_id >= 0) {
         physical.semantic_votes[observation.detection.semantic_id] += vote;
+      }
+    }
+    for (std::size_t i = 0; i < cluster.size() &&
+                            physical.strong_identity_family.empty(); ++i) {
+      for (std::size_t j = i + 1; j < cluster.size(); ++j) {
+        const RawDetection& lhs = input[cluster[i]].detection;
+        const RawDetection& rhs = input[cluster[j]].detection;
+        const SmallObjectIdentityFeatures identity =
+            evaluateSmallObjectIdentity(
+                lhs.label, lhs.center_world, lhs.size_m, lhs.yaw_rad,
+                rhs.label, rhs.center_world, rhs.size_m, rhs.yaw_rad,
+                config.small_object_identity);
+        if (identity.eligible) {
+          physical.strong_identity_family = identity.family;
+          break;
+        }
       }
     }
     output.push_back(std::move(physical));
@@ -424,13 +612,40 @@ AssociationResult associatePhysicalObservations(
       observations.size(), std::vector<AssociationPairFeatures>(tracks.size()));
   std::vector<std::vector<float>> scores(
       observations.size(), std::vector<float>(tracks.size(), 0.0f));
+  std::vector<unsigned char> small_observations(observations.size(), 0U);
+  for (std::size_t i = 0; i < observations.size(); ++i) {
+    small_observations[i] = isSmallObjectSize(
+        observations[i].detection.size_m, config.small_object_identity);
+  }
+  std::vector<unsigned char> small_tracks(tracks.size(), 0U);
+  for (std::size_t i = 0; i < tracks.size(); ++i) {
+    small_tracks[i] =
+        isSmallObjectSize(tracks[i].size_m, config.small_object_identity);
+  }
   for (std::size_t observation_index = 0;
        observation_index < observations.size(); ++observation_index) {
     const InstanceObservation& observation = observations[observation_index];
+    const bool observation_is_small = small_observations[observation_index] != 0U;
     for (std::size_t track_index = 0; track_index < tracks.size(); ++track_index) {
       const InstanceTrack& track = tracks[track_index];
       AssociationPairFeatures& features =
           result.pair_features[observation_index][track_index];
+      bool identity_iou_available = false;
+      float identity_iou = 0.0f;
+      if (observation_is_small && small_tracks[track_index] != 0U) {
+        const SmallObjectIdentityFeatures strong_identity =
+            evaluateSmallObjectIdentity(
+                track.label, track.center_world, track.size_m, track.yaw_rad,
+                observation.detection.label,
+                observation.detection.center_world,
+                observation.detection.size_m,
+                observation.detection.yaw_rad,
+                config.small_object_identity);
+        features.strong_identity = strong_identity.eligible;
+        features.identity_conflict = strong_identity.identity_conflict;
+        identity_iou_available = strong_identity.label_compatible;
+        identity_iou = strong_identity.iou_3d;
+      }
       features.size_ratio = sizeRatio(track.size_m, observation.detection.size_m);
       const float track_diagonal = track.size_m.norm();
       const float observation_diagonal = observation.detection.size_m.norm();
@@ -443,15 +658,20 @@ AssociationResult associatePhysicalObservations(
           center_gate > kEpsilon ? clamp01(1.0f - distance / center_gate) : 0.0f;
       const float conservative_overlap_reach =
           0.5f * (track_diagonal + observation_diagonal);
-      if (!track.publishable ||
-          features.size_ratio < config.min_size_ratio ||
-          (distance > center_gate && distance > conservative_overlap_reach)) {
+      if (!track.publishable || features.identity_conflict ||
+          (!features.strong_identity &&
+           (features.size_ratio < config.min_size_ratio ||
+            (distance > center_gate && distance > conservative_overlap_reach)))) {
         continue;
       }
-      features.iou_3d = orientedBoxIou(
-          track.center_world, track.size_m, track.yaw_rad,
-          observation.detection.center_world, observation.detection.size_m,
-          observation.detection.yaw_rad);
+      features.iou_3d = identity_iou_available
+                            ? identity_iou
+                            : orientedBoxIou(
+                                  track.center_world, track.size_m,
+                                  track.yaw_rad,
+                                  observation.detection.center_world,
+                                  observation.detection.size_m,
+                                  observation.detection.yaw_rad);
       features.containment = orientedBoxContainment(
           track.center_world, track.size_m, track.yaw_rad,
           observation.detection.center_world, observation.detection.size_m,
@@ -468,7 +688,8 @@ AssociationResult associatePhysicalObservations(
               ? static_cast<float>(now_ns - track.last_seen_ns) * 1.0e-9f
               : 0.0f;
       features.recency_score = clamp01(1.0f - age_seconds / 2.0f);
-      features.candidate = distance <= center_gate || features.iou_3d >= 0.05f;
+      features.candidate = features.strong_identity ||
+                           distance <= center_gate || features.iou_3d >= 0.05f;
       if (!features.candidate) {
         continue;
       }
@@ -494,10 +715,15 @@ AssociationResult associatePhysicalObservations(
            config.center_weight * features.center_score +
            config.size_weight * features.size_ratio) /
           std::max(kEpsilon, identity_weight_sum);
-      scores[observation_index][track_index] =
+      const float ordinary_score =
           track.state == InstanceTrackState::kInactive
               ? features.identity_score
               : features.score;
+      // Strong identity candidates must win assignment over ordinary semantic
+      // candidates; geometry still orders multiple strong candidates.
+      scores[observation_index][track_index] =
+          features.strong_identity ? 2.0f + features.identity_score
+                                   : ordinary_score;
     }
   }
 
@@ -518,7 +744,8 @@ AssociationResult associatePhysicalObservations(
     const float decision_score = track.state == InstanceTrackState::kInactive
                                      ? features.identity_score
                                      : features.score;
-    if (features.candidate && decision_score >= threshold) {
+    if (features.candidate &&
+        (features.strong_identity || decision_score >= threshold)) {
       result.track_by_observation[observation_index] = track_index;
     }
   }

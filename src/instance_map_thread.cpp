@@ -11,6 +11,7 @@
 #include <map>
 #include <memory>
 #include <future>
+#include <numeric>
 #include <optional>
 #include <set>
 #include <sstream>
@@ -76,7 +77,8 @@ float rawDetectionConfidence(const RawDetection& detection) {
 }
 
 PhysicalObservationConfig physicalObservationConfig(
-    const PipelineConfig& config) {
+    const PipelineConfig& config,
+    const SmallObjectIdentityConfig& small_object_identity) {
   PhysicalObservationConfig result;
   result.min_2d_iou = config.instance_physical_min_2d_iou;
   result.min_volume_ratio = config.instance_physical_min_volume_ratio;
@@ -84,11 +86,13 @@ PhysicalObservationConfig physicalObservationConfig(
       config.instance_physical_max_normalized_center_distance;
   result.min_3d_iou = config.instance_physical_min_3d_iou;
   result.min_containment = config.instance_physical_min_containment;
+  result.small_object_identity = small_object_identity;
   return result;
 }
 
 AssociationScoringConfig associationScoringConfig(
-    const PipelineConfig& config) {
+    const PipelineConfig& config,
+    const SmallObjectIdentityConfig& small_object_identity) {
   AssociationScoringConfig result;
   result.overlap_weight = config.instance_association_overlap_weight;
   result.center_weight = config.instance_association_center_weight;
@@ -105,6 +109,7 @@ AssociationScoringConfig associationScoringConfig(
   result.merge_support_threshold =
       config.instance_association_merge_threshold;
   result.max_center_gate_m = config.instance_match_center_distance_m;
+  result.small_object_identity = small_object_identity;
   return result;
 }
 
@@ -867,39 +872,21 @@ bool isSmallContainedDifferentObject(float volume_a,
          smaller / larger < config.instance_duplicate_small_object_volume_ratio;
 }
 
-bool isSmallDuplicateTrack(const InstanceTrack& track, const PipelineConfig& config) {
-  if (config.instance_small_duplicate_max_volume_m3 <= 0.0f ||
-      config.instance_small_duplicate_max_extent_m <= 0.0f ||
-      (track.size_m.array() <= 0.0f).any()) {
-    return false;
-  }
-  const float track_volume = sizeVolume(track.size_m);
-  const float max_extent = track.size_m.cwiseMax(Eigen::Vector3f::Zero()).maxCoeff();
-  return track_volume > 0.0f &&
-         track_volume <= config.instance_small_duplicate_max_volume_m3 &&
-         max_extent <= config.instance_small_duplicate_max_extent_m;
+SmallObjectIdentityFeatures smallStableTrackIdentity(
+    const InstanceTrack& lhs,
+    const InstanceTrack& rhs,
+    const SmallObjectIdentityConfig& config) {
+  return evaluateSmallObjectIdentity(
+      lhs.label, lhs.center_world, lhs.size_m, lhs.yaw_rad,
+      rhs.label, rhs.center_world, rhs.size_m, rhs.yaw_rad, config);
 }
 
-bool smallStableTracksAreDuplicates(const InstanceTrack& lhs,
-                                    const InstanceTrack& rhs,
-                                    const PipelineConfig& config) {
-  if (!isSmallDuplicateTrack(lhs, config) ||
-      !isSmallDuplicateTrack(rhs, config)) {
-    return false;
-  }
-  const float size_ratio = sizeRatioScore(lhs.size_m, rhs.size_m);
-  if (size_ratio < config.instance_small_duplicate_size_ratio_min) {
-    return false;
-  }
-  const float iou = obbIou(lhs, rhs);
-  if (iou >= config.instance_small_duplicate_iou_threshold) {
-    return true;
-  }
-  const float lhs_diag = lhs.size_m.cwiseMax(Eigen::Vector3f::Zero()).norm();
-  const float rhs_diag = rhs.size_m.cwiseMax(Eigen::Vector3f::Zero()).norm();
-  const float center_gate =
-      config.instance_small_duplicate_center_ratio * std::max(lhs_diag, rhs_diag);
-  return center_gate > 0.0f && centerDistance(lhs, rhs) <= center_gate;
+bool hasSmallIdentityGeometry(const InstanceTrack& track,
+                              const SmallObjectIdentityConfig& config) {
+  return config.max_volume_m3 > 0.0f && config.max_extent_m > 0.0f &&
+         (track.size_m.array() > 0.0f).all() &&
+         sizeVolume(track.size_m) <= config.max_volume_m3 &&
+         track.size_m.maxCoeff() <= config.max_extent_m;
 }
 
 bool confirmedTrackDuplicatesDetection(const InstanceTrack& track,
@@ -1387,6 +1374,13 @@ InstanceMapThread::InstanceMapThread(ThreadSafeQueue<InferenceResponse>& respons
           ChannelPolicy::kReliableBlocking),
       map_projector_(map_projector),
       config_(std::move(config)),
+      small_object_identity_config_(makeSmallObjectIdentityConfig(
+          config_.instance_small_object_identity_groups,
+          config_.instance_small_duplicate_max_volume_m3,
+          config_.instance_small_duplicate_max_extent_m,
+          config_.instance_small_duplicate_iou_threshold,
+          config_.instance_small_duplicate_center_ratio,
+          config_.instance_small_duplicate_volume_ratio_min)),
       snapshot_remaker_(snapshotRemakerConfigFromPipeline(config_)),
       reducer_(config_.furniture_graph_config),
       published_scene_state_(reducer_.snapshot().statePtr()),
@@ -2274,7 +2268,27 @@ void InstanceMapThread::applyDetections(const InferenceResponse& response) {
       physical_observations = observations;
   if (config_.instance_association_mode != "legacy") {
     physical_observations = clusterPhysicalObservations(
-        observations, physicalObservationConfig(config_));
+        observations,
+        physicalObservationConfig(config_, small_object_identity_config_));
+    for (const InstanceObservation& physical : physical_observations) {
+      if (physical.strong_identity_family.empty()) {
+        continue;
+      }
+      std::ostringstream trace;
+      trace << "stage=cluster frame_id=" << response.provenance.frame_id
+            << " family=" << physical.strong_identity_family
+            << " member_count=" << physical.member_count << " labels=";
+      bool first = true;
+      for (const auto& [label, vote] : physical.label_votes) {
+        (void)vote;
+        if (!first) {
+          trace << "|";
+        }
+        first = false;
+        trace << diagnosticsLabel(label);
+      }
+      RunLogger::logGlobal("small_object_identity", trace.str());
+    }
     if (config_.instance_association_mode == "evidence") {
       observations = physical_observations;
     }
@@ -2337,7 +2351,8 @@ void InstanceMapThread::applyDetections(const InferenceResponse& response) {
             ? AssociationResult{}
             : associatePhysicalObservations(
                   factor_observations, tracks_, response.time_ns,
-                  associationScoringConfig(config_));
+                  associationScoringConfig(
+                      config_, small_object_identity_config_));
     if (config_.instance_association_mode == "shadow") {
       std::size_t shadow_matches = 0;
       for (const auto& match : factor_association.track_by_observation) {
@@ -2384,7 +2399,23 @@ void InstanceMapThread::applyDetections(const InferenceResponse& response) {
                 << " size=" << features.size_ratio
                 << " semantic=" << features.semantic_similarity
                 << " appearance_shadow="
-                << features.appearance_similarity_shadow;
+                << features.appearance_similarity_shadow
+                << " strong_identity="
+                << (features.strong_identity ? "true" : "false");
+          if (features.strong_identity) {
+            const SmallObjectIdentityFeatures identity =
+                evaluateSmallObjectIdentity(
+                    tracks_[*track_index].label,
+                    tracks_[*track_index].center_world,
+                    tracks_[*track_index].size_m,
+                    tracks_[*track_index].yaw_rad,
+                    observation.detection.label,
+                    observation.detection.center_world,
+                    observation.detection.size_m,
+                    observation.detection.yaw_rad,
+                    small_object_identity_config_);
+            trace << " identity_family=" << identity.family;
+          }
           RunLogger::logGlobal("association_decision", trace.str());
         }
         const bool was_tentative = tracks_[*track_index].object_id < 0;
@@ -2436,6 +2467,29 @@ void InstanceMapThread::applyDetections(const InferenceResponse& response) {
         track_matched[*track_index] = true;
         ++updated;
       } else {
+        if (config_.instance_association_mode == "evidence") {
+          for (std::size_t candidate_index = 0;
+               candidate_index < association_track_count;
+               ++candidate_index) {
+            const AssociationPairFeatures& features =
+                factor_association
+                    .pair_features[observation_index][candidate_index];
+            if (!features.identity_conflict) {
+              continue;
+            }
+            std::ostringstream trace;
+            trace << "stage=association_reject frame_id="
+                  << response.provenance.frame_id
+                  << " observation=" << observation_index
+                  << " track_id=" << tracks_[candidate_index].track_id
+                  << " observation_label=" << observation_label
+                  << " track_label="
+                  << diagnosticsLabel(tracks_[candidate_index].label)
+                  << " reason=identity_family_conflict";
+            RunLogger::logGlobal("small_object_identity", trace.str());
+            break;
+          }
+        }
         const bool promoted = createTrack(observation);
         ++created_by_label[observation_label];
         if (promoted) {
@@ -2463,7 +2517,8 @@ void InstanceMapThread::applyDetections(const InferenceResponse& response) {
     }
 
     if (config_.instance_association_mode == "evidence") {
-      const AssociationScoringConfig scoring = associationScoringConfig(config_);
+      const AssociationScoringConfig scoring = associationScoringConfig(
+          config_, small_object_identity_config_);
       std::set<std::pair<int, int>> supported_this_frame;
       for (std::size_t observation_index = 0;
            observation_index < observations.size(); ++observation_index) {
@@ -2480,6 +2535,9 @@ void InstanceMapThread::applyDetections(const InferenceResponse& response) {
              candidate_index < association_track_count; ++candidate_index) {
           if (candidate_index == matched_index ||
               tracks_[candidate_index].object_id < 0 ||
+              factor_association
+                  .pair_features[observation_index][candidate_index]
+                  .identity_conflict ||
               factor_association
                       .pair_features[observation_index][candidate_index]
                       .identity_score < scoring.merge_support_threshold) {
@@ -3255,6 +3313,62 @@ std::size_t InstanceMapThread::removeExpiredTentativeTracks(
 
 std::size_t InstanceMapThread::mergeDuplicateStableTracks(
     std::map<std::string, std::size_t>* small_duplicates_by_label) {
+  // Freeze the strict-identity graph before mutating tracks. Expanding each
+  // connected component to all track-id pairs preserves transitive evidence
+  // such as box -> labeled_package -> medicine_carton even when the canonical
+  // winner is not geometrically compatible with every leaf on its own.
+  std::set<std::pair<int, int>> small_identity_pairs;
+  std::vector<std::size_t> parent(tracks_.size());
+  std::iota(parent.begin(), parent.end(), 0U);
+  std::vector<unsigned char> small_identity_track(tracks_.size(), 0U);
+  for (std::size_t i = 0; i < tracks_.size(); ++i) {
+    small_identity_track[i] =
+        hasSmallIdentityGeometry(tracks_[i], small_object_identity_config_);
+  }
+  const auto find_root = [&parent](std::size_t index) {
+    while (parent[index] != index) {
+      parent[index] = parent[parent[index]];
+      index = parent[index];
+    }
+    return index;
+  };
+  for (std::size_t i = 0; i < tracks_.size(); ++i) {
+    if (tracks_[i].object_id < 0 || !tracks_[i].publishable ||
+        small_identity_track[i] == 0U) {
+      continue;
+    }
+    for (std::size_t j = i + 1; j < tracks_.size(); ++j) {
+      if (tracks_[j].object_id < 0 || !tracks_[j].publishable ||
+          small_identity_track[j] == 0U ||
+          !smallStableTrackIdentity(tracks_[i], tracks_[j],
+                                    small_object_identity_config_)
+               .eligible) {
+        continue;
+      }
+      const std::size_t lhs_root = find_root(i);
+      const std::size_t rhs_root = find_root(j);
+      if (lhs_root != rhs_root) {
+        parent[rhs_root] = lhs_root;
+      }
+    }
+  }
+  for (std::size_t i = 0; i < tracks_.size(); ++i) {
+    if (tracks_[i].object_id < 0 || !tracks_[i].publishable ||
+        small_identity_track[i] == 0U) {
+      continue;
+    }
+    for (std::size_t j = i + 1; j < tracks_.size(); ++j) {
+      if (tracks_[j].object_id < 0 || !tracks_[j].publishable ||
+          small_identity_track[j] == 0U ||
+          find_root(i) != find_root(j)) {
+        continue;
+      }
+      small_identity_pairs.emplace(
+          std::min(tracks_[i].track_id, tracks_[j].track_id),
+          std::max(tracks_[i].track_id, tracks_[j].track_id));
+    }
+  }
+
   std::size_t merged = 0;
   bool changed = true;
   while (changed) {
@@ -3275,8 +3389,7 @@ std::size_t InstanceMapThread::mergeDuplicateStableTracks(
         const bool evidence_ready =
             duplicate_pairs_ready_.count(pair) != 0;
         const bool small_duplicate =
-            config_.instance_association_mode == "legacy" &&
-            smallStableTracksAreDuplicates(lhs, rhs, config_);
+            small_identity_pairs.count(pair) != 0;
         const bool legacy_duplicate =
             config_.instance_association_mode == "legacy" &&
             stableTracksAreDuplicates(lhs, rhs, config_);
@@ -3322,6 +3435,44 @@ std::size_t InstanceMapThread::mergeDuplicateStableTracks(
         const int loser_object_id = tracks_[loser_index].object_id;
         const InstanceTrack loser = tracks_[loser_index];
         InstanceTrack& winner = tracks_[winner_index];
+        const int winner_object_id = winner.object_id;
+        const std::string winner_label_before = winner.label;
+        const SmallObjectIdentityFeatures identity =
+            smallStableTrackIdentity(winner, loser,
+                                     small_object_identity_config_);
+        if (small_duplicate) {
+          std::ostringstream trace;
+          trace << std::fixed << std::setprecision(4)
+                << "stage=stable_merge family=" << identity.family
+                << " canonical_object_id=" << winner_object_id
+                << " retired_object_id=" << loser_object_id
+                << " canonical_track_id=" << winner.track_id
+                << " retired_track_id=" << loser.track_id
+                << " canonical_label=" << diagnosticsLabel(winner.label)
+                << " retired_label=" << diagnosticsLabel(loser.label)
+                << " iou3d=" << identity.iou_3d
+                << " normalized_center="
+                << identity.normalized_center_distance
+                << " volume_ratio=" << identity.volume_ratio
+                << " transitive=" << (!identity.eligible ? "true" : "false");
+          RunLogger::logGlobal("small_object_identity", trace.str());
+        }
+        const bool loser_has_better_obb =
+            std::make_tuple(loser.object_quality_score,
+                            loser.geometry_score,
+                            loser.high_quality_observation_mass,
+                            loser.support_count) >
+            std::make_tuple(winner.object_quality_score,
+                            winner.geometry_score,
+                            winner.high_quality_observation_mass,
+                            winner.support_count);
+        if (loser_has_better_obb) {
+          winner.center_world = loser.center_world;
+          winner.size_m = loser.size_m;
+          winner.yaw_rad = loser.yaw_rad;
+          winner.obb_revision =
+              std::max(winner.obb_revision, loser.obb_revision) + 1U;
+        }
         winner.confidence_mass += loser.confidence_mass;
         winner.support_count += loser.support_count;
         winner.confidence =
@@ -3435,14 +3586,32 @@ std::size_t InstanceMapThread::mergeDuplicateStableTracks(
         winner.semantic_id = bestWeightedKey(winner.semantic_weights, winner.semantic_id);
         updateObjectQualityScore(&winner);
         if (small_duplicate && small_duplicates_by_label != nullptr) {
-          ++(*small_duplicates_by_label)[diagnosticsLabel(winner.label)];
+          ++(*small_duplicates_by_label)[
+              identity.family.empty()
+                  ? diagnosticsLabel(winner_label_before)
+                  : diagnosticsLabel(identity.family)];
         }
 
         object_graph_.removeNode(loser_object_id);
         pending_reducer_merges_.emplace_back(loser_object_id,
                                              winner.object_id);
-        duplicate_pairs_ready_.erase(pair);
-        duplicate_support_timestamps_.erase(pair);
+        for (auto it = duplicate_pairs_ready_.begin();
+             it != duplicate_pairs_ready_.end();) {
+          if (it->first == loser.track_id || it->second == loser.track_id) {
+            it = duplicate_pairs_ready_.erase(it);
+          } else {
+            ++it;
+          }
+        }
+        for (auto it = duplicate_support_timestamps_.begin();
+             it != duplicate_support_timestamps_.end();) {
+          if (it->first.first == loser.track_id ||
+              it->first.second == loser.track_id) {
+            it = duplicate_support_timestamps_.erase(it);
+          } else {
+            ++it;
+          }
+        }
         tracks_.erase(tracks_.begin() + static_cast<std::ptrdiff_t>(loser_index));
         auto winner_it = std::find_if(tracks_.begin(),
                                       tracks_.end(),
