@@ -3,3 +3,9 @@ logs/
 /install/
 **/__pycache__/
 /assets/object_references/
+
+# CLion
+.idea/
+cmake-build-*/
+
+/docs/flowchart/
